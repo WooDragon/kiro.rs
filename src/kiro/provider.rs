@@ -289,10 +289,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let session_id = Self::extract_session_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(model.as_deref(), session_id.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -503,6 +508,21 @@ impl KiroProvider {
             .get("userInputMessage")?
             .get("modelId")?
             .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取会话 ID
+    ///
+    /// 尝试解析 JSON 请求体，提取 conversationState.conversationId。
+    fn extract_session_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
 
