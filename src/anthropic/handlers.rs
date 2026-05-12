@@ -70,10 +70,26 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
+fn available_models() -> Vec<Model> {
+    vec![
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1773446400, // Mar 14, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1773446400, // Mar 14, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
@@ -164,11 +180,15 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
+    ]
+}
+
+pub async fn get_models() -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
 
     Json(ModelsResponse {
         object: "list".to_string(),
-        data: models,
+        data: available_models(),
     })
 }
 
@@ -622,7 +642,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6/4.7：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -631,10 +651,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_adaptive_opus =
+        model_lower.contains("opus")
+            && (model_lower.contains("4-6")
+                || model_lower.contains("4.6")
+                || model_lower.contains("4-7")
+                || model_lower.contains("4.7"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_adaptive_opus {
         "adaptive"
     } else {
         "enabled"
@@ -651,7 +675,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
     
-    if is_opus_4_6 {
+    if is_adaptive_opus {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -680,6 +704,51 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_for_model(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_available_models_includes_opus_4_7() {
+        let models = available_models();
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_uses_adaptive() {
+        let mut payload = request_for_model("claude-opus-4-7-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("high")
+        );
+    }
 }
 
 /// POST /cc/v1/messages
