@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use uuid::Uuid;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -59,6 +60,30 @@ pub async fn auth_middleware(
     }
 }
 
+const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("request-id");
+
+pub fn create_anthropic_request_id() -> String {
+    format!("req_{}", Uuid::new_v4())
+}
+
+pub fn insert_request_id_header(headers: &mut HeaderMap, request_id: &str) {
+    match HeaderValue::from_str(request_id) {
+        Ok(value) => {
+            headers.insert(REQUEST_ID_HEADER.clone(), value);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "生成的 request-id 无法作为响应头写入");
+        }
+    }
+}
+
+pub async fn request_id_middleware(request: Request<Body>, next: Next) -> Response {
+    let request_id = create_anthropic_request_id();
+    let mut response = next.run(request).await;
+    insert_request_id_header(response.headers_mut(), &request_id);
+    response
+}
+
 /// CORS 中间件层
 ///
 /// **安全说明**：当前配置允许所有来源（Any），这是为了支持公开 API 服务。
@@ -75,4 +100,33 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+        .expose_headers([REQUEST_ID_HEADER])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_anthropic_request_id_format() {
+        let request_id = create_anthropic_request_id();
+
+        assert!(request_id.starts_with("req_"));
+        let uuid_part = &request_id[4..];
+        assert!(Uuid::parse_str(uuid_part).is_ok());
+    }
+
+    #[test]
+    fn test_insert_request_id_header() {
+        let mut headers = HeaderMap::new();
+
+        insert_request_id_header(&mut headers, "req_12345678-1234-1234-1234-123456789abc");
+
+        assert_eq!(
+            headers
+                .get(&REQUEST_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("req_12345678-1234-1234-1234-123456789abc")
+        );
+    }
 }
