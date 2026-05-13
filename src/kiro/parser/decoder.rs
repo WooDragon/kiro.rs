@@ -289,6 +289,7 @@ impl EventStreamDecoder {
             }
         }
     }
+
 }
 
 /// 解码迭代器
