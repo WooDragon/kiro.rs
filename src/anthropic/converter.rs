@@ -184,7 +184,7 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+    Uuid::parse_str(s).is_ok()
 }
 
 /// 收集历史消息中使用的所有工具名称
@@ -1299,6 +1299,14 @@ mod tests {
     fn test_extract_session_id_invalid_uuid() {
         // 测试无效的 UUID 格式
         let user_id = "user_xxx_session_invalid-uuid";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_rejects_uuid_shaped_non_uuid() {
+        // 36 字符且连字符位置类似 UUID，但包含非法十六进制字符，不能作为会话 ID
+        let user_id = "user_xxx_session_zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz";
         let session_id = extract_session_id(user_id);
         assert_eq!(session_id, None);
     }
