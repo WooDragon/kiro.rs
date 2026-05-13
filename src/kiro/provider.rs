@@ -66,8 +66,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -94,10 +94,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -165,8 +162,14 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.token_manager.report_no_result(ctx.id);
+                    return Err(e);
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -183,6 +186,7 @@ impl KiroProvider {
                         e
                     );
                     last_error = Some(e.into());
+                    self.token_manager.report_no_result(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -213,6 +217,7 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                self.token_manager.report_no_result(ctx.id);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -222,8 +227,14 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        self.token_manager.report_no_result(ctx.id);
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
@@ -247,6 +258,7 @@ impl KiroProvider {
                     body
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                self.token_manager.report_no_result(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -255,11 +267,13 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                self.token_manager.report_no_result(ctx.id);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            self.token_manager.report_no_result(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -327,8 +341,14 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.token_manager.report_no_result(ctx.id);
+                    return Err(e);
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -347,6 +367,7 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
+                    self.token_manager.report_no_result(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -358,7 +379,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_for_session(ctx.id, session_id.as_deref());
                 return Ok(response);
             }
 
@@ -396,6 +418,7 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                self.token_manager.report_no_result(ctx.id);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -413,8 +436,14 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        self.token_manager.report_no_result(ctx.id);
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
@@ -455,6 +484,7 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.token_manager.report_no_result(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -463,6 +493,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                self.token_manager.report_no_result(ctx.id);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -480,6 +511,7 @@ impl KiroProvider {
                 status,
                 body
             ));
+            self.token_manager.report_no_result(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
