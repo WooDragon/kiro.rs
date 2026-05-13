@@ -52,8 +52,7 @@ pub fn create_router_with_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .layer(middleware::from_fn(request_id_middleware));
+        ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
@@ -63,13 +62,13 @@ pub fn create_router_with_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .layer(middleware::from_fn(request_id_middleware));
+        ));
 
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }

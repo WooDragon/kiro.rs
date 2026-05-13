@@ -67,8 +67,13 @@ pub fn create_anthropic_request_id() -> String {
 }
 
 pub fn insert_request_id_header(headers: &mut HeaderMap, request_id: &str) {
-    if let Ok(value) = HeaderValue::from_str(request_id) {
-        headers.insert(REQUEST_ID_HEADER.clone(), value);
+    match HeaderValue::from_str(request_id) {
+        Ok(value) => {
+            headers.insert(REQUEST_ID_HEADER.clone(), value);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "生成的 request-id 无法作为响应头写入");
+        }
     }
 }
 
