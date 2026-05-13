@@ -2633,6 +2633,14 @@ mod tests {
             .await
             .unwrap();
         manager.report_success_for_session(first.id, Some("session-1"));
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-1")
+                .map(|entry| entry.credential_id),
+            Some(first.id)
+        );
 
         let second_session = manager
             .acquire_context_for_session(None, Some("session-2"))
@@ -2640,6 +2648,14 @@ mod tests {
             .unwrap();
         assert_ne!(second_session.id, first.id);
         manager.report_success_for_session(second_session.id, Some("session-2"));
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-2")
+                .map(|entry| entry.credential_id),
+            Some(second_session.id)
+        );
 
         let sticky = manager
             .acquire_context_for_session(None, Some("session-1"))
