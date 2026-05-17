@@ -2,19 +2,6 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
----
-
-<table>
-<tr>
-<td>
-<b>特别感谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 为本项目提供了 AI API 额度赞助, YesCode 作为一家低调务实的 AI API 中转服务商 <br>
-长期以来提供稳定高可用的服务, 如您有意体验, 请点击链接注册体验 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
-</td>
-</tr>
-</table>
-
----
-
 #### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
 
 ## 免责声明
@@ -36,12 +23,16 @@
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **会话亲和**: `balanced` 模式支持会话级粘性路由，并在成功响应后绑定，兼顾并发分流稳定性
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **Prompt Cache 兼容**: 支持 Anthropic `cache_control`，可透传上游缓存统计或本地回退计算
+- **请求追踪**: Anthropic 兼容端点响应附带 `request-id` 头，便于问题排查
+- **Claude Code 兼容性增强**: 自动剥离 `x-anthropic-billing-header`（含 `cch`）系统元数据
+- **多模型支持**: 支持 Sonnet、Opus（含 4.7）、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
@@ -191,6 +182,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `anthropicPromptCacheMode` | string | `auto` | Anthropic prompt cache 兼容模式：`off` / `passthrough` / `emulated` / `auto` |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -392,6 +384,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
 
+Anthropic 兼容端点（`/v1/*` 与 `/cc/v1/*`）会在响应头中附带 `request-id`，用于请求追踪与日志关联。
+
 ### Thinking 模式
 
 支持 Claude 的 extended thinking 功能：
@@ -437,9 +431,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `*opus*` 且包含 `4.7` / `4-7` | `claude-opus-4.7` |
 | `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
+| `*opus*` 且包含 `4.5` / `4-5` | `claude-opus-4.5` |
+| `*opus*` 其他情况（不含 `4.7` / `4-7` / `4.5` / `4-5`） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
 ## Admin（可选）
@@ -537,6 +532,7 @@ MIT
 ## 致谢
 
 本项目的实现离不开前辈的努力:  
+ - [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)（上游项目）
  - [kiro2api](https://github.com/caidaoli/kiro2api)
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
