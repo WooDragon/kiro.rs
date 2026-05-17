@@ -254,7 +254,7 @@ pub fn decide_prompt_cache(
     }
 }
 
-pub fn billed_input_tokens(input_tokens: i32, usage: PromptCacheUsage) -> i32 {
+pub fn uncached_input_tokens(input_tokens: i32, usage: PromptCacheUsage) -> i32 {
     (input_tokens - usage.cache_creation_input_tokens - usage.cache_read_input_tokens).max(0)
 }
 
@@ -267,7 +267,7 @@ pub fn build_usage_value(
     let mut result = Map::new();
     result.insert(
         "input_tokens".to_string(),
-        json!(billed_input_tokens(input_tokens, usage)),
+        json!(uncached_input_tokens(input_tokens, usage)),
     );
     result.insert("output_tokens".to_string(), json!(output_tokens));
 
@@ -677,7 +677,9 @@ fn collect_usage_maps<'a>(value: &'a Value, out: &mut Vec<&'a Map<String, Value>
 
 fn read_i32(map: &Map<String, Value>, keys: &[&str]) -> Option<i32> {
     for key in keys {
-        let value = map.get(*key)?;
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
         if let Some(n) = value.as_i64() {
             return Some(n as i32);
         }
