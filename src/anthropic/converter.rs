@@ -667,7 +667,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     if let Some(ref system) = req.system {
         let system_content: String = system
             .iter()
-            .map(|s| s.text.clone())
+            .filter_map(|s| s.without_anthropic_billing_headers())
+            .map(|s| s.text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1005,6 +1006,45 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
+    }
+
+    #[test]
+    fn test_convert_request_strips_anthropic_billing_header_system_block() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
+                        .to_string(),
+                },
+                SystemMessage {
+                    text: "stable system prompt".to_string(),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("request should convert");
+        let system_history = match &result.conversation_state.history[0] {
+            Message::User(msg) => &msg.user_input_message.content,
+            _ => panic!("expected system prompt to be converted as user history"),
+        };
+
+        assert!(!system_history.contains("x-anthropic-billing-header"));
+        assert!(!system_history.contains("cch=aaaa"));
+        assert!(system_history.contains("stable system prompt"));
     }
 
     #[test]

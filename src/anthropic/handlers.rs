@@ -233,6 +233,13 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let stripped_headers = payload.strip_anthropic_billing_headers();
+    if stripped_headers > 0 {
+        tracing::debug!(
+            count = stripped_headers,
+            "已剥离 Claude Code x-anthropic-billing-header 系统块"
+        );
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -772,13 +779,20 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+    let stripped_headers = payload.strip_anthropic_billing_headers();
+    if stripped_headers > 0 {
+        tracing::debug!(
+            count = stripped_headers,
+            "已剥离 Claude Code x-anthropic-billing-header 系统块"
+        );
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -872,6 +886,13 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let stripped_headers = payload.strip_anthropic_billing_headers();
+    if stripped_headers > 0 {
+        tracing::debug!(
+            count = stripped_headers,
+            "已剥离 Claude Code x-anthropic-billing-header 系统块"
+        );
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
