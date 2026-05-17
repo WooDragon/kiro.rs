@@ -45,6 +45,11 @@ pub struct KiroProvider {
     default_endpoint: String,
 }
 
+pub struct KiroApiResponse {
+    pub response: reqwest::Response,
+    pub credential_id: u64,
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -108,12 +113,32 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
+    #[allow(dead_code)]
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false)
+            .await
+            .map(|r| r.response)
     }
 
     /// 发送流式 API 请求
+    #[allow(dead_code)]
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true)
+            .await
+            .map(|r| r.response)
+    }
+
+    pub async fn call_api_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_retry(request_body, false).await
+    }
+
+    pub async fn call_api_stream_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -294,7 +319,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<KiroApiResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -381,7 +406,10 @@ impl KiroProvider {
             if status.is_success() {
                 self.token_manager
                     .report_success_for_session(ctx.id, session_id.as_deref());
-                return Ok(response);
+                return Ok(KiroApiResponse {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息

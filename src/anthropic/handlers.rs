@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,9 +23,18 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
+use super::prompt_cache::{
+    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
+    decide_prompt_cache, extract_usage_from_metering,
+};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+use crate::model::config::PromptCacheMode;
+use std::sync::Arc;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -237,7 +246,16 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
+        )
+        .await;
     }
 
     // 转换请求
@@ -287,10 +305,11 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -310,12 +329,41 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
+        )
+        .await
+    }
+}
+
+fn build_prompt_cache_profile(
+    state: &AppState,
+    payload: &MessagesRequest,
+    input_tokens: i32,
+) -> Option<PromptCacheProfile> {
+    if matches!(
+        state.prompt_cache_mode,
+        PromptCacheMode::Auto | PromptCacheMode::Emulated
+    ) {
+        state.prompt_cache.build_profile(payload, input_tokens)
+    } else {
+        None
     }
 }
 
@@ -327,15 +375,29 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    prompt_cache_mode: PromptCacheMode,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let api_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = api_response.response;
+    let account_key = api_response.credential_id.to_string();
+    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+            .with_prompt_cache(
+                prompt_cache_mode,
+                Some(prompt_cache),
+                Some(account_key),
+                prompt_cache_profile,
+                fallback_cache_usage,
+            );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -463,12 +525,18 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    prompt_cache_mode: PromptCacheMode,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let api_response = match provider.call_api_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = api_response.response;
+    let account_key = api_response.credential_id.to_string();
+    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -498,6 +566,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut upstream_cache_usage: Option<PromptCacheUsage> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -525,14 +594,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -551,10 +620,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -565,6 +633,11 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
+                        }
+                        Event::Metering(payload) => {
+                            if let Some(usage) = extract_usage_from_metering(&payload) {
+                                upstream_cache_usage = Some(usage);
+                            }
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -621,6 +694,18 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let cache_decision = decide_prompt_cache(
+        prompt_cache_mode,
+        upstream_cache_usage,
+        fallback_cache_usage,
+        prompt_cache_profile.is_some(),
+    );
+    if matches!(
+        prompt_cache_mode,
+        PromptCacheMode::Auto | PromptCacheMode::Emulated
+    ) {
+        prompt_cache.update(&account_key, prompt_cache_profile.as_ref());
+    }
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -631,10 +716,12 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": build_usage_value(
+            final_input_tokens,
+            output_tokens,
+            cache_decision.fallback_usage,
+            cache_decision.include_cache_fields,
+        )
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -651,12 +738,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_adaptive_opus =
-        model_lower.contains("opus")
-            && (model_lower.contains("4-6")
-                || model_lower.contains("4.6")
-                || model_lower.contains("4-7")
-                || model_lower.contains("4.7"));
+    let is_adaptive_opus = model_lower.contains("opus")
+        && (model_lower.contains("4-6")
+            || model_lower.contains("4.6")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7"));
 
     let thinking_type = if is_adaptive_opus {
         "adaptive"
@@ -674,7 +760,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_adaptive_opus {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -799,7 +885,16 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
+        )
+        .await;
     }
 
     // 转换请求
@@ -849,10 +944,11 @@ pub async fn post_messages_cc(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -872,12 +968,26 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.prompt_cache_mode,
+            state.prompt_cache.clone(),
+            cache_profile,
+        )
+        .await
     }
 }
 
@@ -892,15 +1002,33 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    prompt_cache_mode: PromptCacheMode,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let api_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = api_response.response;
+    let account_key = api_response.credential_id.to_string();
+    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    )
+    .with_prompt_cache(
+        prompt_cache_mode,
+        Some(prompt_cache),
+        Some(account_key),
+        prompt_cache_profile,
+        fallback_cache_usage,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

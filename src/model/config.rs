@@ -11,6 +11,21 @@ pub enum TlsBackend {
     NativeTls,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptCacheMode {
+    Off,
+    Passthrough,
+    Emulated,
+    Auto,
+}
+
+impl Default for PromptCacheMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 impl Default for TlsBackend {
     fn default() -> Self {
         Self::Rustls
@@ -98,6 +113,15 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// Anthropic prompt cache 兼容模式（默认 auto）
+    ///
+    /// - off: 不返回 prompt cache usage 字段
+    /// - passthrough: 仅透传上游 usage 中的 cache 字段
+    /// - emulated: 使用本地 prompt cache tracker 计算 cache 字段
+    /// - auto: 优先透传上游 cache 字段，否则使用本地 tracker
+    #[serde(default, alias = "anthropic_prompt_cache_mode")]
+    pub anthropic_prompt_cache_mode: PromptCacheMode,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -182,6 +206,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            anthropic_prompt_cache_mode: PromptCacheMode::default(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -236,7 +261,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

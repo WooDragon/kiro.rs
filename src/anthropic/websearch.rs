@@ -15,8 +15,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::prompt_cache::{
+    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
+};
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
+use crate::model::config::PromptCacheMode;
+use std::sync::Arc;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -220,9 +225,18 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    prompt_cache_usage: PromptCacheUsage,
+    include_prompt_cache_fields: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        prompt_cache_usage,
+        include_prompt_cache_fields,
+    );
 
     stream::iter(
         events
@@ -238,6 +252,8 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    prompt_cache_usage: PromptCacheUsage,
+    include_prompt_cache_fields: bool,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -257,12 +273,12 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
+                "usage": build_usage_value(
+                    input_tokens,
+                    0,
+                    prompt_cache_usage,
+                    include_prompt_cache_fields,
+                )
             }
         }),
     ));
@@ -475,6 +491,9 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    prompt_cache_mode: PromptCacheMode,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -507,8 +526,35 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let account_key = "websearch";
+    let prompt_cache_usage = if matches!(
+        prompt_cache_mode,
+        PromptCacheMode::Auto | PromptCacheMode::Emulated
+    ) {
+        prompt_cache.compute(account_key, prompt_cache_profile.as_ref())
+    } else {
+        PromptCacheUsage::default()
+    };
+    let include_prompt_cache_fields = prompt_cache_profile.is_some()
+        && matches!(
+            prompt_cache_mode,
+            PromptCacheMode::Auto | PromptCacheMode::Emulated
+        );
+    if matches!(
+        prompt_cache_mode,
+        PromptCacheMode::Auto | PromptCacheMode::Emulated
+    ) {
+        prompt_cache.update(account_key, prompt_cache_profile.as_ref());
+    }
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        prompt_cache_usage,
+        include_prompt_cache_fields,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -569,6 +615,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -599,6 +646,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,6 +654,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,

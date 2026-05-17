@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::PromptCacheMode;
 
+use super::prompt_cache::PromptCacheTracker;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -26,15 +28,23 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    pub prompt_cache_mode: PromptCacheMode,
+    pub prompt_cache: Arc<PromptCacheTracker>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_cache_mode: PromptCacheMode,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            prompt_cache_mode,
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
         }
     }
 
