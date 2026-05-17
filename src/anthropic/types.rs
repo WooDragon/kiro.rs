@@ -1,6 +1,7 @@
 //! Anthropic API 类型定义
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // === 错误响应 ===
@@ -209,7 +210,7 @@ fn is_anthropic_billing_header_line(line: &str) -> bool {
         .starts_with(ANTHROPIC_BILLING_HEADER_PREFIX)
 }
 
-pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<String> {
+pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<Cow<'_, str>> {
     let mut changed = false;
     let kept_lines: Vec<&str> = text
         .lines()
@@ -223,48 +224,49 @@ pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<String> 
         .collect();
 
     if !changed {
-        return Some(text.to_string());
+        return Some(Cow::Borrowed(text));
     }
 
     let stripped = kept_lines.join("\n");
     if stripped.trim().is_empty() {
         None
     } else {
-        Some(stripped)
+        Some(Cow::Owned(stripped))
     }
 }
 
 impl SystemMessage {
     pub(crate) fn without_anthropic_billing_headers(&self) -> Option<Self> {
-        strip_anthropic_billing_header_text(&self.text).map(|text| Self { text })
+        strip_anthropic_billing_header_text(&self.text).map(|text| Self {
+            text: text.into_owned(),
+        })
     }
 }
 
 fn strip_anthropic_billing_headers_from_system(system: &mut Option<Vec<SystemMessage>>) -> usize {
-    let Some(messages) = system else {
+    let Some(messages) = system.take() else {
         return 0;
     };
 
     let mut changed = 0;
     let mut stripped = Vec::with_capacity(messages.len());
 
-    for msg in messages.drain(..) {
-        match msg.without_anthropic_billing_headers() {
-            Some(cleaned) => {
-                if cleaned.text != msg.text {
-                    changed += 1;
-                }
-                stripped.push(cleaned);
+    for msg in messages {
+        match strip_anthropic_billing_header_text(&msg.text) {
+            Some(Cow::Borrowed(_)) => stripped.push(msg),
+            Some(Cow::Owned(text)) => {
+                changed += 1;
+                stripped.push(SystemMessage { text });
             }
             None => changed += 1,
         }
     }
 
-    if stripped.is_empty() {
-        *system = None;
+    *system = if stripped.is_empty() {
+        None
     } else {
-        *messages = stripped;
-    }
+        Some(stripped)
+    };
 
     changed
 }

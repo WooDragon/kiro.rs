@@ -700,7 +700,13 @@ pub async fn count_tokens(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
-    payload.strip_anthropic_billing_headers();
+    let stripped_headers = payload.strip_anthropic_billing_headers();
+    if stripped_headers > 0 {
+        tracing::debug!(
+            count = stripped_headers,
+            "已剥离 Claude Code x-anthropic-billing-header 系统块"
+        );
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
