@@ -1024,9 +1024,11 @@ mod tests {
                 SystemMessage {
                     text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
                         .to_string(),
+                    cache_control: None,
                 },
                 SystemMessage {
                     text: "stable system prompt".to_string(),
+                    cache_control: None,
                 },
             ]),
             tools: None,
