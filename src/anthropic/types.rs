@@ -250,6 +250,7 @@ impl SystemMessage {
     pub(crate) fn without_anthropic_billing_headers(&self) -> Option<Self> {
         strip_anthropic_billing_header_text(&self.text).map(|text| Self {
             text: text.into_owned(),
+            cache_control: self.cache_control.clone(),
         })
     }
 }
@@ -267,7 +268,10 @@ fn strip_anthropic_billing_headers_from_system(system: &mut Option<Vec<SystemMes
             Some(Cow::Borrowed(_)) => stripped.push(msg),
             Some(Cow::Owned(text)) => {
                 changed += 1;
-                stripped.push(SystemMessage { text });
+                stripped.push(SystemMessage {
+                    text,
+                    cache_control: msg.cache_control,
+                });
             }
             None => changed += 1,
         }
@@ -396,11 +400,12 @@ mod tests {
             stream: false,
             system: Some(vec![
                 SystemMessage {
-                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
-                        .to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;".to_string(),
+                    cache_control: None,
                 },
                 SystemMessage {
                     text: "stable system prompt".to_string(),
+                    cache_control: None,
                 },
             ]),
             tools: None,
@@ -423,6 +428,29 @@ mod tests {
         );
 
         assert_eq!(stripped.as_deref(), Some("real prompt"));
+    }
+
+    #[test]
+    fn preserves_cache_control_when_stripping_billing_header_line() {
+        let mut system = Some(vec![SystemMessage {
+            text: "x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb;\nreal prompt"
+                .to_string(),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        }]);
+
+        assert_eq!(strip_anthropic_billing_headers_from_system(&mut system), 1);
+        let system = system.expect("system prompt should remain");
+        assert_eq!(system[0].text, "real prompt");
+        assert_eq!(
+            system[0]
+                .cache_control
+                .as_ref()
+                .map(|cache_control| cache_control.cache_type.as_str()),
+            Some("ephemeral")
+        );
     }
 
     #[test]
