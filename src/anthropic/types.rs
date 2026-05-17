@@ -400,8 +400,7 @@ mod tests {
             stream: false,
             system: Some(vec![
                 SystemMessage {
-                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
-                        .to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;".to_string(),
                     cache_control: None,
                 },
                 SystemMessage {
@@ -429,6 +428,29 @@ mod tests {
         );
 
         assert_eq!(stripped.as_deref(), Some("real prompt"));
+    }
+
+    #[test]
+    fn preserves_cache_control_when_stripping_billing_header_line() {
+        let mut system = Some(vec![SystemMessage {
+            text: "x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb;\nreal prompt"
+                .to_string(),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        }]);
+
+        assert_eq!(strip_anthropic_billing_headers_from_system(&mut system), 1);
+        let system = system.expect("system prompt should remain");
+        assert_eq!(system[0].text, "real prompt");
+        assert_eq!(
+            system[0]
+                .cache_control
+                .as_ref()
+                .map(|cache_control| cache_control.cache_type.as_str()),
+            Some("ephemeral")
+        );
     }
 
     #[test]

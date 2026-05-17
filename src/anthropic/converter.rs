@@ -1022,8 +1022,7 @@ mod tests {
             stream: false,
             system: Some(vec![
                 SystemMessage {
-                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
-                        .to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;".to_string(),
                     cache_control: None,
                 },
                 SystemMessage {
