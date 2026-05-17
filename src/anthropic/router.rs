@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::PromptCacheMode;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -38,8 +39,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    prompt_cache_mode: PromptCacheMode,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, prompt_cache_mode);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

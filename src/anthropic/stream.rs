@@ -3,11 +3,18 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::model::config::PromptCacheMode;
+
+use super::prompt_cache::{
+    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
+    decide_prompt_cache, extract_usage_from_metering,
+};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -189,27 +196,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -458,6 +459,8 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        prompt_cache_usage: PromptCacheUsage,
+        include_prompt_cache_fields: bool,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -486,10 +489,12 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": build_usage_value(
+                        input_tokens,
+                        output_tokens,
+                        prompt_cache_usage,
+                        include_prompt_cache_fields,
+                    )
                 }),
             ));
         }
@@ -523,6 +528,14 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    pub prompt_cache_mode: PromptCacheMode,
+    pub prompt_cache: Option<Arc<PromptCacheTracker>>,
+    pub prompt_cache_account: Option<String>,
+    pub prompt_cache_profile: Option<PromptCacheProfile>,
+    pub prompt_cache_usage: PromptCacheUsage,
+    pub include_prompt_cache_fields: bool,
+    pub upstream_prompt_cache_usage: Option<PromptCacheUsage>,
+    pub prompt_cache_updated: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -559,6 +572,14 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            prompt_cache_mode: PromptCacheMode::Off,
+            prompt_cache: None,
+            prompt_cache_account: None,
+            prompt_cache_profile: None,
+            prompt_cache_usage: PromptCacheUsage::default(),
+            include_prompt_cache_fields: false,
+            upstream_prompt_cache_usage: None,
+            prompt_cache_updated: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -569,6 +590,24 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
         }
+    }
+
+    pub fn with_prompt_cache(
+        mut self,
+        mode: PromptCacheMode,
+        tracker: Option<Arc<PromptCacheTracker>>,
+        account: Option<String>,
+        profile: Option<PromptCacheProfile>,
+        fallback_usage: PromptCacheUsage,
+    ) -> Self {
+        self.prompt_cache_mode = mode;
+        self.prompt_cache = tracker;
+        self.prompt_cache_account = account;
+        self.include_prompt_cache_fields = profile.is_some()
+            && !matches!(mode, PromptCacheMode::Off | PromptCacheMode::Passthrough);
+        self.prompt_cache_profile = profile;
+        self.prompt_cache_usage = fallback_usage;
+        self
     }
 
     /// 生成 message_start 事件
@@ -583,10 +622,12 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": build_usage_value(
+                    self.input_tokens,
+                    1,
+                    self.prompt_cache_usage,
+                    self.include_prompt_cache_fields,
+                )
             }
         })
     }
@@ -638,9 +679,8 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -652,6 +692,20 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(payload) => {
+                if let Some(usage) = extract_usage_from_metering(payload) {
+                    self.upstream_prompt_cache_usage = Some(usage);
+                    let decision = decide_prompt_cache(
+                        self.prompt_cache_mode,
+                        self.upstream_prompt_cache_usage,
+                        self.prompt_cache_usage,
+                        self.prompt_cache_profile.is_some(),
+                    );
+                    self.prompt_cache_usage = decision.fallback_usage;
+                    self.include_prompt_cache_fields = decision.include_cache_fields;
+                }
                 Vec::new()
             }
             Event::Error {
@@ -1120,12 +1174,37 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
+        self.update_prompt_cache();
+
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(
+            final_input_tokens,
+            self.output_tokens,
+            self.prompt_cache_usage,
+            self.include_prompt_cache_fields,
+        ));
         events
+    }
+
+    fn update_prompt_cache(&mut self) {
+        if self.prompt_cache_updated {
+            return;
+        }
+        self.prompt_cache_updated = true;
+        if !matches!(
+            self.prompt_cache_mode,
+            PromptCacheMode::Auto | PromptCacheMode::Emulated
+        ) {
+            return;
+        }
+        let (Some(tracker), Some(account), Some(profile)) = (
+            self.prompt_cache.as_ref(),
+            self.prompt_cache_account.as_ref(),
+            self.prompt_cache_profile.as_ref(),
+        ) else {
+            return;
+        };
+        tracker.update(account, Some(profile));
     }
 }
 
@@ -1158,14 +1237,32 @@ impl BufferedStreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_thinking(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    pub fn with_prompt_cache(
+        mut self,
+        mode: PromptCacheMode,
+        tracker: Option<Arc<PromptCacheTracker>>,
+        account: Option<String>,
+        profile: Option<PromptCacheProfile>,
+        fallback_usage: PromptCacheUsage,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_prompt_cache(mode, tracker, account, profile, fallback_usage);
+        self
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1213,7 +1310,12 @@ impl BufferedStreamContext {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        *usage = build_usage_value(
+                            final_input_tokens,
+                            1,
+                            self.inner.prompt_cache_usage,
+                            self.inner.include_prompt_cache_fields,
+                        );
                     }
                 }
             }
@@ -1297,7 +1399,10 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
@@ -1313,10 +1418,12 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
@@ -1738,7 +1845,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1751,14 +1863,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1790,9 +1899,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1811,7 +1918,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1829,7 +1940,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1849,7 +1964,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1878,7 +1997,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1968,12 +2091,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
