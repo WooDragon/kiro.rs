@@ -667,7 +667,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     if let Some(ref system) = req.system {
         let system_content: String = system
             .iter()
-            .map(|s| s.text.clone())
+            .filter_map(|s| s.without_anthropic_billing_headers())
+            .map(|s| s.text)
             .collect::<Vec<_>>()
             .join("\n");
 

@@ -201,6 +201,80 @@ pub struct SystemMessage {
     pub text: String,
 }
 
+const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+fn is_anthropic_billing_header_line(line: &str) -> bool {
+    line.trim_start()
+        .to_ascii_lowercase()
+        .starts_with(ANTHROPIC_BILLING_HEADER_PREFIX)
+}
+
+pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<String> {
+    let mut changed = false;
+    let kept_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let is_billing_header = is_anthropic_billing_header_line(line);
+            if is_billing_header {
+                changed = true;
+            }
+            !is_billing_header
+        })
+        .collect();
+
+    if !changed {
+        return Some(text.to_string());
+    }
+
+    let stripped = kept_lines.join("\n");
+    if stripped.trim().is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+impl SystemMessage {
+    pub(crate) fn without_anthropic_billing_headers(&self) -> Option<Self> {
+        strip_anthropic_billing_header_text(&self.text).map(|text| Self { text })
+    }
+}
+
+fn strip_anthropic_billing_headers_from_system(system: &mut Option<Vec<SystemMessage>>) -> usize {
+    let Some(messages) = system else {
+        return 0;
+    };
+
+    let mut changed = 0;
+    let mut stripped = Vec::with_capacity(messages.len());
+
+    for msg in messages.drain(..) {
+        match msg.without_anthropic_billing_headers() {
+            Some(cleaned) => {
+                if cleaned.text != msg.text {
+                    changed += 1;
+                }
+                stripped.push(cleaned);
+            }
+            None => changed += 1,
+        }
+    }
+
+    if stripped.is_empty() {
+        *system = None;
+    } else {
+        *messages = stripped;
+    }
+
+    changed
+}
+
+impl MessagesRequest {
+    pub(crate) fn strip_anthropic_billing_headers(&mut self) -> usize {
+        strip_anthropic_billing_headers_from_system(&mut self.system)
+    }
+}
+
 /// 工具定义
 ///
 /// 支持两种格式：
@@ -276,8 +350,70 @@ pub struct CountTokensRequest {
     pub tools: Option<Vec<Tool>>,
 }
 
+impl CountTokensRequest {
+    pub(crate) fn strip_anthropic_billing_headers(&mut self) -> usize {
+        strip_anthropic_billing_headers_from_system(&mut self.system)
+    }
+}
+
 /// Token 计数响应
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_standalone_anthropic_billing_header_system_block() {
+        let mut req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;"
+                        .to_string(),
+                },
+                SystemMessage {
+                    text: "stable system prompt".to_string(),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert_eq!(req.strip_anthropic_billing_headers(), 1);
+        let system = req.system.expect("stable system prompt should remain");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].text, "stable system prompt");
+    }
+
+    #[test]
+    fn strips_billing_header_line_without_dropping_other_text() {
+        let stripped = strip_anthropic_billing_header_text(
+            "  X-Anthropic-Billing-Header: cc_version=2.1.87.42; cch=bbbb;\nreal prompt",
+        );
+
+        assert_eq!(stripped.as_deref(), Some("real prompt"));
+    }
+
+    #[test]
+    fn preserves_non_billing_system_text() {
+        let text = "please mention x-anthropic-billing-header: literally";
+
+        assert_eq!(
+            strip_anthropic_billing_header_text(text).as_deref(),
+            Some(text)
+        );
+    }
 }
