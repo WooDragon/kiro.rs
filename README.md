@@ -386,7 +386,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 > - `/cc/v1/messages`：默认 `prefix` 模式，仅在首帧前短暂等待上游 usage；拿到可靠 usage、超时或缓冲达到上限后立即开始流式回放
 > - `ccStreamingMode=buffered` 保留旧行为：等待上游流完成后更正 `message_start` 并一次性返回所有事件
 > - `ccStreamingMode=streaming` 与 `/v1/messages` 行为一致
-> - 等待期间会每 25 秒发送 `ping` 事件保活
+> - 流开始后会每 25 秒发送 `ping` 事件保活
 
 Anthropic 兼容端点（`/v1/*` 与 `/cc/v1/*`）会在响应头中附带 `request-id`，用于请求追踪与日志关联。
 

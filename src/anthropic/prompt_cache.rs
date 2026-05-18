@@ -315,32 +315,42 @@ pub fn extract_usage_snapshot_from_metering(value: &Value) -> Option<UsageSnapsh
     let mut maps = Vec::new();
     collect_usage_maps(value, &mut maps);
 
+    let mut snapshot = UsageSnapshot::default();
+    let mut cache_usage = PromptCacheUsage::default();
+    let mut saw_cache_fields = false;
+
     for map in maps {
-        let input_tokens = read_i32(
-            map,
-            &[
-                "inputTokens",
-                "input_tokens",
-                "contextInputTokens",
-                "context_input_tokens",
-                "promptTokens",
-                "prompt_tokens",
-                "uncachedInputTokens",
-                "uncached_input_tokens",
-            ],
-        );
-        let output_tokens = read_i32(
-            map,
-            &[
-                "outputTokens",
-                "output_tokens",
-                "completionTokens",
-                "completion_tokens",
-                "generatedTokens",
-                "generated_tokens",
-            ],
-        );
-        let total_tokens = read_i32(map, &["totalTokens", "total_tokens"]);
+        snapshot.input_tokens = snapshot.input_tokens.or_else(|| {
+            read_i32(
+                map,
+                &[
+                    "inputTokens",
+                    "input_tokens",
+                    "contextInputTokens",
+                    "context_input_tokens",
+                    "promptTokens",
+                    "prompt_tokens",
+                    "uncachedInputTokens",
+                    "uncached_input_tokens",
+                ],
+            )
+        });
+        snapshot.output_tokens = snapshot.output_tokens.or_else(|| {
+            read_i32(
+                map,
+                &[
+                    "outputTokens",
+                    "output_tokens",
+                    "completionTokens",
+                    "completion_tokens",
+                    "generatedTokens",
+                    "generated_tokens",
+                ],
+            )
+        });
+        snapshot.total_tokens = snapshot
+            .total_tokens
+            .or_else(|| read_i32(map, &["totalTokens", "total_tokens"]));
         let cache_read =
             read_i32(map, &["cacheReadInputTokens", "cache_read_input_tokens"]).unwrap_or(0);
         let cache_creation = read_i32(
@@ -378,30 +388,31 @@ pub fn extract_usage_snapshot_from_metering(value: &Value) -> Option<UsageSnapsh
             cache_creation_5m_input_tokens: cache_5m,
             cache_creation_1h_input_tokens: cache_1h,
         };
-        let prompt_cache_usage = if usage.has_tokens()
+        let has_cache_fields = usage.has_tokens()
             || map.contains_key("cacheReadInputTokens")
             || map.contains_key("cache_read_input_tokens")
             || map.contains_key("cacheCreationInputTokens")
             || map.contains_key("cache_creation_input_tokens")
             || map.contains_key("cacheWriteInputTokens")
-            || map.contains_key("cache_write_input_tokens")
-        {
-            Some(usage)
-        } else {
-            None
-        };
-        let snapshot = UsageSnapshot {
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            prompt_cache_usage,
-        };
-        if snapshot.has_tokens() {
-            return Some(snapshot);
+            || map.contains_key("cache_write_input_tokens");
+        if has_cache_fields {
+            saw_cache_fields = true;
+            cache_usage.cache_read_input_tokens =
+                cache_usage.cache_read_input_tokens.max(cache_read);
+            cache_usage.cache_creation_input_tokens =
+                cache_usage.cache_creation_input_tokens.max(cache_creation);
+            cache_usage.cache_creation_5m_input_tokens =
+                cache_usage.cache_creation_5m_input_tokens.max(cache_5m);
+            cache_usage.cache_creation_1h_input_tokens =
+                cache_usage.cache_creation_1h_input_tokens.max(cache_1h);
         }
     }
 
-    None
+    if saw_cache_fields {
+        snapshot.prompt_cache_usage = Some(cache_usage);
+    }
+
+    snapshot.has_tokens().then_some(snapshot)
 }
 
 #[derive(Debug)]
@@ -822,6 +833,25 @@ mod tests {
         assert_eq!(snapshot.input_tokens, None);
         assert_eq!(snapshot.output_tokens, Some(25));
         assert_eq!(snapshot.total_tokens, Some(1000));
+    }
+
+    #[test]
+    fn merges_usage_snapshot_tokens_and_cache_from_separate_maps() {
+        let value = json!({
+            "cacheReadInputTokens": 44,
+            "usage": {
+                "inputTokens": 900,
+                "outputTokens": 33
+            }
+        });
+
+        let snapshot = extract_usage_snapshot_from_metering(&value).unwrap();
+        assert_eq!(snapshot.input_tokens, Some(900));
+        assert_eq!(snapshot.output_tokens, Some(33));
+        assert_eq!(
+            snapshot.prompt_cache_usage.unwrap().cache_read_input_tokens,
+            44
+        );
     }
 
     #[test]
