@@ -25,7 +25,7 @@ use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::prompt_cache::{
     PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
-    decide_prompt_cache, extract_usage_from_metering,
+    decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
 use super::stream::PrefixBufferedStreamContext;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -574,6 +574,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut upstream_input_tokens: Option<i32> = None;
+    let mut upstream_output_tokens: Option<i32> = None;
     let mut upstream_cache_usage: Option<PromptCacheUsage> = None;
 
     // 收集工具调用的增量 JSON
@@ -643,8 +645,21 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::Metering(payload) => {
-                            if let Some(usage) = extract_usage_from_metering(&payload) {
-                                upstream_cache_usage = Some(usage);
+                            if let Some(snapshot) = extract_usage_snapshot_from_metering(&payload) {
+                                if let Some(input_tokens) = snapshot.input_tokens {
+                                    upstream_input_tokens = Some(input_tokens.max(1));
+                                } else if let Some(total_tokens) = snapshot.total_tokens {
+                                    if let Some(output_tokens) = snapshot.output_tokens {
+                                        upstream_input_tokens =
+                                            Some((total_tokens - output_tokens).max(1));
+                                    }
+                                }
+                                if let Some(output_tokens) = snapshot.output_tokens {
+                                    upstream_output_tokens = Some(output_tokens.max(0));
+                                }
+                                if let Some(usage) = snapshot.prompt_cache_usage {
+                                    upstream_cache_usage = Some(usage);
+                                }
                             }
                         }
                         Event::Exception { exception_type, .. } => {
@@ -698,10 +713,13 @@ async fn handle_non_stream_request(
     content.extend(tool_uses);
 
     // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
+    let output_tokens =
+        upstream_output_tokens.unwrap_or_else(|| token::estimate_output_tokens(&content));
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 优先使用上游 meteringEvent usage，其次 contextUsageEvent，最后回退估算值
+    let final_input_tokens = upstream_input_tokens
+        .or(context_input_tokens)
+        .unwrap_or(input_tokens);
     let cache_decision = decide_prompt_cache(
         prompt_cache_mode,
         upstream_cache_usage,

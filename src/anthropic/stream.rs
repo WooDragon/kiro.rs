@@ -1257,8 +1257,6 @@ pub struct BufferedStreamContext {
     inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
 }
@@ -1280,7 +1278,6 @@ impl BufferedStreamContext {
         Self {
             inner,
             event_buffer: Vec::new(),
-            estimated_input_tokens,
             initial_events_generated: false,
         }
     }
@@ -1334,10 +1331,7 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        let final_input_tokens = self.inner.final_input_tokens();
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
@@ -1690,6 +1684,33 @@ mod tests {
                 .iter()
                 .any(|event| event.event == "content_block_delta")
         );
+    }
+
+    #[test]
+    fn buffered_stream_rewrites_message_start_with_upstream_metering_tokens() {
+        let mut ctx =
+            BufferedStreamContext::new("claude-sonnet-4-5-20250929", 10, false, HashMap::new());
+
+        ctx.process_and_buffer(&Event::Metering(json!({
+            "usage": {
+                "inputTokens": 321,
+                "outputTokens": 17
+            }
+        })));
+
+        let events = ctx.finish_and_get_all_events();
+        let message_start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap();
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap();
+
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 321);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 321);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 17);
     }
 
     #[test]
