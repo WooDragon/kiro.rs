@@ -153,10 +153,15 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut failed_credential_ids: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session_excluding(None, None, &failed_credential_ids)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -173,6 +178,7 @@ impl KiroProvider {
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager.report_failure(ctx.id);
+                    failed_credential_ids.insert(ctx.id);
                     continue;
                 }
             };
@@ -212,6 +218,7 @@ impl KiroProvider {
                     );
                     last_error = Some(e.into());
                     self.token_manager.report_no_result(ctx.id);
+                    failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -266,6 +273,7 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                failed_credential_ids.insert(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -284,6 +292,7 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 self.token_manager.report_no_result(ctx.id);
+                failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -299,6 +308,7 @@ impl KiroProvider {
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             self.token_manager.report_no_result(ctx.id);
+            failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -324,6 +334,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut failed_credential_ids: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -334,7 +345,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context_for_session(model.as_deref(), session_id.as_deref())
+                .acquire_context_for_session_excluding(
+                    model.as_deref(),
+                    session_id.as_deref(),
+                    &failed_credential_ids,
+                )
                 .await
             {
                 Ok(c) => c,
@@ -352,6 +367,7 @@ impl KiroProvider {
                 Err(e) => {
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
+                    failed_credential_ids.insert(ctx.id);
                     continue;
                 }
             };
@@ -393,6 +409,7 @@ impl KiroProvider {
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
                     self.token_manager.report_no_result(ctx.id);
+                    failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -478,6 +495,7 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                failed_credential_ids.insert(ctx.id);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -513,6 +531,7 @@ impl KiroProvider {
                     body
                 ));
                 self.token_manager.report_no_result(ctx.id);
+                failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -540,6 +559,7 @@ impl KiroProvider {
                 body
             ));
             self.token_manager.report_no_result(ctx.id);
+            failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
