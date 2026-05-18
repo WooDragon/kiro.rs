@@ -13,7 +13,7 @@ use crate::model::config::PromptCacheMode;
 
 use super::prompt_cache::{
     PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
-    decide_prompt_cache, extract_usage_from_metering,
+    decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -535,6 +535,8 @@ pub struct StreamContext {
     pub prompt_cache_usage: PromptCacheUsage,
     pub include_prompt_cache_fields: bool,
     pub upstream_prompt_cache_usage: Option<PromptCacheUsage>,
+    pub upstream_input_tokens: Option<i32>,
+    pub upstream_output_tokens: Option<i32>,
     pub prompt_cache_updated: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
@@ -579,6 +581,8 @@ impl StreamContext {
             prompt_cache_usage: PromptCacheUsage::default(),
             include_prompt_cache_fields: false,
             upstream_prompt_cache_usage: None,
+            upstream_input_tokens: None,
+            upstream_output_tokens: None,
             prompt_cache_updated: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -695,8 +699,21 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(payload) => {
-                if let Some(usage) = extract_usage_from_metering(payload) {
-                    self.upstream_prompt_cache_usage = Some(usage);
+                if let Some(snapshot) = extract_usage_snapshot_from_metering(payload) {
+                    if let Some(input_tokens) = snapshot.input_tokens {
+                        self.upstream_input_tokens = Some(input_tokens.max(1));
+                    } else if let Some(total_tokens) = snapshot.total_tokens {
+                        if let Some(output_tokens) = snapshot.output_tokens {
+                            self.upstream_input_tokens =
+                                Some((total_tokens - output_tokens).max(1));
+                        }
+                    }
+                    if let Some(output_tokens) = snapshot.output_tokens {
+                        self.upstream_output_tokens = Some(output_tokens.max(0));
+                    }
+                    if let Some(usage) = snapshot.prompt_cache_usage {
+                        self.upstream_prompt_cache_usage = Some(usage);
+                    }
                     let decision = decide_prompt_cache(
                         self.prompt_cache_mode,
                         self.upstream_prompt_cache_usage,
@@ -1171,19 +1188,36 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_input_tokens = self.final_input_tokens();
+        let final_output_tokens = self.final_output_tokens();
 
         self.update_prompt_cache();
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
-            self.output_tokens,
+            final_output_tokens,
             self.prompt_cache_usage,
             self.include_prompt_cache_fields,
         ));
         events
+    }
+
+    pub fn final_input_tokens(&self) -> i32 {
+        self.upstream_input_tokens
+            .or(self.context_input_tokens)
+            .unwrap_or(self.input_tokens)
+            .max(1)
+    }
+
+    pub fn final_output_tokens(&self) -> i32 {
+        self.upstream_output_tokens
+            .unwrap_or(self.output_tokens)
+            .max(0)
+    }
+
+    pub fn has_reliable_input_tokens(&self) -> bool {
+        self.upstream_input_tokens.is_some() || self.context_input_tokens.is_some()
     }
 
     fn update_prompt_cache(&mut self) {
@@ -1325,6 +1359,130 @@ impl BufferedStreamContext {
     }
 }
 
+const PREFIX_BUFFER_MAX_EVENTS: usize = 128;
+
+/// 前缀缓冲流处理上下文 - 用于 /cc/v1/messages 默认流式策略
+///
+/// 只在 `message_start` 前短暂缓冲；拿到可靠 input_tokens、超过缓冲上限或超时后，
+/// 释放修正后的前缀事件，随后退化为普通实时流式输出。
+pub struct PrefixBufferedStreamContext {
+    inner: StreamContext,
+    event_buffer: Vec<SseEvent>,
+    initial_events_generated: bool,
+    released: bool,
+}
+
+impl PrefixBufferedStreamContext {
+    pub fn new(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            inner: StreamContext::new_with_thinking(
+                model,
+                estimated_input_tokens,
+                thinking_enabled,
+                tool_name_map,
+            ),
+            event_buffer: Vec::new(),
+            initial_events_generated: false,
+            released: false,
+        }
+    }
+
+    pub fn with_prompt_cache(
+        mut self,
+        mode: PromptCacheMode,
+        tracker: Option<Arc<PromptCacheTracker>>,
+        account: Option<String>,
+        profile: Option<PromptCacheProfile>,
+        fallback_usage: PromptCacheUsage,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_prompt_cache(mode, tracker, account, profile, fallback_usage);
+        self
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.released
+    }
+
+    pub fn process_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if !self.initial_events_generated {
+            let initial_events = self.inner.generate_initial_events();
+            if self.released {
+                self.initial_events_generated = true;
+                let mut events = initial_events;
+                events.extend(self.inner.process_kiro_event(event));
+                return events;
+            }
+            self.event_buffer.extend(initial_events);
+            self.initial_events_generated = true;
+        }
+
+        let events = self.inner.process_kiro_event(event);
+        if self.released {
+            events
+        } else {
+            self.event_buffer.extend(events);
+            if self.inner.has_reliable_input_tokens()
+                || self.event_buffer.len() >= PREFIX_BUFFER_MAX_EVENTS
+            {
+                self.release()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn release_due_to_timeout(&mut self) -> Vec<SseEvent> {
+        if self.released {
+            Vec::new()
+        } else {
+            tracing::debug!("Claude Code prefix buffer timed out; releasing with best usage");
+            self.release()
+        }
+    }
+
+    pub fn finish(&mut self) -> Vec<SseEvent> {
+        let final_events = self.inner.generate_final_events();
+        if self.released {
+            final_events
+        } else {
+            if !self.initial_events_generated {
+                self.event_buffer
+                    .extend(self.inner.generate_initial_events());
+                self.initial_events_generated = true;
+            }
+            self.event_buffer.extend(final_events);
+            self.release()
+        }
+    }
+
+    fn release(&mut self) -> Vec<SseEvent> {
+        self.released = true;
+        let final_input_tokens = self.inner.final_input_tokens();
+        for event in &mut self.event_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        *usage = build_usage_value(
+                            final_input_tokens,
+                            1,
+                            self.inner.prompt_cache_usage,
+                            self.inner.include_prompt_cache_fields,
+                        );
+                    }
+                }
+            }
+        }
+        std::mem::take(&mut self.event_buffer)
+    }
+}
+
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
@@ -1425,6 +1583,112 @@ mod tests {
         assert_eq!(
             start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
+        );
+    }
+
+    #[test]
+    fn stream_final_usage_prefers_upstream_metering_tokens() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-5-20250929",
+            10,
+            false,
+            HashMap::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Metering(json!({
+            "usage": {
+                "inputTokens": 321,
+                "outputTokens": 17
+            }
+        })));
+        assert!(events.is_empty());
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["usage"]["input_tokens"], 321);
+        assert_eq!(delta.data["usage"]["output_tokens"], 17);
+    }
+
+    #[test]
+    fn stream_final_usage_derives_input_from_total_and_output_tokens() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-5-20250929",
+            10,
+            false,
+            HashMap::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let _ = ctx.process_kiro_event(&Event::Metering(json!({
+            "usage": {
+                "totalTokens": 100,
+                "outputTokens": 7
+            }
+        })));
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["usage"]["input_tokens"], 93);
+        assert_eq!(delta.data["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn prefix_buffer_releases_message_start_when_usage_arrives() {
+        let mut ctx = PrefixBufferedStreamContext::new(
+            "claude-sonnet-4-5-20250929",
+            10,
+            false,
+            HashMap::new(),
+        );
+
+        let events = ctx.process_event(&Event::Metering(json!({
+            "usage": {
+                "inputTokens": 321,
+                "outputTokens": 17
+            }
+        })));
+
+        assert!(ctx.is_released());
+        let message_start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap();
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 321);
+    }
+
+    #[test]
+    fn prefix_buffer_timeout_releases_with_estimated_usage() {
+        let mut ctx = PrefixBufferedStreamContext::new(
+            "claude-sonnet-4-5-20250929",
+            10,
+            false,
+            HashMap::new(),
+        );
+
+        let buffered = ctx.process_event(&Event::AssistantResponse(
+            serde_json::from_value(json!({"content": "hello"})).unwrap(),
+        ));
+        assert!(buffered.is_empty());
+        assert!(!ctx.is_released());
+
+        let events = ctx.release_due_to_timeout();
+        assert!(ctx.is_released());
+        let message_start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap();
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 10);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "content_block_delta")
         );
     }
 

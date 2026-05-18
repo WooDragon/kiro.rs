@@ -8,7 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::PromptCacheMode;
+use crate::model::config::{CcStreamingMode, PromptCacheMode};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -40,8 +40,14 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     prompt_cache_mode: PromptCacheMode,
+    cc_streaming_mode: CcStreamingMode,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking, prompt_cache_mode);
+    let mut state = AppState::new(
+        api_key,
+        extract_thinking,
+        prompt_cache_mode,
+        cc_streaming_mode,
+    );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -57,7 +63,7 @@ pub fn create_router_with_provider(
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    // 与 /v1 的区别：流式策略由 ccStreamingMode 控制，默认仅在首帧前短暂缓冲
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))

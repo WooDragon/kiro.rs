@@ -20,9 +20,23 @@ pub enum PromptCacheMode {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CcStreamingMode {
+    Buffered,
+    Prefix,
+    Streaming,
+}
+
 impl Default for PromptCacheMode {
     fn default() -> Self {
         Self::Auto
+    }
+}
+
+impl Default for CcStreamingMode {
+    fn default() -> Self {
+        Self::Prefix
     }
 }
 
@@ -122,6 +136,14 @@ pub struct Config {
     #[serde(default, alias = "anthropic_prompt_cache_mode")]
     pub anthropic_prompt_cache_mode: PromptCacheMode,
 
+    /// Claude Code 兼容端点的流式策略（默认 prefix）
+    ///
+    /// - buffered: 等待上游流结束后一次性返回（旧行为）
+    /// - prefix: 仅在首帧前短暂缓冲，拿到可靠 usage 或超时后实时返回
+    /// - streaming: 与 /v1/messages 一样立即流式返回
+    #[serde(default, alias = "cc_streaming_mode")]
+    pub cc_streaming_mode: CcStreamingMode,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -207,6 +229,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             anthropic_prompt_cache_mode: PromptCacheMode::default(),
+            cc_streaming_mode: CcStreamingMode::default(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -264,5 +287,43 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cc_streaming_mode_defaults_to_prefix() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cc_streaming_mode, CcStreamingMode::Prefix);
+    }
+
+    #[test]
+    fn cc_streaming_mode_accepts_camel_and_snake_case() {
+        let camel: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "ccStreamingMode": "buffered"
+            }"#,
+        )
+        .unwrap();
+        let snake: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "cc_streaming_mode": "streaming"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(camel.cc_streaming_mode, CcStreamingMode::Buffered);
+        assert_eq!(snake.cc_streaming_mode, CcStreamingMode::Streaming);
     }
 }

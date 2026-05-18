@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::model::config::PromptCacheMode;
 
-use super::types::{CacheControl, MessagesRequest};
+use super::types::{CacheControl, MessagesRequest, is_claude_code_filtered_prompt_text};
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
@@ -59,6 +59,23 @@ pub struct PromptCacheTracker {
 pub struct PromptCacheDecision {
     pub fallback_usage: PromptCacheUsage,
     pub include_cache_fields: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub input_tokens: Option<i32>,
+    pub output_tokens: Option<i32>,
+    pub total_tokens: Option<i32>,
+    pub prompt_cache_usage: Option<PromptCacheUsage>,
+}
+
+impl UsageSnapshot {
+    pub fn has_tokens(self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.total_tokens.is_some()
+            || self.prompt_cache_usage.is_some()
+    }
 }
 
 impl PromptCacheTracker {
@@ -291,10 +308,39 @@ pub fn build_usage_value(
 }
 
 pub fn extract_usage_from_metering(value: &Value) -> Option<PromptCacheUsage> {
+    extract_usage_snapshot_from_metering(value).and_then(|snapshot| snapshot.prompt_cache_usage)
+}
+
+pub fn extract_usage_snapshot_from_metering(value: &Value) -> Option<UsageSnapshot> {
     let mut maps = Vec::new();
     collect_usage_maps(value, &mut maps);
 
     for map in maps {
+        let input_tokens = read_i32(
+            map,
+            &[
+                "inputTokens",
+                "input_tokens",
+                "contextInputTokens",
+                "context_input_tokens",
+                "promptTokens",
+                "prompt_tokens",
+                "uncachedInputTokens",
+                "uncached_input_tokens",
+            ],
+        );
+        let output_tokens = read_i32(
+            map,
+            &[
+                "outputTokens",
+                "output_tokens",
+                "completionTokens",
+                "completion_tokens",
+                "generatedTokens",
+                "generated_tokens",
+            ],
+        );
+        let total_tokens = read_i32(map, &["totalTokens", "total_tokens"]);
         let cache_read =
             read_i32(map, &["cacheReadInputTokens", "cache_read_input_tokens"]).unwrap_or(0);
         let cache_creation = read_i32(
@@ -332,11 +378,26 @@ pub fn extract_usage_from_metering(value: &Value) -> Option<PromptCacheUsage> {
             cache_creation_5m_input_tokens: cache_5m,
             cache_creation_1h_input_tokens: cache_1h,
         };
-        if usage.has_tokens()
-            || map.contains_key("uncachedInputTokens")
-            || map.contains_key("uncached_input_tokens")
+        let prompt_cache_usage = if usage.has_tokens()
+            || map.contains_key("cacheReadInputTokens")
+            || map.contains_key("cache_read_input_tokens")
+            || map.contains_key("cacheCreationInputTokens")
+            || map.contains_key("cache_creation_input_tokens")
+            || map.contains_key("cacheWriteInputTokens")
+            || map.contains_key("cache_write_input_tokens")
         {
-            return Some(usage);
+            Some(usage)
+        } else {
+            None
+        };
+        let snapshot = UsageSnapshot {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            prompt_cache_usage,
+        };
+        if snapshot.has_tokens() {
+            return Some(snapshot);
         }
     }
 
@@ -644,9 +705,7 @@ fn is_anthropic_billing_header_block(value: &Value) -> bool {
     let Some(text) = map.get("text").and_then(Value::as_str) else {
         return false;
     };
-    text.trim_start()
-        .to_ascii_lowercase()
-        .starts_with("x-anthropic-billing-header:")
+    is_claude_code_filtered_prompt_text(text)
 }
 
 fn write_hash_chunk(hasher: &mut Sha256, chunk: &[u8]) {
@@ -725,6 +784,44 @@ mod tests {
         let usage = extract_usage_from_metering(&value).unwrap();
         assert_eq!(usage.cache_read_input_tokens, 123);
         assert_eq!(usage.cache_creation_input_tokens, 456);
+    }
+
+    #[test]
+    fn parses_upstream_usage_snapshot_tokens_and_cache_fields() {
+        let value = json!({
+            "metering": {
+                "tokenUsage": {
+                    "inputTokens": "321",
+                    "outputTokens": 17,
+                    "totalTokens": 338,
+                    "cacheWriteInputTokens": 55,
+                    "cacheReadInputTokens": 89
+                }
+            }
+        });
+
+        let snapshot = extract_usage_snapshot_from_metering(&value).unwrap();
+        assert_eq!(snapshot.input_tokens, Some(321));
+        assert_eq!(snapshot.output_tokens, Some(17));
+        assert_eq!(snapshot.total_tokens, Some(338));
+        let cache = snapshot.prompt_cache_usage.unwrap();
+        assert_eq!(cache.cache_creation_input_tokens, 55);
+        assert_eq!(cache.cache_read_input_tokens, 89);
+    }
+
+    #[test]
+    fn parses_upstream_usage_snapshot_from_total_minus_output() {
+        let value = json!({
+            "usage": {
+                "total_tokens": 1000,
+                "output_tokens": 25
+            }
+        });
+
+        let snapshot = extract_usage_snapshot_from_metering(&value).unwrap();
+        assert_eq!(snapshot.input_tokens, None);
+        assert_eq!(snapshot.output_tokens, Some(25));
+        assert_eq!(snapshot.total_tokens, Some(1000));
     }
 
     #[test]

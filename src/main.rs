@@ -160,6 +160,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         config.anthropic_prompt_cache_mode,
+        config.cc_streaming_mode,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
