@@ -13,6 +13,7 @@ const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
 const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
+const PREFIX_LOOKBACK_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PromptCacheUsage {
@@ -157,10 +158,13 @@ impl PromptCacheTracker {
         }
 
         let mut matched_tokens = 0;
-        for breakpoint in profile.breakpoints.iter().rev() {
-            if breakpoint.cumulative_tokens < min_tokens {
-                continue;
-            }
+        for breakpoint in profile
+            .breakpoints
+            .iter()
+            .rev()
+            .filter(|breakpoint| breakpoint.cumulative_tokens >= min_tokens)
+            .take(PREFIX_LOOKBACK_LIMIT)
+        {
             let Some(entry) = entries.get_mut(&breakpoint.fingerprint) else {
                 continue;
             };
@@ -207,12 +211,11 @@ impl PromptCacheTracker {
             if breakpoint.cumulative_tokens < min_tokens {
                 continue;
             }
-            entries.insert(
-                breakpoint.fingerprint,
-                PromptCacheEntry {
+            entries
+                .entry(breakpoint.fingerprint)
+                .or_insert(PromptCacheEntry {
                     expires_at: now + breakpoint.ttl,
-                },
-            );
+                });
         }
     }
 }
@@ -714,6 +717,32 @@ mod tests {
         "abcd ".repeat(1200)
     }
 
+    fn request_with_message_count(message_count: usize) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: (0..message_count)
+                .map(|idx| Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("{} message-{idx}", long_text())),
+                })
+                .collect(),
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: long_text(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
     #[test]
     fn parses_upstream_cache_usage() {
         let value = json!({
@@ -809,6 +838,53 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn cache_update_does_not_extend_existing_expiry() {
+        let tracker = PromptCacheTracker::default();
+        let req = request_with_message_count(1);
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+        let fingerprint = profile.breakpoints.last().unwrap().fingerprint;
+
+        tracker.update("account", Some(&profile));
+        let before = {
+            let entries_by_account = tracker.entries_by_account.lock().unwrap();
+            entries_by_account
+                .get("account")
+                .and_then(|entries| entries.get(&fingerprint))
+                .map(|entry| entry.expires_at)
+                .unwrap()
+        };
+
+        std::thread::sleep(Duration::from_millis(5));
+        tracker.update("account", Some(&profile));
+
+        let after = {
+            let entries_by_account = tracker.entries_by_account.lock().unwrap();
+            entries_by_account
+                .get("account")
+                .and_then(|entries| entries.get(&fingerprint))
+                .map(|entry| entry.expires_at)
+                .unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn prefix_match_looks_back_only_recent_ten_breakpoints() {
+        let tracker = PromptCacheTracker::default();
+        let initial_req = request_with_message_count(1);
+        let initial_profile = tracker.build_profile(&initial_req, 3000).unwrap();
+        tracker.update("account", Some(&initial_profile));
+
+        let extended_req = request_with_message_count(PREFIX_LOOKBACK_LIMIT + 2);
+        let extended_profile = tracker.build_profile(&extended_req, 30_000).unwrap();
+        assert!(extended_profile.breakpoints.len() > PREFIX_LOOKBACK_LIMIT);
+
+        let usage = tracker.compute("account", Some(&extended_profile));
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert!(usage.cache_creation_input_tokens > 0);
     }
 
     #[test]

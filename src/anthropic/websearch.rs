@@ -516,22 +516,25 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
+    let (search_results, credential_id) = match call_mcp_api(&provider, &mcp_request).await {
+        Ok((response, credential_id)) => (parse_search_results(&response), Some(credential_id)),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            (None, None)
         }
     };
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let account_key = "websearch";
+    let account_key = credential_id.map(|id| id.to_string());
     let prompt_cache_usage = if matches!(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        prompt_cache.compute(account_key, prompt_cache_profile.as_ref())
+        account_key
+            .as_deref()
+            .map(|key| prompt_cache.compute(key, prompt_cache_profile.as_ref()))
+            .unwrap_or_default()
     } else {
         PromptCacheUsage::default()
     };
@@ -544,7 +547,9 @@ pub async fn handle_websearch_request(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        prompt_cache.update(account_key, prompt_cache_profile.as_ref());
+        if let Some(account_key) = account_key.as_deref() {
+            prompt_cache.update(account_key, prompt_cache_profile.as_ref());
+        }
     }
     let stream = create_websearch_sse_stream(
         model,
@@ -569,12 +574,14 @@ pub async fn handle_websearch_request(
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
-) -> anyhow::Result<McpResponse> {
+) -> anyhow::Result<(McpResponse, u64)> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let api_response = provider.call_mcp_with_context(&request_body).await?;
+    let credential_id = api_response.credential_id;
+    let response = api_response.response;
 
     let body = response.text().await?;
     tracing::debug!("MCP response: {}", body);
@@ -589,7 +596,7 @@ async fn call_mcp_api(
         );
     }
 
-    Ok(mcp_response)
+    Ok((mcp_response, credential_id))
 }
 
 #[cfg(test)]

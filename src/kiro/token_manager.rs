@@ -547,6 +547,12 @@ const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const MAX_STICKY_SESSIONS: usize = 10_000;
 /// 会话粘性全量 TTL 清理的最小间隔
 const STICKY_SESSION_PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(60);
+/// balanced 模式下新凭据完成 warmup 前的成功次数阈值
+const BALANCED_WARMUP_SUCCESS_THRESHOLD: u64 = 5;
+/// balanced 模式下新凭据完成 warmup 前允许的最大并发
+const BALANCED_WARMUP_MAX_IN_FLIGHT: u64 = 1;
+/// balanced 模式下新凭据选择分数的 warmup 惩罚权重
+const BALANCED_WARMUP_SCORE_PENALTY: u64 = 10;
 
 /// API 调用上下文
 ///
@@ -844,6 +850,25 @@ impl MultiTokenManager {
         (entry.id, entry.credentials.clone())
     }
 
+    fn is_balanced_warmup_saturated(entry: &CredentialEntry) -> bool {
+        entry.success_count < BALANCED_WARMUP_SUCCESS_THRESHOLD
+            && entry.in_flight_count >= BALANCED_WARMUP_MAX_IN_FLIGHT
+    }
+
+    fn balanced_selection_score(entry: &CredentialEntry) -> (u64, u64, u32) {
+        let remaining_warmup =
+            BALANCED_WARMUP_SUCCESS_THRESHOLD.saturating_sub(entry.success_count);
+        let warmup_penalty = remaining_warmup.saturating_mul(BALANCED_WARMUP_SCORE_PENALTY);
+        (
+            entry
+                .success_count
+                .saturating_add(entry.in_flight_count)
+                .saturating_add(warmup_penalty),
+            entry.in_flight_count,
+            entry.credentials.priority,
+        )
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -877,14 +902,21 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used + in-flight 策略：选择已成功和正在处理请求总量最少的凭据
+                // Least-Used + in-flight + warmup 策略：选择已成功和正在处理请求总量最少的凭据
+                // 新凭据在 warmup 完成前限制最大并发，避免瞬间承接过多流量。
+                let mut candidates: Vec<usize> = available
+                    .iter()
+                    .copied()
+                    .filter(|idx| !Self::is_balanced_warmup_saturated(&entries[*idx]))
+                    .collect();
+                if candidates.is_empty() {
+                    candidates = available;
+                }
+
                 // 平局时按优先级排序（数字越小优先级越高）
-                let idx = available.iter().min_by_key(|idx| {
+                let idx = candidates.iter().min_by_key(|idx| {
                     let e = &entries[**idx];
-                    (
-                        e.success_count.saturating_add(e.in_flight_count),
-                        e.credentials.priority,
-                    )
+                    Self::balanced_selection_score(e)
                 })?;
 
                 Some(Self::reserve_credential(&mut entries[*idx], Utc::now()))
@@ -2864,6 +2896,42 @@ mod tests {
         manager.report_no_result(first.id);
         manager.report_no_result(second.id);
         manager.report_no_result(third.id);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_warmup_limits_new_credential_concurrency() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("warmed-token", 0),
+                valid_access_credential("new-token", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .success_count = 100;
+        }
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 2);
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 1);
+
+        manager.report_no_result(first.id);
+        manager.report_no_result(second.id);
     }
 
     #[tokio::test]

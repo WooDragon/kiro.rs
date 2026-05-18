@@ -143,12 +143,23 @@ impl KiroProvider {
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
+    #[allow(dead_code)]
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_context(request_body)
+            .await
+            .map(|r| r.response)
+    }
+
+    /// 发送 MCP API 请求，并返回实际使用的凭据 ID。
+    pub async fn call_mcp_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<KiroApiResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -231,7 +242,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(KiroApiResponse {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应
