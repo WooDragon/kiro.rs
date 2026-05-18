@@ -1442,21 +1442,26 @@ impl PrefixBufferedStreamContext {
     }
 
     pub fn finish(&mut self) -> Vec<SseEvent> {
-        let final_events = self.inner.generate_final_events();
         if self.released {
-            final_events
+            self.inner.generate_final_events()
         } else {
             if !self.initial_events_generated {
                 self.event_buffer
                     .extend(self.inner.generate_initial_events());
                 self.initial_events_generated = true;
             }
+            let final_events = self.inner.generate_final_events();
             self.event_buffer.extend(final_events);
             self.release()
         }
     }
 
     fn release(&mut self) -> Vec<SseEvent> {
+        if !self.initial_events_generated {
+            self.event_buffer
+                .extend(self.inner.generate_initial_events());
+            self.initial_events_generated = true;
+        }
         self.released = true;
         let final_input_tokens = self.inner.final_input_tokens();
         for event in &mut self.event_buffer {
@@ -1683,6 +1688,41 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event == "content_block_delta")
+        );
+    }
+
+    #[test]
+    fn prefix_buffer_timeout_before_first_upstream_event_emits_message_start() {
+        let mut ctx = PrefixBufferedStreamContext::new(
+            "claude-sonnet-4-5-20250929",
+            10,
+            false,
+            HashMap::new(),
+        );
+
+        let events = ctx.release_due_to_timeout();
+
+        assert!(ctx.is_released());
+        assert_eq!(
+            events.first().map(|event| event.event.as_str()),
+            Some("message_start")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "content_block_start")
+        );
+
+        let final_events = ctx.finish();
+        assert!(
+            final_events
+                .iter()
+                .any(|event| event.event == "message_delta")
+        );
+        assert!(
+            !final_events
+                .iter()
+                .any(|event| event.event == "message_start")
         );
     }
 
