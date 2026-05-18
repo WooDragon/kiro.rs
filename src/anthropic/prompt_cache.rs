@@ -11,6 +11,7 @@ use super::types::{CacheControl, MessagesRequest};
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
+const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,7 +48,6 @@ pub struct PromptCacheProfile {
 #[derive(Debug, Clone, Copy)]
 struct PromptCacheEntry {
     expires_at: Instant,
-    ttl: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -167,7 +167,6 @@ impl PromptCacheTracker {
             if entry.expires_at <= now {
                 continue;
             }
-            entry.expires_at = now + entry.ttl;
             matched_tokens = breakpoint
                 .cumulative_tokens
                 .min(profile.total_input_tokens)
@@ -212,7 +211,6 @@ impl PromptCacheTracker {
                 breakpoint.fingerprint,
                 PromptCacheEntry {
                     expires_at: now + breakpoint.ttl,
-                    ttl: breakpoint.ttl,
                 },
             );
         }
@@ -556,8 +554,11 @@ fn prune_expired(
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    if model.to_ascii_lowercase().contains("opus") {
+    let model = model.to_ascii_lowercase();
+    if model.contains("opus") {
         OPUS_MIN_CACHEABLE_TOKENS
+    } else if model.contains("haiku-3") || model.contains("haiku_3") || model.contains("haiku 3") {
+        HAIKU_3_MIN_CACHEABLE_TOKENS
     } else {
         DEFAULT_MIN_CACHEABLE_TOKENS
     }
@@ -754,5 +755,76 @@ mod tests {
         tracker.update("account", Some(&profile));
         let second = tracker.compute("account", Some(&profile));
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn cache_hit_does_not_extend_expiry() {
+        let tracker = PromptCacheTracker::default();
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(long_text()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: long_text(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+        let fingerprint = profile.breakpoints.last().unwrap().fingerprint;
+
+        tracker.update("account", Some(&profile));
+        let before = {
+            let entries_by_account = tracker.entries_by_account.lock().unwrap();
+            entries_by_account
+                .get("account")
+                .and_then(|entries| entries.get(&fingerprint))
+                .map(|entry| entry.expires_at)
+                .unwrap()
+        };
+
+        let usage = tracker.compute("account", Some(&profile));
+        assert!(usage.cache_read_input_tokens > 0);
+
+        let after = {
+            let entries_by_account = tracker.entries_by_account.lock().unwrap();
+            entries_by_account
+                .get("account")
+                .and_then(|entries| entries.get(&fingerprint))
+                .map(|entry| entry.expires_at)
+                .unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn min_cacheable_tokens_follow_anthropic_model_thresholds() {
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-opus-4-7"),
+            OPUS_MIN_CACHEABLE_TOKENS
+        );
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-haiku-3-5-20241022"),
+            HAIKU_3_MIN_CACHEABLE_TOKENS
+        );
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-haiku-4-5-20251001"),
+            DEFAULT_MIN_CACHEABLE_TOKENS
+        );
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-sonnet-4-5"),
+            DEFAULT_MIN_CACHEABLE_TOKENS
+        );
     }
 }

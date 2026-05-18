@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -721,6 +721,14 @@ impl MultiTokenManager {
         true
     }
 
+    fn is_entry_available_for_model_excluding(
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        Self::is_entry_available_for_model(entry, model) && !excluded_ids.contains(&entry.id)
+    }
+
     fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
         let now = Instant::now();
         sessions.retain(|_, entry| now.duration_since(entry.last_used_at) <= STICKY_SESSION_TTL);
@@ -795,6 +803,7 @@ impl MultiTokenManager {
         &self,
         session_id: &str,
         model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         let credential_id = {
             let mut sessions = self.sticky_sessions.lock();
@@ -805,6 +814,10 @@ impl MultiTokenManager {
             }
             entry.credential_id
         };
+
+        if excluded_ids.contains(&credential_id) {
+            return None;
+        }
 
         let hit = {
             let entries = self.entries.lock();
@@ -838,14 +851,20 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let mut entries = self.entries.lock();
 
         // 过滤可用凭据
         let available: Vec<usize> = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| Self::is_entry_available_for_model(entry, model))
+            .filter(|(_, entry)| {
+                Self::is_entry_available_for_model_excluding(entry, model, excluded_ids)
+            })
             .map(|(idx, _)| idx)
             .collect();
 
@@ -880,11 +899,15 @@ impl MultiTokenManager {
         }
     }
 
-    fn reserve_existing_credential(
+    fn reserve_existing_credential_excluding(
         &self,
         id: u64,
         model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
+        if excluded_ids.contains(&id) {
+            return None;
+        }
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
@@ -915,6 +938,17 @@ impl MultiTokenManager {
         model: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_excluding(model, session_id, &HashSet::new())
+            .await
+    }
+
+    /// 获取指定会话的 API 调用上下文，并临时跳过本次请求中已失败的凭据。
+    pub async fn acquire_context_for_session_excluding(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -933,7 +967,8 @@ impl MultiTokenManager {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 let sticky_hit = if is_balanced {
-                    session_id.and_then(|sid| self.select_sticky_credential(sid, model))
+                    session_id
+                        .and_then(|sid| self.select_sticky_credential(sid, model, excluded_ids))
                 } else {
                     None
                 };
@@ -944,11 +979,11 @@ impl MultiTokenManager {
                     None
                 } else {
                     let current_id = *self.current_id.lock();
-                    self.reserve_existing_credential(current_id, model)
+                    self.reserve_existing_credential_excluding(current_id, model, excluded_ids)
                 };
 
                 if let Some((hit_id, _hit_credentials)) = sticky_hit {
-                    match self.reserve_existing_credential(hit_id, model) {
+                    match self.reserve_existing_credential_excluding(hit_id, model, excluded_ids) {
                         Some((reserved_id, reserved_credentials)) => {
                             (reserved_id, reserved_credentials, true)
                         }
@@ -956,7 +991,8 @@ impl MultiTokenManager {
                             if let Some(session_id) = session_id {
                                 self.clear_sticky_session_if_matches(session_id, hit_id);
                             }
-                            let mut best = self.select_next_credential(model);
+                            let mut best =
+                                self.select_next_credential_excluding(model, excluded_ids);
                             if best.is_none() {
                                 let mut entries = self.entries.lock();
                                 if entries.iter().any(|e| {
@@ -977,7 +1013,8 @@ impl MultiTokenManager {
                                         }
                                     }
                                     drop(entries);
-                                    best = self.select_next_credential(model);
+                                    best =
+                                        self.select_next_credential_excluding(model, excluded_ids);
                                 }
                             }
                             if let Some((new_id, new_creds)) = best {
@@ -995,7 +1032,7 @@ impl MultiTokenManager {
                     (hit_id, hit_credentials, false)
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential_excluding(model, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1014,7 +1051,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential_excluding(model, excluded_ids);
                         }
                     }
 
@@ -2609,6 +2646,62 @@ mod tests {
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         cred.priority = priority;
         cred
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_excluding_skips_failed_current_credential() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        manager.report_no_result(first.id);
+
+        let excluded = HashSet::from([first.id]);
+        let retry = manager
+            .acquire_context_for_session_excluding(None, None, &excluded)
+            .await
+            .unwrap();
+
+        assert_eq!(retry.id, 2);
+        manager.report_no_result(retry.id);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_excluding_ignores_sticky_failed_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-1", 1);
+        let excluded = HashSet::from([1]);
+        let retry = manager
+            .acquire_context_for_session_excluding(None, Some("session-1"), &excluded)
+            .await
+            .unwrap();
+
+        assert_eq!(retry.id, 2);
+        manager.report_no_result(retry.id);
     }
 
     #[tokio::test]
