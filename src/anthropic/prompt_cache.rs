@@ -554,10 +554,13 @@ fn prune_expired(
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model = model.to_ascii_lowercase();
+    let model = model
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-");
     if model.contains("opus") {
         OPUS_MIN_CACHEABLE_TOKENS
-    } else if model.contains("haiku-3") || model.contains("haiku_3") || model.contains("haiku 3") {
+    } else if model.contains("haiku-3") {
         HAIKU_3_MIN_CACHEABLE_TOKENS
     } else {
         DEFAULT_MIN_CACHEABLE_TOKENS

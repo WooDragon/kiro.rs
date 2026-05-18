@@ -726,7 +726,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> bool {
-        Self::is_entry_available_for_model(entry, model) && !excluded_ids.contains(&entry.id)
+        !excluded_ids.contains(&entry.id) && Self::is_entry_available_for_model(entry, model)
     }
 
     fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
