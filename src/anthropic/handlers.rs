@@ -196,9 +196,17 @@ fn available_models() -> Vec<Model> {
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
+    let models = available_models();
+    let first_id = models.first().map(|model| model.id.clone());
+    let last_id = models.last().map(|model| model.id.clone());
+
     Json(ModelsResponse {
+        response_type: "list".to_string(),
         object: "list".to_string(),
-        data: available_models(),
+        data: models,
+        has_more: false,
+        first_id,
+        last_id,
     })
 }
 

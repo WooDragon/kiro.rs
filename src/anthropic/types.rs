@@ -9,6 +9,8 @@ use std::collections::HashMap;
 /// API 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: String,
     pub error: ErrorDetail,
 }
 
@@ -24,6 +26,7 @@ impl ErrorResponse {
     /// 创建新的错误响应
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            response_type: "error".to_string(),
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
@@ -55,8 +58,13 @@ pub struct Model {
 /// 模型列表响应
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
+    #[serde(rename = "type")]
+    pub response_type: String,
     pub object: String,
     pub data: Vec<Model>,
+    pub has_more: bool,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
 }
 
 // === Messages 端点类型 ===
@@ -476,5 +484,15 @@ mod tests {
         assert!(!is_claude_code_filtered_prompt_text(
             "please keep x-anthropic-billing-header: as literal text"
         ));
+    }
+
+    #[test]
+    fn error_response_uses_anthropic_error_envelope() {
+        let response = ErrorResponse::new("invalid_request_error", "bad request");
+        let json = serde_json::to_value(response).expect("error response should serialize");
+
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "bad request");
     }
 }

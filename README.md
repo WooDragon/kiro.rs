@@ -378,6 +378,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
+| `/cc/v1/models` | GET | 获取可用模型列表（与 `/v1` 相同） |
 | `/cc/v1/messages` | POST | 创建消息（Claude Code 优化流式策略，默认首帧前短暂缓冲） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
