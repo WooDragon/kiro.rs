@@ -943,7 +943,7 @@ impl MultiTokenManager {
     }
 
     /// 获取指定会话的 API 调用上下文，并临时跳过本次请求中已失败的凭据。
-    pub async fn acquire_context_for_session_excluding(
+    pub(crate) async fn acquire_context_for_session_excluding(
         &self,
         model: Option<&str>,
         session_id: Option<&str>,
