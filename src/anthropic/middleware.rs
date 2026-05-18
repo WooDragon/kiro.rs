@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::PromptCacheMode;
+use crate::model::config::{CcStreamingMode, PromptCacheMode};
 
 use super::prompt_cache::PromptCacheTracker;
 use super::types::ErrorResponse;
@@ -29,6 +29,7 @@ pub struct AppState {
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
     pub prompt_cache_mode: PromptCacheMode,
+    pub cc_streaming_mode: CcStreamingMode,
     pub prompt_cache: Arc<PromptCacheTracker>,
 }
 
@@ -38,12 +39,14 @@ impl AppState {
         api_key: impl Into<String>,
         extract_thinking: bool,
         prompt_cache_mode: PromptCacheMode,
+        cc_streaming_mode: CcStreamingMode,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
             prompt_cache_mode,
+            cc_streaming_mode,
             prompt_cache: Arc::new(PromptCacheTracker::default()),
         }
     }

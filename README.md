@@ -183,6 +183,7 @@ docker-compose up
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `anthropicPromptCacheMode` | string | `auto` | Anthropic prompt cache 兼容模式：`off` / `passthrough` / `emulated` / `auto` |
+| `ccStreamingMode` | string | `prefix` | `/cc/v1/messages` 流式策略：`prefix`（首帧前短暂缓冲）/ `buffered`（旧版全量缓冲）/ `streaming`（与 `/v1` 相同） |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -208,7 +209,8 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
-   "extractThinking": true
+   "extractThinking": true,
+   "ccStreamingMode": "prefix"
 }
 ```
 
@@ -376,13 +378,15 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
+| `/cc/v1/messages` | POST | 创建消息（Claude Code 优化流式策略，默认首帧前短暂缓冲） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
-> - 等待期间会每 25 秒发送 `ping` 事件保活
+> - `/v1/messages`：实时流式返回，优先低延迟；`message_start.usage` 可能是估算值，最终 `message_delta.usage` 会尽量使用上游 usage 修正
+> - `/cc/v1/messages`：默认 `prefix` 模式，仅在首帧前短暂等待上游 usage；拿到可靠 usage、超时或缓冲达到上限后立即开始流式回放
+> - `ccStreamingMode=buffered` 保留旧行为：等待上游流完成后更正 `message_start` 并一次性返回所有事件
+> - `ccStreamingMode=streaming` 与 `/v1/messages` 行为一致
+> - 流开始后会每 25 秒发送 `ping` 事件保活
 
 Anthropic 兼容端点（`/v1/*` 与 `/cc/v1/*`）会在响应头中附带 `request-id`，用于请求追踪与日志关联。
 

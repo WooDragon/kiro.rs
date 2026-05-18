@@ -213,12 +213,17 @@ pub struct SystemMessage {
     pub cache_control: Option<CacheControl>,
 }
 
-const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+const CLAUDE_CODE_PROMPT_FILTER_PREFIXES: &[&str] = &["x-anthropic-billing-header:"];
 
-fn is_anthropic_billing_header_line(line: &str) -> bool {
-    line.trim_start()
-        .to_ascii_lowercase()
-        .starts_with(ANTHROPIC_BILLING_HEADER_PREFIX)
+pub(crate) fn is_claude_code_filtered_prompt_text(text: &str) -> bool {
+    let normalized = text.trim_start().to_ascii_lowercase();
+    CLAUDE_CODE_PROMPT_FILTER_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn is_claude_code_filtered_prompt_line(line: &str) -> bool {
+    is_claude_code_filtered_prompt_text(line)
 }
 
 pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<Cow<'_, str>> {
@@ -226,11 +231,11 @@ pub(crate) fn strip_anthropic_billing_header_text(text: &str) -> Option<Cow<'_, 
     let kept_lines: Vec<&str> = text
         .lines()
         .filter(|line| {
-            let is_billing_header = is_anthropic_billing_header_line(line);
-            if is_billing_header {
+            let should_filter = is_claude_code_filtered_prompt_line(line);
+            if should_filter {
                 changed = true;
             }
-            !is_billing_header
+            !should_filter
         })
         .collect();
 
@@ -461,5 +466,15 @@ mod tests {
             strip_anthropic_billing_header_text(text).as_deref(),
             Some(text)
         );
+    }
+
+    #[test]
+    fn claude_code_prompt_filter_only_matches_safe_prefixes() {
+        assert!(is_claude_code_filtered_prompt_text(
+            "  x-anthropic-billing-header: cc_version=2.1.87.42"
+        ));
+        assert!(!is_claude_code_filtered_prompt_text(
+            "please keep x-anthropic-billing-header: as literal text"
+        ));
     }
 }
