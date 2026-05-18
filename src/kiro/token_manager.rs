@@ -856,9 +856,13 @@ impl MultiTokenManager {
     }
 
     fn balanced_selection_score(entry: &CredentialEntry) -> (u64, u64, u32) {
-        let remaining_warmup =
-            BALANCED_WARMUP_SUCCESS_THRESHOLD.saturating_sub(entry.success_count);
-        let warmup_penalty = remaining_warmup.saturating_mul(BALANCED_WARMUP_SCORE_PENALTY);
+        let warmup_penalty = if entry.success_count < BALANCED_WARMUP_SUCCESS_THRESHOLD {
+            entry
+                .in_flight_count
+                .saturating_mul(BALANCED_WARMUP_SCORE_PENALTY)
+        } else {
+            0
+        };
         (
             entry
                 .success_count
