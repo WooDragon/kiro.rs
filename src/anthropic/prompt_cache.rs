@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_match_looks_back_only_recent_ten_breakpoints() {
+    fn prefix_match_respects_lookback_limit() {
         let tracker = PromptCacheTracker::default();
         let initial_req = request_with_message_count(1);
         let initial_profile = tracker.build_profile(&initial_req, 3000).unwrap();

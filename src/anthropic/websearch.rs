@@ -527,26 +527,18 @@ pub async fn handle_websearch_request(
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
     let account_key = credential_id.map(|id| id.to_string());
-    let prompt_cache_usage = if matches!(
+    let prompt_cache_enabled = matches!(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
-    ) {
-        account_key
-            .as_deref()
-            .map(|key| prompt_cache.compute(key, prompt_cache_profile.as_ref()))
-            .unwrap_or_default()
-    } else {
-        PromptCacheUsage::default()
+    );
+    let prompt_cache_usage = match (prompt_cache_enabled, account_key.as_deref()) {
+        (true, Some(account_key)) => {
+            prompt_cache.compute(account_key, prompt_cache_profile.as_ref())
+        }
+        _ => PromptCacheUsage::default(),
     };
-    let include_prompt_cache_fields = prompt_cache_profile.is_some()
-        && matches!(
-            prompt_cache_mode,
-            PromptCacheMode::Auto | PromptCacheMode::Emulated
-        );
-    if matches!(
-        prompt_cache_mode,
-        PromptCacheMode::Auto | PromptCacheMode::Emulated
-    ) {
+    let include_prompt_cache_fields = prompt_cache_profile.is_some() && prompt_cache_enabled;
+    if prompt_cache_enabled {
         if let Some(account_key) = account_key.as_deref() {
             prompt_cache.update(account_key, prompt_cache_profile.as_ref());
         }
