@@ -729,6 +729,11 @@ impl MultiTokenManager {
         !excluded_ids.contains(&entry.id) && Self::is_entry_available_for_model(entry, model)
     }
 
+    /// Computes the initial balanced-mode success count for a newly added credential.
+    ///
+    /// New credentials start at the minimum success count among currently enabled credentials so
+    /// they do not look artificially under-used and receive a burst of traffic. If there are no
+    /// enabled credentials yet, the new credential starts at zero.
     fn warm_start_success_count(entries: &[CredentialEntry]) -> u64 {
         entries
             .iter()
@@ -2903,6 +2908,15 @@ mod tests {
         new_cred.kiro_api_key = Some("ksk_new".to_string());
         new_cred.priority = 0;
         let new_id = manager.add_credential(new_cred).await.unwrap();
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|entry| entry.id == new_id)
+                .map(|entry| entry.success_count),
+            Some(100)
+        );
 
         let first = manager.acquire_context(None).await.unwrap();
         let second = manager.acquire_context(None).await.unwrap();
