@@ -413,6 +413,8 @@ struct CredentialEntry {
     in_flight_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 最近一次被选择用于请求的时间（仅内存态，用于 balanced 模式轮转）
+    last_reserved_at: Option<Instant>,
 }
 
 /// 禁用原因
@@ -615,6 +617,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     in_flight_count: 0,
                     last_used_at: None,
+                    last_reserved_at: None,
                 }
             })
             .collect();
@@ -729,20 +732,6 @@ impl MultiTokenManager {
         !excluded_ids.contains(&entry.id) && Self::is_entry_available_for_model(entry, model)
     }
 
-    /// Computes the initial balanced-mode success count for a newly added credential.
-    ///
-    /// New credentials start at the minimum success count among currently enabled credentials so
-    /// they do not look artificially under-used and receive a burst of traffic. If there are no
-    /// enabled credentials yet, the new credential starts at zero.
-    fn warm_start_success_count(entries: &[CredentialEntry]) -> u64 {
-        entries
-            .iter()
-            .filter(|entry| !entry.disabled)
-            .map(|entry| entry.success_count)
-            .min()
-            .unwrap_or(0)
-    }
-
     fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
         let now = Instant::now();
         sessions.retain(|_, entry| now.duration_since(entry.last_used_at) <= STICKY_SESSION_TTL);
@@ -855,6 +844,7 @@ impl MultiTokenManager {
     ) -> (u64, KiroCredentials) {
         entry.in_flight_count = entry.in_flight_count.saturating_add(1);
         entry.last_used_at = Some(now.to_rfc3339());
+        entry.last_reserved_at = Some(Instant::now());
         (entry.id, entry.credentials.clone())
     }
 
@@ -891,12 +881,13 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used + in-flight 策略：选择已成功和正在处理请求总量最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // Least-In-Flight + LRU 策略：优先摊平当前并发请求，
+                // 平局时选择最近最少被分配的凭据，避免历史成功计数导致新增凭据被打爆。
                 let idx = available.iter().min_by_key(|idx| {
                     let e = &entries[**idx];
                     (
-                        e.success_count.saturating_add(e.in_flight_count),
+                        e.in_flight_count,
+                        e.last_reserved_at,
                         e.credentials.priority,
                     )
                 })?;
@@ -2048,7 +2039,6 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
-            let success_count = Self::warm_start_success_count(&entries);
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2056,9 +2046,10 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count,
+                success_count: 0,
                 in_flight_count: 0,
                 last_used_at: None,
+                last_reserved_at: None,
             });
         }
 
@@ -2908,26 +2899,16 @@ mod tests {
         new_cred.kiro_api_key = Some("ksk_new".to_string());
         new_cred.priority = 0;
         let new_id = manager.add_credential(new_cred).await.unwrap();
-        assert_eq!(
-            manager
-                .snapshot()
-                .entries
-                .iter()
-                .find(|entry| entry.id == new_id)
-                .map(|entry| entry.success_count),
-            Some(100)
-        );
-
         let first = manager.acquire_context(None).await.unwrap();
+        manager.report_no_result(first.id);
         let second = manager.acquire_context(None).await.unwrap();
+        manager.report_no_result(second.id);
         let third = manager.acquire_context(None).await.unwrap();
 
         assert_eq!(first.id, new_id);
         assert_eq!(second.id, 1);
         assert_eq!(third.id, 2);
 
-        manager.report_no_result(first.id);
-        manager.report_no_result(second.id);
         manager.report_no_result(third.id);
     }
 
