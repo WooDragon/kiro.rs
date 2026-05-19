@@ -218,7 +218,6 @@ impl KiroProvider {
                     );
                     last_error = Some(e.into());
                     self.token_manager.report_no_result(ctx.id);
-                    failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -292,7 +291,6 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 self.token_manager.report_no_result(ctx.id);
-                failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -308,7 +306,6 @@ impl KiroProvider {
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             self.token_manager.report_no_result(ctx.id);
-            failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -409,7 +406,6 @@ impl KiroProvider {
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
                     self.token_manager.report_no_result(ctx.id);
-                    failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -531,7 +527,6 @@ impl KiroProvider {
                     body
                 ));
                 self.token_manager.report_no_result(ctx.id);
-                failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -559,7 +554,6 @@ impl KiroProvider {
                 body
             ));
             self.token_manager.report_no_result(ctx.id);
-            failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -615,5 +609,155 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kiro::endpoint::RequestContext;
+    use crate::model::config::Config;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TestEndpoint {
+        base_url: String,
+    }
+
+    impl KiroEndpoint for TestEndpoint {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/api", self.base_url)
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/mcp", self.base_url)
+        }
+
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn valid_access_credential(token: &str, priority: u32) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some(token.to_string());
+        cred.expires_at = Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339());
+        cred.priority = priority;
+        cred
+    }
+
+    async fn start_status_server(
+        statuses: Vec<u16>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut auth_headers = Vec::new();
+            for status in statuses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let auth = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or_default()
+                    .to_string();
+                auth_headers.push(auth);
+
+                let reason = if status == 200 { "OK" } else { "ERR" };
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            auth_headers
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    fn provider_for(base_url: String) -> KiroProvider {
+        let config = Config::default();
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![
+                    valid_access_credential("token-1", 0),
+                    valid_access_credential("token-2", 1),
+                ],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("test".to_string(), Arc::new(TestEndpoint { base_url }));
+        KiroProvider::with_proxy(token_manager, None, endpoints, "test".to_string())
+    }
+
+    #[tokio::test]
+    async fn api_transient_status_retries_same_credential() {
+        let (base_url, handle) = start_status_server(vec![429, 200]).await;
+        let provider = provider_for(base_url);
+
+        let response = provider.call_api_with_context("{}").await.unwrap();
+        assert_eq!(response.credential_id, 1);
+
+        let auth_headers = handle.await.unwrap();
+        assert_eq!(auth_headers.len(), 2);
+        assert!(auth_headers.iter().all(|h| h.contains("Bearer token-1")));
+    }
+
+    #[tokio::test]
+    async fn mcp_transient_status_retries_same_credential() {
+        let (base_url, handle) = start_status_server(vec![503, 200]).await;
+        let provider = provider_for(base_url);
+
+        let _response = provider.call_mcp("{}").await.unwrap();
+
+        let auth_headers = handle.await.unwrap();
+        assert_eq!(auth_headers.len(), 2);
+        assert!(auth_headers.iter().all(|h| h.contains("Bearer token-1")));
+    }
+
+    #[tokio::test]
+    async fn api_credential_failure_excludes_failed_credential() {
+        let (base_url, handle) = start_status_server(vec![403, 200]).await;
+        let provider = provider_for(base_url);
+
+        let response = provider.call_api_with_context("{}").await.unwrap();
+        assert_eq!(response.credential_id, 2);
+
+        let auth_headers = handle.await.unwrap();
+        assert_eq!(auth_headers.len(), 2);
+        assert!(auth_headers[0].contains("Bearer token-1"));
+        assert!(auth_headers[1].contains("Bearer token-2"));
     }
 }

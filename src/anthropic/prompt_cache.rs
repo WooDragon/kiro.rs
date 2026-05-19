@@ -11,7 +11,6 @@ use super::types::{CacheControl, MessagesRequest, is_claude_code_filtered_prompt
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
-const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -632,8 +631,6 @@ fn min_cacheable_tokens_for_model(model: &str) -> i32 {
         .replace(' ', "-");
     if model.contains("opus") {
         OPUS_MIN_CACHEABLE_TOKENS
-    } else if model.contains("haiku-3") {
-        HAIKU_3_MIN_CACHEABLE_TOKENS
     } else {
         DEFAULT_MIN_CACHEABLE_TOKENS
     }
@@ -946,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             min_cacheable_tokens_for_model("claude-haiku-3-5-20241022"),
-            HAIKU_3_MIN_CACHEABLE_TOKENS
+            DEFAULT_MIN_CACHEABLE_TOKENS
         );
         assert_eq!(
             min_cacheable_tokens_for_model("claude-haiku-4-5-20251001"),
