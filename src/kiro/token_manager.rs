@@ -729,6 +729,15 @@ impl MultiTokenManager {
         !excluded_ids.contains(&entry.id) && Self::is_entry_available_for_model(entry, model)
     }
 
+    fn warm_start_success_count(entries: &[CredentialEntry]) -> u64 {
+        entries
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .map(|entry| entry.success_count)
+            .min()
+            .unwrap_or(0)
+    }
+
     fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
         let now = Instant::now();
         sessions.retain(|_, entry| now.duration_since(entry.last_used_at) <= STICKY_SESSION_TTL);
@@ -2034,6 +2043,7 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
+            let success_count = Self::warm_start_success_count(&entries);
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2041,7 +2051,7 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: 0,
+                success_count,
                 in_flight_count: 0,
                 last_used_at: None,
             });
@@ -2860,6 +2870,47 @@ mod tests {
         assert_eq!(first.id, 1);
         assert_eq!(second.id, 2);
         assert_eq!(third.id, 3);
+
+        manager.report_no_result(first.id);
+        manager.report_no_result(second.id);
+        manager.report_no_result(third.id);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_new_credential_does_not_receive_burst() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 10),
+                valid_access_credential("token-2", 20),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            manager.report_success(1);
+            manager.report_success(2);
+        }
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.auth_method = Some("api_key".to_string());
+        new_cred.kiro_api_key = Some("ksk_new".to_string());
+        new_cred.priority = 0;
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+        let third = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(first.id, new_id);
+        assert_eq!(second.id, 1);
+        assert_eq!(third.id, 2);
 
         manager.report_no_result(first.id);
         manager.report_no_result(second.id);
