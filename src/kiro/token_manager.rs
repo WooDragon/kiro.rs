@@ -409,6 +409,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// balanced 模式下的内部选路偏移，不计入对外成功次数
+    balanced_offset: u64,
     /// 当前已分配但尚未完成的 API 调用数
     in_flight_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -436,6 +438,8 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    #[serde(default)]
+    balanced_offset: u64,
     last_used_at: Option<String>,
 }
 
@@ -613,6 +617,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    balanced_offset: 0,
                     in_flight_count: 0,
                     last_used_at: None,
                 }
@@ -882,7 +887,9 @@ impl MultiTokenManager {
                 let idx = available.iter().min_by_key(|idx| {
                     let e = &entries[**idx];
                     (
-                        e.success_count.saturating_add(e.in_flight_count),
+                        e.success_count
+                            .saturating_add(e.balanced_offset)
+                            .saturating_add(e.in_flight_count),
                         e.credentials.priority,
                     )
                 })?;
@@ -1315,6 +1322,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.balanced_offset = s.balanced_offset;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -1339,6 +1347,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            balanced_offset: e.balanced_offset,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2034,6 +2043,12 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
+            let balanced_offset = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.success_count.saturating_add(e.balanced_offset))
+                .min()
+                .unwrap_or(0);
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2042,6 +2057,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                balanced_offset,
                 in_flight_count: 0,
                 last_used_at: None,
             });
@@ -2049,6 +2065,7 @@ impl MultiTokenManager {
 
         // 6. 持久化
         self.persist_credentials()?;
+        self.save_stats();
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -2864,6 +2881,53 @@ mod tests {
         manager.report_no_result(first.id);
         manager.report_no_result(second.id);
         manager.report_no_result(third.id);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_new_credential_uses_offset_without_changing_success_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].success_count = 100;
+            entries[1].success_count = 120;
+        }
+
+        let mut new_credential = KiroCredentials::default();
+        new_credential.kiro_api_key = Some("ksk_new_key_123".to_string());
+        new_credential.auth_method = Some("api_key".to_string());
+        new_credential.priority = 2;
+
+        let new_id = manager.add_credential(new_credential).await.unwrap();
+
+        {
+            let entries = manager.entries.lock();
+            let new_entry = entries.iter().find(|e| e.id == new_id).unwrap();
+            assert_eq!(new_entry.success_count, 0);
+            assert_eq!(new_entry.balanced_offset, 100);
+        }
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+
+        assert_ne!(first.id, new_id);
+        assert_eq!(second.id, new_id);
+
+        manager.report_no_result(first.id);
+        manager.report_no_result(second.id);
     }
 
     #[tokio::test]
