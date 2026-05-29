@@ -83,6 +83,24 @@ fn map_provider_error(err: Error) -> Response {
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779753600, // May 26, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779753600, // May 26, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
             created: 1773446400, // Mar 14, 2026
@@ -768,7 +786,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6/4.7：覆写为 adaptive 类型
+/// - Opus 4.6/4.7/4.8：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -781,7 +799,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         && (model_lower.contains("4-6")
             || model_lower.contains("4.6")
             || model_lower.contains("4-7")
-            || model_lower.contains("4.7"));
+            || model_lower.contains("4.7")
+            || model_lower.contains("4-8")
+            || model_lower.contains("4.8"));
 
     let thinking_type = if is_adaptive_opus {
         "adaptive"
@@ -865,6 +885,28 @@ mod tests {
         let models = available_models();
         assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
         assert!(models.iter().any(|m| m.id == "claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn test_available_models_includes_opus_4_8() {
+        let models = available_models();
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-8-thinking"));
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_8_uses_adaptive() {
+        let mut payload = request_for_model("claude-opus-4-8-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("high")
+        );
     }
 
     #[test]

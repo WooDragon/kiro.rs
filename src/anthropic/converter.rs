@@ -82,6 +82,7 @@ Complete all chunked operations without commentary.";
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - opus 4.7/4-7 → claude-opus-4.7
+/// - opus 4.8/4-8 → claude-opus-4.8
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
@@ -94,7 +95,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -117,7 +120,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
         {
             1_000_000
         }
@@ -973,6 +977,15 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_4_8() {
+        let result = map_model("claude-opus-4-8-thinking");
+        assert_eq!(result, Some("claude-opus-4.8".to_string()));
+
+        let dotted = map_model("claude-opus-4.8");
+        assert_eq!(dotted, Some("claude-opus-4.8".to_string()));
+    }
+
+    #[test]
     fn test_map_model_other_opus_defaults_to_4_6() {
         let result = map_model("claude-opus-4-20250514");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
@@ -981,6 +994,11 @@ mod tests {
     #[test]
     fn test_context_window_opus_4_7() {
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+    }
+
+    #[test]
+    fn test_context_window_opus_4_8() {
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
     }
 
     #[test]

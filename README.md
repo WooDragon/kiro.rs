@@ -435,10 +435,11 @@ Anthropic 兼容端点（`/v1/*` 与 `/cc/v1/*`）会在响应头中附带 `requ
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `*opus*` 且包含 `4.8` / `4-8` | `claude-opus-4.8` |
 | `*opus*` 且包含 `4.7` / `4-7` | `claude-opus-4.7` |
 | `*sonnet*` | `claude-sonnet-4.5` |
 | `*opus*` 且包含 `4.5` / `4-5` | `claude-opus-4.5` |
-| `*opus*` 其他情况（不含 `4.7` / `4-7` / `4.5` / `4-5`） | `claude-opus-4.6` |
+| `*opus*` 其他情况（不含 `4.8` / `4-8` / `4.7` / `4-7` / `4.5` / `4-5`） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
 ## Admin（可选）
