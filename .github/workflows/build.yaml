@@ -22,7 +22,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
@@ -69,7 +69,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Determine version
         id: version
@@ -84,19 +84,21 @@ jobs:
             echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
       - name: Install admin-ui dependencies
         working-directory: admin-ui
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build admin-ui
         working-directory: admin-ui
@@ -123,7 +125,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
