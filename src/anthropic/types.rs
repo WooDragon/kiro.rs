@@ -127,6 +127,8 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }
@@ -417,6 +419,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 

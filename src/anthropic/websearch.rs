@@ -620,6 +620,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -660,6 +662,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -687,6 +691,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -712,6 +718,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 

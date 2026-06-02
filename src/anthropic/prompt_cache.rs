@@ -876,6 +876,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
         let profile = tracker.build_profile(&req, 3000).unwrap();
@@ -909,6 +911,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
         let profile = tracker.build_profile(&req, 3000).unwrap();

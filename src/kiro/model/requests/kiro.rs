@@ -32,9 +32,23 @@ use super::conversation::ConversationState;
 pub struct KiroRequest {
     /// 对话状态
     pub conversation_state: ConversationState,
+    /// 推理配置（max_tokens, temperature, top_p）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_config: Option<InferenceConfig>,
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
 }
 #[cfg(test)]
 mod tests {
