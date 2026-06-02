@@ -17,6 +17,9 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
+/// JSON Schema composition/reference keys that are valid without object-only fields.
+const COMPOSITION_SCHEMA_KEYS: &[&str] = &["anyOf", "oneOf", "allOf", "$ref"];
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
@@ -26,40 +29,99 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         return serde_json::json!({
             "type": "object",
             "properties": {},
-            "required": [],
-            "additionalProperties": true
+            "required": []
         });
     };
 
-    // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    // type：只在缺失或无效且不是组合/$ref schema 时补 object，避免改变有效 schema 语义。
+    let has_composition = COMPOSITION_SCHEMA_KEYS
+        .iter()
+        .any(|key| obj.contains_key(*key));
+    let schema_type = obj.get("type").and_then(|v| v.as_str());
+    let type_is_valid = schema_type.is_some_and(|s| !s.is_empty());
+    let mut is_object_schema = schema_type == Some("object");
+    if !type_is_valid && should_default_to_object_type(&obj, has_composition) {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        is_object_schema = true;
     }
 
-    // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+    // properties：存在但不是 object 时修复；缺失时仅为 object schema 补空对象。
+    match (is_object_schema, obj.get("properties")) {
+        (_, Some(serde_json::Value::Object(_))) => {}
+        (_, Some(_)) | (true, None) => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
+        _ => {}
     }
 
-    // required（必须是 string 数组）
-    let required = match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
-            arr.into_iter()
+    // required：Kiro 只接受非空 string 数组；空数组/非法值会导致 Improperly formed request。
+    match obj.remove("required") {
+        Some(serde_json::Value::Array(arr)) => {
+            let required: Vec<_> = arr
+                .into_iter()
                 .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect(),
-        ),
-        _ => serde_json::Value::Array(Vec::new()),
-    };
-    obj.insert("required".to_string(), required);
-
-    // additionalProperties（允许 bool 或 object，其他按 true 处理）
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+                .collect();
+            if !required.is_empty() {
+                obj.insert("required".to_string(), serde_json::Value::Array(required));
+            }
+        }
+        Some(_) | None => {}
     }
+
+    // additionalProperties：Kiro-Go 对应实现会递归移除该字段，避免 Kiro 400。
+    obj.remove("additionalProperties");
+    clean_nested_schema_fields(&mut obj);
 
     serde_json::Value::Object(obj)
+}
+
+fn should_default_to_object_type(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    has_composition: bool,
+) -> bool {
+    !has_composition || obj.contains_key("properties") || obj.contains_key("required")
+}
+
+fn clean_nested_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for value in obj.values_mut() {
+        match value {
+            serde_json::Value::Object(child) => {
+                clean_schema_fields(child);
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let serde_json::Value::Object(child) = item {
+                        clean_schema_fields(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn clean_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.remove("additionalProperties");
+
+    if let Some(required) = obj.remove("required") {
+        if let serde_json::Value::Array(arr) = required {
+            let required: Vec<_> = arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                .collect();
+            if !required.is_empty() {
+                obj.insert("required".to_string(), serde_json::Value::Array(required));
+            }
+        }
+    }
+
+    clean_nested_schema_fields(obj);
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -333,10 +395,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -587,7 +646,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -618,7 +680,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -661,7 +725,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -826,7 +895,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -911,34 +981,26 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-20250514")
+            .unwrap()
+            .contains("sonnet"));
+        assert!(map_model("claude-3-5-sonnet-20241022")
+            .unwrap()
+            .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-4-20250514")
+            .unwrap()
+            .contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        assert!(map_model("claude-haiku-4-20250514")
+            .unwrap()
+            .contains("haiku"));
     }
 
     #[test]
@@ -1109,13 +1171,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1148,7 +1215,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1158,12 +1226,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1191,16 +1257,211 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_removes_kiro_rejected_fields_recursively() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "description": "Run a shell command",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "additionalProperties": false,
+                    "required": null
+                },
+                "options": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {
+                        "timeout": {"type": "integer", "minimum": 1}
+                    }
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false,
+            "anyOf": [
+                {
+                    "type": "object",
+                    "required": [],
+                    "additionalProperties": false
+                }
+            ]
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert!(!schema_contains_key(&normalized, "additionalProperties"));
+        assert_eq!(normalized["required"], serde_json::json!(["command"]));
+        assert_eq!(
+            normalized["properties"]["command"].get("required"),
+            None,
+            "nested null required should be removed"
+        );
+        assert_eq!(
+            normalized["properties"]["options"].get("required"),
+            None,
+            "nested empty required should be removed"
+        );
+        assert_eq!(
+            normalized["anyOf"][0].get("required"),
+            None,
+            "composition empty required should be removed"
+        );
+    }
+
+    #[test]
+    fn test_normalize_json_schema_preserves_composition_required_values() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }
+            ]
+        });
+
+        let normalized = normalize_json_schema(schema.clone());
+        assert_eq!(normalized, schema);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_repairs_invalid_tool_schema_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": null,
+            "required": ["path", 42, null],
+            "additionalProperties": "sometimes"
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["properties"], serde_json::json!({}));
+        assert_eq!(normalized["required"], serde_json::json!(["path"]));
+        assert_eq!(normalized.get("additionalProperties"), None);
+    }
+
+    #[test]
+    fn test_opus_4_8_sanitizes_multiple_tool_schemas() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut bash_schema = std::collections::HashMap::new();
+        bash_schema.insert("type".to_string(), serde_json::json!("object"));
+        bash_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "command": {"type": "string"},
+                "description": {"type": "string"}
+            }),
+        );
+        bash_schema.insert("required".to_string(), serde_json::json!(["command"]));
+        bash_schema.insert("additionalProperties".to_string(), serde_json::json!(false));
+
+        let mut edit_schema = std::collections::HashMap::new();
+        edit_schema.insert("type".to_string(), serde_json::json!("object"));
+        edit_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"}
+            }),
+        );
+        edit_schema.insert(
+            "required".to_string(),
+            serde_json::json!(["file_path", "old_string", "new_string"]),
+        );
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("use tools"),
+            }],
+            system: None,
+            stream: true,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "Run a shell command".to_string(),
+                    input_schema: bash_schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "Edit".to_string(),
+                    description: "Edit a file".to_string(),
+                    input_schema: edit_schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("opus 4.8 request should convert");
+        let user_input = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(user_input.model_id, "claude-opus-4.8");
+
+        let tools = &user_input.user_input_message_context.tools;
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].tool_specification.name, "Bash");
+        assert_eq!(
+            tools[0]
+                .tool_specification
+                .input_schema
+                .json
+                .get("additionalProperties"),
+            None
+        );
+        assert_eq!(
+            tools[0].tool_specification.input_schema.json["required"],
+            serde_json::json!(["command"])
+        );
+        assert_eq!(tools[1].tool_specification.name, "Edit");
+        assert_eq!(
+            tools[1].tool_specification.input_schema.json["required"],
+            serde_json::json!(["file_path", "old_string", "new_string"])
+        );
+    }
+
+    fn schema_contains_key(value: &serde_json::Value, key: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|child| schema_contains_key(child, key))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().any(|child| schema_contains_key(child, key))
+            }
+            _ => false,
+        }
     }
 
     #[test]
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -1462,10 +1723,9 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg =
+            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1494,10 +1754,8 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1559,10 +1817,8 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1605,10 +1861,8 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1751,7 +2005,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
         ]);
 
         let mut history = vec![
@@ -1804,9 +2058,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -1856,7 +2116,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
