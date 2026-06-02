@@ -197,6 +197,8 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 推理配置
+    pub inference_config: Option<crate::kiro::model::requests::kiro::InferenceConfig>,
 }
 
 /// 转换错误
@@ -362,6 +364,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
+    // 10.5 将历史中的结构化 tool 数据降级为纯文本
+    // Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults）
+    sanitize_history_tools(&mut history, &validated_tool_results);
+
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
@@ -397,9 +403,28 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
+    // 14. 构建 InferenceConfig
+    let inference_config = if req.max_tokens > 0
+        || req.temperature.is_some()
+        || req.top_p.is_some()
+    {
+        Some(crate::kiro::model::requests::kiro::InferenceConfig {
+            max_tokens: if req.max_tokens > 0 {
+                Some(req.max_tokens as u32)
+            } else {
+                None
+            },
+            temperature: req.temperature,
+            top_p: req.top_p,
+        })
+    } else {
+        None
+    };
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        inference_config,
     })
 }
 
@@ -614,6 +639,127 @@ fn remove_orphaned_tool_uses(
             }
         }
     }
+}
+
+/// 将历史中的结构化 tool 数据降级为纯文本叙述。
+/// Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults），
+/// 历史中所有其他 tool 数据必须以纯文本形式保留语义。
+fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[ToolResult]) {
+    if history.is_empty() {
+        return;
+    }
+
+    // 1. 收集 tool_use_id → tool_name 映射
+    let mut tool_name_map: HashMap<String, String> = HashMap::new();
+    for msg in history.iter() {
+        if let Message::Assistant(a) = msg {
+            if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
+                for tu in tool_uses {
+                    tool_name_map.insert(tu.tool_use_id.clone(), tu.name.clone());
+                }
+            }
+        }
+    }
+
+    // 2. 判断最后一条 assistant 是否是活跃 tool turn
+    let current_result_ids: std::collections::HashSet<&str> = current_tool_results
+        .iter()
+        .map(|r| r.tool_use_id.as_str())
+        .collect();
+
+    let active_idx = history
+        .iter()
+        .rposition(|msg| matches!(msg, Message::Assistant(_)))
+        .filter(|&idx| {
+            if let Message::Assistant(a) = &history[idx] {
+                if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
+                    !tool_uses.is_empty()
+                        && tool_uses
+                            .iter()
+                            .all(|tu| current_result_ids.contains(tu.tool_use_id.as_str()))
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+
+    // 3. 遍历历史，执行降级
+    for (idx, msg) in history.iter_mut().enumerate() {
+        match msg {
+            Message::Assistant(a) => {
+                if Some(idx) == active_idx {
+                    continue;
+                }
+                if let Some(tool_uses) = a.assistant_response_message.tool_uses.take() {
+                    if !tool_uses.is_empty() {
+                        let narrated = narrate_tool_uses(&tool_uses);
+                        let content = &mut a.assistant_response_message.content;
+                        if content.is_empty() {
+                            *content = narrated;
+                        } else {
+                            content.push_str("\n\n");
+                            content.push_str(&narrated);
+                        }
+                    }
+                }
+            }
+            Message::User(u) => {
+                let ctx = &mut u.user_input_message.user_input_message_context;
+                if !ctx.tool_results.is_empty() {
+                    let narrated = narrate_tool_results(&ctx.tool_results, &tool_name_map);
+                    let content = &mut u.user_input_message.content;
+                    if content.is_empty() {
+                        *content = narrated;
+                    } else {
+                        content.push_str("\n\n");
+                        content.push_str(&narrated);
+                    }
+                    ctx.tool_results.clear();
+                }
+                ctx.tools.clear();
+            }
+        }
+    }
+}
+
+fn narrate_tool_uses(tool_uses: &[ToolUseEntry]) -> String {
+    tool_uses
+        .iter()
+        .map(|tu| {
+            let args = serde_json::to_string(&tu.input).unwrap_or_default();
+            format!("[Tool Call: {}]\nArguments: {}", tu.name, args)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn narrate_tool_results(
+    tool_results: &[ToolResult],
+    name_map: &HashMap<String, String>,
+) -> String {
+    let parts: Vec<String> = tool_results
+        .iter()
+        .map(|tr| {
+            let name = name_map
+                .get(&tr.tool_use_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let text_content: String = tr
+                .content
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if tr.is_error {
+                format!("[{}] ERROR:\n{}", name, text_content)
+            } else {
+                format!("[{}] {}", name, text_content)
+            }
+        })
+        .collect();
+    format!("Tool results:\n\n{}", parts.join("\n\n"))
 }
 
 /// Kiro API 工具名称最大长度限制

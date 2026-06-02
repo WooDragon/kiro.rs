@@ -308,6 +308,7 @@ pub async fn post_messages(
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
+        inference_config: conversion_result.inference_config,
         profile_arn: None,
     };
 
@@ -1016,6 +1017,7 @@ pub async fn post_messages_cc(
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
+        inference_config: conversion_result.inference_config,
         profile_arn: None,
     };
 
