@@ -26,37 +26,65 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         return serde_json::json!({
             "type": "object",
             "properties": {},
-            "required": [],
-            "additionalProperties": true
+            "required": []
         });
     };
 
-    // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+    // type：只在缺失或无效且不是组合/$ref schema 时补 object，避免改变有效 schema 语义。
+    let has_composition = ["anyOf", "oneOf", "allOf", "$ref"]
+        .iter()
+        .any(|key| obj.contains_key(*key));
+    let type_is_valid = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if !type_is_valid && (!has_composition || obj.contains_key("properties") || obj.contains_key("required")) {
         obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
     }
 
-    // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+    // properties：存在但不是 object 时修复；缺失时仅为 object schema 补空对象。
+    match (obj.get("type").and_then(|v| v.as_str()), obj.get("properties")) {
+        (_, Some(serde_json::Value::Object(_))) => {}
+        (_, Some(_)) | (Some("object"), None) => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
+        _ => {}
     }
 
-    // required（必须是 string 数组）
-    let required = match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect(),
-        ),
-        _ => serde_json::Value::Array(Vec::new()),
-    };
-    obj.insert("required".to_string(), required);
+    // required：存在时必须是 string 数组；缺失时仅为 object schema 补空数组。
+    match obj.remove("required") {
+        Some(serde_json::Value::Array(arr)) => {
+            obj.insert(
+                "required".to_string(),
+                serde_json::Value::Array(
+                    arr.into_iter()
+                        .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                        .collect(),
+                ),
+            );
+        }
+        Some(_) => {
+            obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
+        }
+        None if obj.get("type").and_then(|v| v.as_str()) == Some("object") => {
+            obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
+        }
+        None => {}
+    }
 
-    // additionalProperties（允许 bool 或 object，其他按 true 处理）
+    // additionalProperties：缺失时保留缺失，存在但类型非法时再修复。
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        Some(_) => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        None => {}
     }
 
     serde_json::Value::Object(obj)
@@ -1194,6 +1222,141 @@ mod tests {
         let tools = &result.conversation_state.current_message.user_input_message
             .user_input_message_context.tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_preserves_valid_tool_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "description": "Run a shell command",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer", "minimum": 1}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        });
+
+        assert_eq!(normalize_json_schema(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_preserves_composition_schema() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }
+            ]
+        });
+
+        assert_eq!(normalize_json_schema(schema.clone()), schema);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_repairs_invalid_tool_schema_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": null,
+            "required": ["path", 42, null],
+            "additionalProperties": "sometimes"
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["properties"], serde_json::json!({}));
+        assert_eq!(normalized["required"], serde_json::json!(["path"]));
+        assert_eq!(normalized["additionalProperties"], true);
+    }
+
+    #[test]
+    fn test_opus_4_8_preserves_multiple_tool_schemas() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut bash_schema = std::collections::HashMap::new();
+        bash_schema.insert("type".to_string(), serde_json::json!("object"));
+        bash_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "command": {"type": "string"},
+                "description": {"type": "string"}
+            }),
+        );
+        bash_schema.insert("required".to_string(), serde_json::json!(["command"]));
+        bash_schema.insert("additionalProperties".to_string(), serde_json::json!(false));
+
+        let mut edit_schema = std::collections::HashMap::new();
+        edit_schema.insert("type".to_string(), serde_json::json!("object"));
+        edit_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"}
+            }),
+        );
+        edit_schema.insert(
+            "required".to_string(),
+            serde_json::json!(["file_path", "old_string", "new_string"]),
+        );
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("use tools"),
+            }],
+            system: None,
+            stream: true,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "Run a shell command".to_string(),
+                    input_schema: bash_schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "Edit".to_string(),
+                    description: "Edit a file".to_string(),
+                    input_schema: edit_schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("opus 4.8 request should convert");
+        let user_input = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(user_input.model_id, "claude-opus-4.8");
+
+        let tools = &user_input.user_input_message_context.tools;
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].tool_specification.name, "Bash");
+        assert_eq!(tools[0].tool_specification.input_schema.json["additionalProperties"], false);
+        assert_eq!(
+            tools[0].tool_specification.input_schema.json["required"],
+            serde_json::json!(["command"])
+        );
+        assert_eq!(tools[1].tool_specification.name, "Edit");
+        assert_eq!(
+            tools[1].tool_specification.input_schema.json["required"],
+            serde_json::json!(["file_path", "old_string", "new_string"])
+        );
     }
 
     #[test]
