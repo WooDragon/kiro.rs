@@ -21,7 +21,9 @@ use std::time::Duration;
 use tokio::time::{Instant, interval_at};
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{
+    ConversionError, convert_request, max_payload_bytes, trim_history_to_byte_limit,
+};
 use super::middleware::AppState;
 use super::prompt_cache::{
     PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
@@ -34,8 +36,76 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
+use crate::kiro::model::requests::conversation::ConversationState;
+use crate::kiro::model::requests::kiro::InferenceConfig;
 use crate::model::config::{CcStreamingMode, PromptCacheMode};
 use std::sync::Arc;
+
+/// 构建并序列化 KiroRequest，在超限时 proactive 裁剪 history。
+///
+/// 本函数是两处"构造 KiroRequest → 序列化"重复段的唯一入口，热路径（未超限）零额外成本：
+/// 1. 序列化为 String（本来就要做的唯一一次）
+/// 2. 若 `body.len() <= max_payload_bytes()` 直接返回 Ok(body)
+/// 3. 否则调用 `trim_history_to_byte_limit` 裁剪最旧历史，重新序列化后返回
+///
+/// 注意：裁剪只作用于 `conversation_state.history`，不触碰 `payload.messages`（prompt cache 指纹）。
+///
+/// # 参数
+/// * `conversation_state` - 已经过 sanitize_history_tools 的对话状态
+/// * `inference_config` - 推理配置（max_tokens / temperature / top_p）
+/// * `has_system_pair` - build_history 返回的 flag；为 true 时保护 history 首 2 条不被裁
+fn finalize_request_body(
+    conversation_state: ConversationState,
+    inference_config: Option<InferenceConfig>,
+    has_system_pair: bool,
+) -> Result<String, serde_json::Error> {
+    let mut kiro_request = KiroRequest {
+        conversation_state,
+        inference_config,
+        profile_arn: None,
+    };
+
+    // 本来就要做的唯一一次序列化
+    let body = serde_json::to_string(&kiro_request)?;
+
+    let limit = max_payload_bytes();
+    if body.len() <= limit {
+        // 热路径：未超限，直接返回
+        return Ok(body);
+    }
+
+    // 超限：尝试裁剪最旧历史对
+    match trim_history_to_byte_limit(
+        &mut kiro_request.conversation_state,
+        has_system_pair,
+        limit,
+        body.len(),
+    ) {
+        Some(stats) => {
+            tracing::warn!(
+                pairs_removed = stats.pairs_removed,
+                bytes_before = stats.bytes_before,
+                bytes_after_est = stats.bytes_after_est,
+                limit,
+                "payload 超限：已裁剪最旧 {} 对历史，bytes {} → ≤{}（预估）",
+                stats.pairs_removed,
+                stats.bytes_before,
+                stats.bytes_after_est
+            );
+            // 重新序列化已裁剪的请求
+            serde_json::to_string(&kiro_request)
+        }
+        None => {
+            // 无可裁对或结构异常：fail-open，原样发送，由 map_provider_error 兜底
+            tracing::warn!(
+                body_len = body.len(),
+                limit,
+                "payload 超限但无可裁对，原样发送（map_provider_error 兜底）"
+            );
+            Ok(body)
+        }
+    }
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -305,14 +375,15 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        inference_config: conversion_result.inference_config,
-        profile_arn: None,
-    };
+    // 先取出 tool_name_map（后续透传给流式/非流式处理器），再构建并序列化请求体
+    let tool_name_map = conversion_result.tool_name_map;
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    // 构建 Kiro 请求体（含超限 proactive 裁剪；profile_arn 由 provider 层注入）
+    let request_body = match finalize_request_body(
+        conversion_result.conversation_state,
+        conversion_result.inference_config,
+        conversion_result.has_system_pair,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -344,8 +415,6 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
         // 流式响应
@@ -1016,14 +1085,15 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        inference_config: conversion_result.inference_config,
-        profile_arn: None,
-    };
+    // 先取出 tool_name_map（后续透传给流式/非流式处理器），再构建并序列化请求体
+    let tool_name_map = conversion_result.tool_name_map;
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    // 构建 Kiro 请求体（含超限 proactive 裁剪；profile_arn 由 provider 层注入）
+    let request_body = match finalize_request_body(
+        conversion_result.conversation_state,
+        conversion_result.inference_config,
+        conversion_result.has_system_pair,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -1055,8 +1125,6 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
         match state.cc_streaming_mode {

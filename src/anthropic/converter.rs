@@ -199,6 +199,158 @@ pub struct ConversionResult {
     pub tool_name_map: HashMap<String, String>,
     /// 推理配置
     pub inference_config: Option<crate::kiro::model::requests::kiro::InferenceConfig>,
+    /// history 首部是否注入了 system 对（User+Assistant 伪装）。
+    /// system 对在数据结构上与普通消息无法区分，必须在注入点记录并向下游传递，
+    /// 供 `trim_history_to_byte_limit` 保护首部不可裁对数。
+    pub has_system_pair: bool,
+}
+
+/// payload 大小裁剪统计，用于 warn 日志记录
+pub struct TrimStats {
+    /// 裁掉的 (User, Assistant) 对数
+    pub pairs_removed: usize,
+    /// 裁剪前 body 字节数（`KiroRequest` 完整序列化大小）
+    pub bytes_before: usize,
+    /// 裁剪后预估 body 字节数（低估，真实减少 ≥ 预估减少）
+    pub bytes_after_est: usize,
+}
+
+/// 每次请求读取 env `KIRO_MAX_PAYLOAD_BYTES`，若未设置或解析失败则使用默认值。
+///
+/// 默认 900 KiB（921600 字节），保守阈值优先避免误删历史。
+/// 每次请求现读而非 LazyLock 缓存，使运维可热调阈值无需重启进程。
+pub(crate) fn max_payload_bytes() -> usize {
+    const DEFAULT: usize = 900 * 1024; // 900 KiB
+    std::env::var("KIRO_MAX_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT)
+}
+
+/// 最近保留的 (User, Assistant) 对数，确保活跃 tool turn 永在保留区内。
+const KEEP_RECENT_PAIRS: usize = 2;
+
+/// 对 `conversation_state.history` 做 proactive 大小裁剪。
+///
+/// 只裁 history 字段；不触碰 `payload.messages`（prompt cache 指纹的数据源）；
+/// 不触碰 current_message（独立字段）。
+///
+/// # 参数
+/// * `state` - 可变的对话状态；`history` 必须已经过 `sanitize_history_tools`
+/// * `has_system_pair` - build_history 注入 system 对时置 true；首 2 条永不裁
+/// * `max_bytes` - 最大允许 body 大小（字节），由调用方传入 `max_payload_bytes()`
+/// * `bytes_before` - 调用方已测量的完整 `KiroRequest` 序列化大小，复用避免重复序列化
+///
+/// # 返回
+/// `Some(TrimStats)` 表示执行了裁剪；`None` 表示无需裁剪、无可裁对或结构异常（fail-open）。
+///
+/// # 安全保证
+/// - system 对（前 `pinned_front` 条）永不裁
+/// - 尾部 `KEEP_RECENT_PAIRS` 对（4 条）永不裁，保护活跃 tool turn
+/// - 遇结构异常（role 不成对、首条非 User）→ fail-open：跳过裁剪、warn 记录、返回 None
+/// - 裁剪算法安全低估（漏掉相邻逗号），数学保证一轮达标，不需补删循环
+pub(crate) fn trim_history_to_byte_limit(
+    state: &mut ConversationState,
+    has_system_pair: bool,
+    max_bytes: usize,
+    bytes_before: usize,
+) -> Option<TrimStats> {
+    if bytes_before <= max_bytes {
+        // 未超限，热路径零额外成本
+        return None;
+    }
+
+    let history = &mut state.history;
+    let len = history.len();
+
+    // ── 鲁棒性检查（运行时检查，非 debug_assert，release 下同样生效）──
+    // history 必须严格 User/Assistant 交替（build_history 保证），否则 fail-open
+    if !len.is_multiple_of(2) {
+        tracing::warn!(
+            len,
+            "history 长度为奇数，结构异常，跳过 payload 裁剪（fail-open）"
+        );
+        return None;
+    }
+    if len > 0 && !matches!(history[0], Message::User(_)) {
+        tracing::warn!("history 首条非 User，结构异常，跳过 payload 裁剪（fail-open）");
+        return None;
+    }
+
+    // ── 计算可裁窗口 ──────────────────────────────────────────────────────
+    // 前 pinned_front 条（system 对）永不裁；尾部保留 KEEP_RECENT_PAIRS 对（4 条）
+    let pinned_front = if has_system_pair { 2 } else { 0 };
+    let pinned_tail = KEEP_RECENT_PAIRS * 2;
+
+    // 可裁区间：[pinned_front, len - pinned_tail)
+    if len <= pinned_front + pinned_tail {
+        tracing::warn!(
+            bytes_before,
+            max_bytes,
+            "无可裁对（全被 system/活跃对锁住），原样发送（map_provider_error 兜底）"
+        );
+        return None;
+    }
+
+    let cuttable_end = len - pinned_tail; // exclusive
+
+    // ── 正向裁剪（旧 → 新），低估计算，一轮达标 ──────────────────────────
+    let excess = bytes_before - max_bytes;
+    let mut cut_bytes: usize = 0;
+    let mut pairs_to_remove: usize = 0;
+
+    let mut i = pinned_front;
+    while i + 1 < cuttable_end {
+        let user_msg = &history[i];
+        let assistant_msg = &history[i + 1];
+
+        // 鲁棒性：确认对结构正确
+        if !matches!(user_msg, Message::User(_)) || !matches!(assistant_msg, Message::Assistant(_))
+        {
+            tracing::warn!(i, "裁剪窗口内 role 不成对，结构异常，终止裁剪（fail-open）");
+            break;
+        }
+
+        // 对整个 Message 序列化（含 tool_uses 等全部字段），安全低估
+        // 漏掉的仅是相邻元素间的结构性逗号，故 est ≤ 该对在 body 中的真实字节
+        let est = serde_json::to_string(user_msg)
+            .map(|s| s.len())
+            .unwrap_or(0)
+            + serde_json::to_string(assistant_msg)
+                .map(|s| s.len())
+                .unwrap_or(0);
+
+        cut_bytes += est;
+        pairs_to_remove += 1;
+
+        if cut_bytes >= excess {
+            // 已累积足够字节，一轮达标，停止
+            break;
+        }
+
+        i += 2;
+    }
+
+    if pairs_to_remove == 0 {
+        // 窗口内没有可删对（罕见边界情况）
+        tracing::warn!(
+            bytes_before,
+            max_bytes,
+            "裁剪窗口内无可删对，原样发送（map_provider_error 兜底）"
+        );
+        return None;
+    }
+
+    // ── 执行裁剪：一次性 drain ────────────────────────────────────────────
+    let drain_end = pinned_front + pairs_to_remove * 2;
+    state.history.drain(pinned_front..drain_end);
+
+    let bytes_after_est = bytes_before.saturating_sub(cut_bytes);
+    Some(TrimStats {
+        pairs_removed: pairs_to_remove,
+        bytes_before,
+        bytes_after_est,
+    })
 }
 
 /// 转换错误
@@ -338,7 +490,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    // build_history 同时返回 has_system_pair flag：system 对伪装成普通 User+Assistant，
+    // 无法从数据反推，必须在注入点记录并向下游传递（供裁剪保护首部不可裁对数）
+    let (mut history, has_system_pair) =
+        build_history(req, messages, &model_id, &mut tool_name_map)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -423,6 +578,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         conversation_state,
         tool_name_map,
         inference_config,
+        has_system_pair,
     })
 }
 
@@ -716,10 +872,7 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
     }
 }
 
-fn narrate_tool_results(
-    tool_results: &[ToolResult],
-    name_map: &HashMap<String, String>,
-) -> String {
+fn narrate_tool_results(tool_results: &[ToolResult], name_map: &HashMap<String, String>) -> String {
     let parts: Vec<String> = tool_results
         .iter()
         .map(|tr| {
@@ -851,13 +1004,21 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
+///
+/// # Returns
+/// `(history, has_system_pair)`：
+/// - `history` - 构建好的历史消息列表
+/// - `has_system_pair` - 是否在 history 首部注入了 system 对（User+Assistant 伪装）。
+///   system 对无法从数据结构反推，必须在注入点记录，供 `trim_history_to_byte_limit` 保护。
 fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
-) -> Result<Vec<Message>, ConversionError> {
+) -> Result<(Vec<Message>, bool), ConversionError> {
     let mut history = Vec::new();
+    // 记录是否向 history 首部注入了 system 对；在两个注入分支处置 true，作为单一真相源
+    let mut has_system_pair = false;
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
@@ -886,20 +1047,26 @@ fn build_history(
                 system_content
             };
 
-            // 系统消息作为 user + assistant 配对
+            // 系统消息作为 user + assistant 配对注入 history 首部
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
 
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
+
+            // ← 系统注入分支 1：标记 has_system_pair
+            has_system_pair = true;
         }
     } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
+        // 没有系统消息但有thinking配置，插入新的系统消息（作为 system 对处理）
         let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
         history.push(Message::Assistant(assistant_msg));
+
+        // ← 系统注入分支 2：标记 has_system_pair
+        has_system_pair = true;
     }
 
     // 2. 处理常规消息历史
@@ -950,7 +1117,7 @@ fn build_history(
         history.push(Message::Assistant(auto_assistant));
     }
 
-    Ok(history)
+    Ok((history, has_system_pair))
 }
 
 /// 合并多个 user 消息
@@ -1107,26 +1274,34 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514")
-            .unwrap()
-            .contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022")
-            .unwrap()
-            .contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514")
-            .unwrap()
-            .contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514")
-            .unwrap()
-            .contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]
@@ -2112,9 +2287,10 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg =
-            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -2143,8 +2319,10 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -2206,8 +2384,10 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -2250,8 +2430,10 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -2394,7 +2576,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
         ]);
 
         let mut history = vec![
@@ -2526,5 +2708,532 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // P0-2 E2E 测试（通过 convert_request 验证占位符落到活跃 turn 的 tool_results）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// T-P02-E2E-01：空 tool_result 经 convert_request 后占位符落到活跃 turn 的
+    /// tool_results[0].content[0]["text"]；序列化结果不含 `"text":""`
+    #[test]
+    fn test_empty_tool_result_placeholder_in_active_turn() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do something"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_empty", "name": "Bash", "input": {}}
+                    ]),
+                },
+                // 空 tool_result：content 为空字符串
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_empty", "content": ""}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".to_string(),
+                description: "Run command".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("should convert");
+        let tool_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_results.len(), 1, "应有 1 个 tool_result");
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(text, "(empty result)", "空 tool_result 应替换为占位符");
+
+        // 序列化后不含空 text
+        let json = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!json.contains("\"text\":\"\""), "序列化结果不应含空 text");
+        assert!(json.contains("(empty result)"));
+    }
+
+    /// T-P02-E2E-02：非空 tool_result 经 convert_request 后内容不被改写
+    #[test]
+    fn test_nonempty_tool_result_not_overwritten_in_e2e() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do something"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_real", "name": "Bash", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_real", "content": "real output"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".to_string(),
+                description: "Run command".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("should convert");
+        let tool_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_results.len(), 1);
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(text, "real output", "非空内容不应被改写");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // P0-1 裁剪函数单元测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 辅助函数：构造一个 N 轮对话的 ConversationState（无 system 对，无 tool）
+    fn make_conversation_state(rounds: usize, content_per_msg: &str) -> ConversationState {
+        let model_id = "claude-sonnet-4.5";
+        let mut history = Vec::new();
+        for i in 0..rounds {
+            let user = Message::User(HistoryUserMessage::new(
+                format!("{content_per_msg} user {i}"),
+                model_id,
+            ));
+            let assistant = Message::Assistant(HistoryAssistantMessage::new(format!(
+                "{content_per_msg} assistant {i}"
+            )));
+            history.push(user);
+            history.push(assistant);
+        }
+        ConversationState::new("test-conv").with_history(history)
+    }
+
+    /// T01：未超限时 trim_history_to_byte_limit 返回 None，history 不变
+    #[test]
+    fn test_trim_no_change_when_under_limit() {
+        let mut state = make_conversation_state(2, "hello");
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+        // 设置 limit > bytes，不应裁剪
+        let result = trim_history_to_byte_limit(&mut state, false, bytes + 1000, bytes);
+        assert!(result.is_none(), "未超限时不应裁剪");
+        assert_eq!(state.history.len(), 4, "history 不应改变");
+    }
+
+    /// T02：超限时裁剪最旧优先（裁掉第一对）
+    #[test]
+    fn test_trim_removes_oldest_pair_first() {
+        // 构造足够大的 history，然后人为将 limit 设为极小触发裁剪
+        let mut state = make_conversation_state(4, "some content here");
+        let orig_len = state.history.len(); // 8
+
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 设 limit 比实际小，必然触发裁剪
+        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        assert!(result.is_some(), "超限时应裁剪");
+        let stats = result.unwrap();
+        assert!(stats.pairs_removed > 0);
+        assert!(state.history.len() < orig_len, "history 应变短");
+    }
+
+    /// T03：裁剪后 history 严格保持 User/Assistant 交替
+    #[test]
+    fn test_trim_preserves_alternating_roles() {
+        let mut state = make_conversation_state(6, "content");
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+
+        // 验证剩余 history 严格交替
+        for (i, msg) in state.history.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!(
+                    matches!(msg, Message::User(_)),
+                    "偶数位置应为 User，实际不是 i={}",
+                    i
+                );
+            } else {
+                assert!(
+                    matches!(msg, Message::Assistant(_)),
+                    "奇数位置应为 Assistant，实际不是 i={}",
+                    i
+                );
+            }
+        }
+    }
+
+    /// T04：has_system_pair=true 时，history 首 2 条（system 对）永不被裁
+    #[test]
+    fn test_trim_preserves_system_pair() {
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+
+        let model_id = "claude-sonnet-4.5";
+
+        // 构造：system 对 + 3 轮普通对话（共 8 条）
+        let sys_user = Message::User(HistoryUserMessage::new(
+            "You are a helpful assistant.",
+            model_id,
+        ));
+        let sys_assistant = Message::Assistant(HistoryAssistantMessage::new(
+            "I will follow these instructions.",
+        ));
+
+        let mut history = vec![sys_user, sys_assistant];
+        for i in 0..3 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("user message {i}"),
+                model_id,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "assistant reply {i}"
+            ))));
+        }
+
+        let system_content_snapshot = if let Message::User(u) = &history[0] {
+            u.user_input_message.content.clone()
+        } else {
+            panic!("history[0] 应为 User")
+        };
+
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 触发裁剪；has_system_pair=true 保护首 2 条
+        let result = trim_history_to_byte_limit(&mut state, true, 1, bytes);
+
+        // system 对应保留
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(
+                u.user_input_message.content, system_content_snapshot,
+                "system 对首条不应被裁"
+            );
+        } else {
+            panic!("裁剪后 history[0] 应仍为 User（system）");
+        }
+        if result.is_some() {
+            // 如果确实裁了，长度应变短但保护对还在
+            assert!(state.history.len() >= 2, "system 对的 2 条必须保留");
+        }
+    }
+
+    /// T05：活跃 tool turn（尾部保留区）不被裁
+    #[test]
+    fn test_trim_preserves_active_tool_turn() {
+        use crate::kiro::model::requests::conversation::AssistantMessage;
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let model_id = "claude-sonnet-4.5";
+
+        // 构造：3 轮历史 + 活跃 tool turn（最后 1 对）
+        let mut history = Vec::new();
+        for i in 0..3 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("old user {i}"),
+                model_id,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "old assistant {i}"
+            ))));
+        }
+
+        // 活跃 tool turn：assistant 带 tool_use
+        let user_before_tool = Message::User(HistoryUserMessage::new("invoke tool", model_id));
+        let mut active_assistant = AssistantMessage::new("");
+        active_assistant = active_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("tu_active", "Bash").with_input(serde_json::json!({"cmd": "ls"})),
+        ]);
+        history.push(user_before_tool);
+        history.push(Message::Assistant(HistoryAssistantMessage {
+            assistant_response_message: active_assistant,
+        }));
+
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        let orig_len = state.history.len(); // 8
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 触发裁剪
+        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+
+        // 活跃 tool turn（最后 2 条）必须保留
+        let new_len = state.history.len();
+        assert!(new_len <= orig_len, "history 应变短或相同");
+
+        // 最后一条必须是带 tool_uses 的 assistant（活跃 tool turn）
+        let last = state.history.last().unwrap();
+        if let Message::Assistant(a) = last {
+            assert!(
+                a.assistant_response_message.tool_uses.is_some(),
+                "活跃 tool turn（最后 assistant）不应被裁"
+            );
+        } else {
+            panic!("裁剪后最后一条应仍为 assistant");
+        }
+    }
+
+    /// T06：current_message 独立于 history，裁剪前后不变
+    #[test]
+    fn test_trim_does_not_touch_current_message() {
+        use crate::kiro::model::requests::conversation::{CurrentMessage, UserInputMessage};
+
+        let mut state = make_conversation_state(4, "content");
+
+        // 设置 current_message 内容
+        let user_input = UserInputMessage::new("this is the current message", "claude-sonnet-4.5");
+        state.current_message = CurrentMessage::new(user_input);
+
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+
+        assert_eq!(
+            state.current_message.user_input_message.content, "this is the current message",
+            "current_message 不应被裁剪"
+        );
+    }
+
+    /// T07：无可裁对（全被 pinned）时原样透传，不报错，返回 None
+    #[test]
+    fn test_trim_no_panic_when_nothing_cuttable() {
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+
+        let model_id = "claude-sonnet-4.5";
+
+        // 只有 system 对（2 条）+ KEEP_RECENT_PAIRS*2 条（4 条）= 6 条，全被 pinned
+        let sys_user = Message::User(HistoryUserMessage::new("system", model_id));
+        let sys_assistant = Message::Assistant(HistoryAssistantMessage::new(
+            "I will follow these instructions.",
+        ));
+
+        let mut history = vec![sys_user, sys_assistant];
+        for i in 0..2 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("recent user {i}"),
+                model_id,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "recent assistant {i}"
+            ))));
+        }
+
+        let orig_len = history.len();
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 即使超限，也无可裁对
+        let result = trim_history_to_byte_limit(&mut state, true, 1, bytes);
+        assert!(result.is_none(), "无可裁对时应返回 None（不报错）");
+        assert_eq!(state.history.len(), orig_len, "history 不应改变");
+    }
+
+    /// T08a：恰好等于 limit，不裁剪
+    #[test]
+    fn test_trim_exact_limit_no_trim() {
+        let mut state = make_conversation_state(2, "msg");
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        let result = trim_history_to_byte_limit(&mut state, false, bytes, bytes);
+        assert!(result.is_none(), "恰好等于 limit 时不应裁剪");
+    }
+
+    /// T08b：limit+1 触发裁剪（bytes_before = limit+1 > limit）
+    #[test]
+    fn test_trim_limit_plus_one_triggers_trim() {
+        let mut state = make_conversation_state(4, "some long content here");
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 将 limit 设为 bytes-1，使 bytes_before > limit
+        let result = trim_history_to_byte_limit(&mut state, false, bytes - 1, bytes);
+        // 有可裁对时应裁；无可裁对时 None（不报错）
+        // 只验证不 panic
+        let _ = result;
+    }
+
+    /// T09：has_system_pair=false 路径正常工作（无 system 对时 pinned_front=0）
+    #[test]
+    fn test_trim_no_system_pair_path() {
+        let mut state = make_conversation_state(4, "content");
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // has_system_pair=false，pinned_front=0
+        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        // 有 4 对可裁，应裁成功
+        assert!(result.is_some(), "has_system_pair=false 时应正常裁剪");
+        assert!(state.history.len() % 2 == 0, "裁剪后 history 长度应为偶数");
+    }
+
+    /// T10：fail-open 路径——奇数长度 history 不 panic，返回 None
+    #[test]
+    fn test_trim_odd_history_fails_open() {
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+
+        // 构造奇数长度 history（结构异常）
+        let model_id = "claude-sonnet-4.5";
+        let history = vec![
+            Message::User(HistoryUserMessage::new("user1", model_id)),
+            Message::Assistant(HistoryAssistantMessage::new("assistant1")),
+            Message::User(HistoryUserMessage::new("user2", model_id)), // 奇数
+        ];
+
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        let serialized = serde_json::to_string(&state).unwrap();
+        let bytes = serialized.len();
+
+        // 不应 panic，应 fail-open 返回 None
+        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        assert!(result.is_none(), "奇数长度 history 应 fail-open 返回 None");
+        assert_eq!(state.history.len(), 3, "fail-open 时 history 不应改变");
+    }
+
+    /// 回归护栏变体：空 tool_result 经叙述/历史处理后，assistant content 不含危险模式
+    #[test]
+    fn test_regression_empty_tool_result_narrated_has_no_dangerous_patterns() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        // 构造：第1轮 tool 调用返回空 result（会被叙述进 history），第2轮正常
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do the thing"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_empty_hist", "name": "Bash", "input": {}}
+                    ]),
+                },
+                // 空 tool_result（会进入历史被叙述）
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_empty_hist", "content": ""}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Done."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("follow up"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".to_string(),
+                description: "Run command".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("should convert");
+
+        // 危险模式不应出现在 assistant content 里
+        let dangerous_patterns = [
+            "[Tool Call:",
+            "[Tool Call]",
+            "[Called tool",
+            "Arguments: {",
+            "tool_use_id",
+            "\"type\":\"tool_use\"",
+        ];
+
+        for msg in &result.conversation_state.history {
+            if let Message::Assistant(a) = msg {
+                let content = &a.assistant_response_message.content;
+                for pattern in &dangerous_patterns {
+                    assert!(
+                        !content.contains(pattern),
+                        "assistant content 不应含危险模式 '{}': {:?}",
+                        pattern,
+                        content
+                    );
+                }
+            }
+        }
     }
 }
