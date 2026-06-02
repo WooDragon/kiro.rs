@@ -1,4 +1,4 @@
-name: Build Artifacts
+name: Build and Release
 
 on:
   push:
@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version label for artifacts (e.g., 2025.12.1)'
+        description: 'Version label for release (e.g., 2026.3.1 or v2026.3.1)'
         required: true
-        default: '2026.1.1'
+        default: '2026.3.1'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pre-check:
@@ -30,59 +30,77 @@ jobs:
         id: check
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping beta release: commit already has a release tag"
           else
-            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  prepare:
     needs: pre-check
     if: needs.pre-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      make_latest: ${{ steps.meta.outputs.make_latest }}
+    steps:
+      - name: Determine release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RAW_VERSION="${{ github.event.inputs.version }}"
+            if [[ "$RAW_VERSION" == v* ]]; then
+              TAG="$RAW_VERSION"
+            else
+              TAG="v$RAW_VERSION"
+            fi
+            VERSION="$TAG"
+            RELEASE_NAME="Release $TAG"
+            PRERELEASE=false
+            MAKE_LATEST=true
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+            VERSION="$TAG"
+            RELEASE_NAME="Release $TAG"
+            PRERELEASE=false
+            MAKE_LATEST=true
+          else
+            SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+            TAG="beta-$SHORT_SHA"
+            VERSION="$TAG"
+            RELEASE_NAME="Beta $SHORT_SHA"
+            PRERELEASE=true
+            MAKE_LATEST=false
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "make_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            name: macOS-arm64
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            name: macOS-x64
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: Windows-x64
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            name: Linux-x64
+            asset_name: linux-x86_64
           - platform: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            name: Linux-arm64
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            name: Linux-musl-x64
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            name: Linux-musl-arm64
+            asset_name: linux-aarch64
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
-          fi
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -112,24 +130,96 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-cache-${{ matrix.target }}"
+          shared-key: rust-cache-${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Build app
-        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Upload build artifacts
+      - name: Package release archive
+        shell: bash
+        run: |
+          PACKAGE_ROOT="dist/kiro-rs-${{ needs.prepare.outputs.version }}-${{ matrix.asset_name }}"
+          mkdir -p "$PACKAGE_ROOT"
+          cp "target/${{ matrix.target }}/release/kiro-rs" "$PACKAGE_ROOT/"
+          cp README.md LICENSE "$PACKAGE_ROOT/"
+          tar -C dist -czf "dist/kiro-rs-${{ needs.prepare.outputs.version }}-${{ matrix.asset_name }}.tar.gz" "$(basename "$PACKAGE_ROOT")"
+
+      - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
+          name: kiro-rs-${{ needs.prepare.outputs.version }}-${{ matrix.asset_name }}
           if-no-files-found: error
-          compression-level: 6
-          path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+          compression-level: 0
+          path: dist/*.tar.gz
+
+  release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: kiro-rs-${{ needs.prepare.outputs.version }}-*
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.prepare.outputs.make_latest }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*.tar.gz
+
+  cleanup:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep only the 10 newest releases
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const staleReleases = releases
+              .filter((release) => !release.draft)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+              .slice(10);
+
+            if (staleReleases.length === 0) {
+              core.info('No old releases to delete.');
+              return;
+            }
+
+            for (const release of staleReleases) {
+              core.info(`Deleting release ${release.tag_name} (${release.id})`);
+              await github.rest.repos.deleteRelease({
+                owner,
+                repo,
+                release_id: release.id,
+              });
+
+              if (release.prerelease && release.tag_name.startsWith('beta-')) {
+                try {
+                  await github.rest.git.deleteRef({
+                    owner,
+                    repo,
+                    ref: `tags/${release.tag_name}`,
+                  });
+                } catch (error) {
+                  core.warning(`Failed to delete tag ${release.tag_name}: ${error.message}`);
+                }
+              }
+            }
