@@ -172,7 +172,7 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.release_name }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          prerelease: ${{ fromJSON(needs.prepare.outputs.prerelease) }}
           make_latest: ${{ needs.prepare.outputs.make_latest }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -195,7 +195,7 @@ jobs:
 
             const staleReleases = releases
               .filter((release) => !release.draft)
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
               .slice(10);
 
             if (staleReleases.length === 0) {
@@ -210,16 +210,4 @@ jobs:
                 repo,
                 release_id: release.id,
               });
-
-              if (release.prerelease && release.tag_name.startsWith('beta-')) {
-                try {
-                  await github.rest.git.deleteRef({
-                    owner,
-                    repo,
-                    ref: `tags/${release.tag_name}`,
-                  });
-                } catch (error) {
-                  core.warning(`Failed to delete tag ${release.tag_name}: ${error.message}`);
-                }
-              }
             }
