@@ -172,7 +172,7 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.release_name }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ fromJSON(needs.prepare.outputs.prerelease) }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
           make_latest: ${{ needs.prepare.outputs.make_latest }}
           generate_release_notes: true
           fail_on_unmatched_files: true
