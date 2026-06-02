@@ -404,9 +404,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 14. 构建 InferenceConfig
-    let inference_config = if req.max_tokens > 0
-        || req.temperature.is_some()
-        || req.top_p.is_some()
+    let inference_config = if req.max_tokens > 0 || req.temperature.is_some() || req.top_p.is_some()
     {
         Some(crate::kiro::model::requests::kiro::InferenceConfig {
             max_tokens: if req.max_tokens > 0 {
