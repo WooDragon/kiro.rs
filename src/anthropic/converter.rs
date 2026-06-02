@@ -696,7 +696,7 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
                 // 直接剥离 toolUses，不注入叙述文本（防止模型模仿 tool call 格式）
                 a.assistant_response_message.tool_uses = None;
                 if a.assistant_response_message.content.trim().is_empty() {
-                    a.assistant_response_message.content = ".".to_string();
+                    a.assistant_response_message.content = " ".to_string();
                 }
             }
             Message::User(u) => {
@@ -736,9 +736,9 @@ fn narrate_tool_results(
                 .collect::<Vec<_>>()
                 .join("\n");
             if tr.is_error {
-                format!("[{}] ERROR:\n{}", name, text_content.trim())
+                format!("[{}] ERROR:\n{}", name, text_content.trim_end())
             } else {
-                format!("[{}] {}", name, text_content.trim())
+                format!("[{}] {}", name, text_content.trim_end())
             }
         })
         .collect();
@@ -1842,8 +1842,8 @@ mod tests {
         if let Message::Assistant(a) = &history[1] {
             assert!(a.assistant_response_message.tool_uses.is_none());
             assert_eq!(
-                a.assistant_response_message.content, ".",
-                "空 content 应设为占位符 '.'"
+                a.assistant_response_message.content, " ",
+                "空 content 应设为占位符 ' '"
             );
         } else {
             panic!("history[1] 应为 Assistant");
