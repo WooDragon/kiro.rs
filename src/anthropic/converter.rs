@@ -404,9 +404,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 14. 构建 InferenceConfig
-    let inference_config = if req.max_tokens > 0
-        || req.temperature.is_some()
-        || req.top_p.is_some()
+    let inference_config = if req.max_tokens > 0 || req.temperature.is_some() || req.top_p.is_some()
     {
         Some(crate::kiro::model::requests::kiro::InferenceConfig {
             max_tokens: if req.max_tokens > 0 {
@@ -641,15 +639,16 @@ fn remove_orphaned_tool_uses(
     }
 }
 
-/// 将历史中的结构化 tool 数据降级为纯文本叙述。
+/// 将历史中的结构化 tool 数据降级。
 /// Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults），
-/// 历史中所有其他 tool 数据必须以纯文本形式保留语义。
+/// 历史中 assistant 的 toolUses 直接剥离（不注入文本，避免模型模仿输出格式），
+/// 历史中 user 的 toolResults 叙述为自然语言保留语义。
 fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[ToolResult]) {
     if history.is_empty() {
         return;
     }
 
-    // 1. 收集 tool_use_id → tool_name 映射
+    // 1. 收集 tool_use_id → tool_name 映射（供 user turn 叙述时使用）
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
     for msg in history.iter() {
         if let Message::Assistant(a) = msg {
@@ -692,17 +691,10 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
                 if Some(idx) == active_idx {
                     continue;
                 }
-                if let Some(tool_uses) = a.assistant_response_message.tool_uses.take() {
-                    if !tool_uses.is_empty() {
-                        let narrated = narrate_tool_uses(&tool_uses);
-                        let content = &mut a.assistant_response_message.content;
-                        if content.trim().is_empty() {
-                            *content = narrated;
-                        } else {
-                            content.push_str("\n\n");
-                            content.push_str(&narrated);
-                        }
-                    }
+                // 直接剥离 toolUses，不注入叙述文本（防止模型模仿 tool call 格式）
+                a.assistant_response_message.tool_uses = None;
+                if a.assistant_response_message.content.trim().is_empty() {
+                    a.assistant_response_message.content = " ".to_string();
                 }
             }
             Message::User(u) => {
@@ -724,17 +716,6 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
     }
 }
 
-fn narrate_tool_uses(tool_uses: &[ToolUseEntry]) -> String {
-    tool_uses
-        .iter()
-        .map(|tu| {
-            let args = serde_json::to_string(&tu.input).unwrap_or_default();
-            format!("[Tool Call: {}]\nArguments: {}", tu.name, args)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 fn narrate_tool_results(
     tool_results: &[ToolResult],
     name_map: &HashMap<String, String>,
@@ -753,13 +734,13 @@ fn narrate_tool_results(
                 .collect::<Vec<_>>()
                 .join("\n");
             if tr.is_error {
-                format!("[{}] ERROR:\n{}", name, text_content)
+                format!("[{}] ERROR:\n{}", name, text_content.trim_end())
             } else {
-                format!("[{}] {}", name, text_content)
+                format!("[{}] {}", name, text_content.trim_end())
             }
         })
         .collect();
-    format!("Tool results:\n\n{}", parts.join("\n\n"))
+    parts.join("\n\n")
 }
 
 /// Kiro API 工具名称最大长度限制
@@ -1734,6 +1715,137 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_sanitize_history_strips_tool_uses_without_narration() {
+        use super::sanitize_history_tools;
+        use crate::kiro::model::requests::conversation::{
+            AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
+        };
+        use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+        // 构造历史：2 轮 tool 使用 + 1 轮纯文本
+        let mut history = vec![
+            Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new("read file", "claude-sonnet-4"),
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage {
+                    content: "I'll read it.".to_string(),
+                    tool_uses: Some(vec![ToolUseEntry {
+                        tool_use_id: "tu_old_1".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"path": "/foo"}),
+                    }]),
+                },
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: {
+                    let mut m = UserMessage::new("", "claude-sonnet-4");
+                    m.user_input_message_context.tool_results =
+                        vec![ToolResult::success("tu_old_1", "file content here")];
+                    m
+                },
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage {
+                    content: String::new(),
+                    tool_uses: Some(vec![ToolUseEntry {
+                        tool_use_id: "tu_active".to_string(),
+                        name: "Edit".to_string(),
+                        input: serde_json::json!({"file": "/bar"}),
+                    }]),
+                },
+            }),
+        ];
+
+        // 当前 tool_results 对应最后一条 assistant 的 tool_use
+        let current_results = vec![ToolResult::success("tu_active", "edit done")];
+
+        sanitize_history_tools(&mut history, &current_results);
+
+        // 验证：历史中第一条 assistant（非活跃）tool_uses 被剥离
+        if let Message::Assistant(a) = &history[1] {
+            assert!(
+                a.assistant_response_message.tool_uses.is_none(),
+                "历史 assistant tool_uses 应被剥离"
+            );
+            // content 保持原样，不注入任何 [Tool Call:...] 文本
+            assert_eq!(a.assistant_response_message.content, "I'll read it.");
+            assert!(
+                !a.assistant_response_message.content.contains("[Tool Call"),
+                "不应注入 tool call 叙述文本"
+            );
+        } else {
+            panic!("history[1] 应为 Assistant");
+        }
+
+        // 验证：tool_results 被叙述进 user content
+        if let Message::User(u) = &history[2] {
+            assert!(
+                u.user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty(),
+                "结构化 tool_results 应被清除"
+            );
+            assert!(
+                u.user_input_message.content.contains("[Read]"),
+                "user content 应包含叙述化的 tool result"
+            );
+        } else {
+            panic!("history[2] 应为 User");
+        }
+
+        // 验证：活跃 turn（最后一条 assistant）保持不变
+        if let Message::Assistant(a) = &history[3] {
+            assert!(
+                a.assistant_response_message.tool_uses.is_some(),
+                "活跃 assistant tool_uses 应保留"
+            );
+            // 空 content 不应被设为 "." 因为它是活跃 turn
+        } else {
+            panic!("history[3] 应为 Assistant");
+        }
+    }
+
+    #[test]
+    fn test_sanitize_sets_placeholder_for_empty_assistant_content() {
+        use super::sanitize_history_tools;
+        use crate::kiro::model::requests::conversation::{
+            AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
+        };
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new("do something", "claude-sonnet-4"),
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage {
+                    content: String::new(), // 只有 tool_use 没有文本
+                    tool_uses: Some(vec![ToolUseEntry {
+                        tool_use_id: "tu_orphan".to_string(),
+                        name: "Bash".to_string(),
+                        input: serde_json::json!({"cmd": "ls"}),
+                    }]),
+                },
+            }),
+        ];
+
+        // 没有活跃 tool_results
+        sanitize_history_tools(&mut history, &[]);
+
+        if let Message::Assistant(a) = &history[1] {
+            assert!(a.assistant_response_message.tool_uses.is_none());
+            assert_eq!(
+                a.assistant_response_message.content, " ",
+                "空 content 应设为占位符 ' '"
+            );
+        } else {
+            panic!("history[1] 应为 Assistant");
+        }
     }
 
     #[test]
