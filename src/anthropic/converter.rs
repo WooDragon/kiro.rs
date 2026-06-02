@@ -28,8 +28,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
             "type": "object",
-            "properties": {},
-            "required": []
+            "properties": {}
         });
     };
 
