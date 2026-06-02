@@ -211,7 +211,8 @@ pub struct TrimStats {
     pub pairs_removed: usize,
     /// 裁剪前 body 字节数（`KiroRequest` 完整序列化大小）
     pub bytes_before: usize,
-    /// 裁剪后预估 body 字节数（低估，真实减少 ≥ 预估减少）
+    /// 裁剪后 body 字节数的保守上界：因 cut_bytes 是真实删除量的安全低估，
+    /// `bytes_before - cut_bytes` 是裁后真实大小的高估上界（真实值 ≤ 此值 ≤ max_bytes）。
     pub bytes_after_est: usize,
 }
 
@@ -298,17 +299,21 @@ pub(crate) fn trim_history_to_byte_limit(
     let excess = bytes_before - max_bytes;
     let mut cut_bytes: usize = 0;
     let mut pairs_to_remove: usize = 0;
+    let mut reached = false; // 是否累积到足够字节（cut_bytes >= excess）
 
     let mut i = pinned_front;
     while i + 1 < cuttable_end {
         let user_msg = &history[i];
         let assistant_msg = &history[i + 1];
 
-        // 鲁棒性：确认对结构正确
+        // 鲁棒性：窗口内 role 不成对属结构异常 → 真正 fail-open（不修改 history）
         if !matches!(user_msg, Message::User(_)) || !matches!(assistant_msg, Message::Assistant(_))
         {
-            tracing::warn!(i, "裁剪窗口内 role 不成对，结构异常，终止裁剪（fail-open）");
-            break;
+            tracing::warn!(
+                i,
+                "裁剪窗口内 role 不成对，结构异常，跳过裁剪（fail-open，不修改 history）"
+            );
+            return None;
         }
 
         // 对整个 Message 序列化（含 tool_uses 等全部字段），安全低估
@@ -325,18 +330,22 @@ pub(crate) fn trim_history_to_byte_limit(
 
         if cut_bytes >= excess {
             // 已累积足够字节，一轮达标，停止
+            reached = true;
             break;
         }
 
         i += 2;
     }
 
-    if pairs_to_remove == 0 {
-        // 窗口内没有可删对（罕见边界情况）
+    // 删光整个可裁窗口仍不足以覆盖 excess（超限主要来自 system/tools/current 等不可裁部分），
+    // 或窗口内本就无可删对 → 真正 fail-open：不裁剪、保留历史，交 map_provider_error 兜底。
+    // 仅在 reached 时返回 Some，锁住不变量「返回 Some ⟺ 裁后 body ≤ max_bytes」。
+    if !reached {
         tracing::warn!(
             bytes_before,
             max_bytes,
-            "裁剪窗口内无可删对，原样发送（map_provider_error 兜底）"
+            cut_bytes,
+            "可裁窗口不足以将 payload 裁剪到限内，跳过裁剪（fail-open），交 map_provider_error 兜底"
         );
         return None;
     }
@@ -345,6 +354,8 @@ pub(crate) fn trim_history_to_byte_limit(
     let drain_end = pinned_front + pairs_to_remove * 2;
     state.history.drain(pinned_front..drain_end);
 
+    // bytes_after_est = bytes_before - cut_bytes。因 cut_bytes 是真实删除量的安全低估，
+    // 此值是裁剪后真实 body 大小的保守上界（真实值 ≤ 此值）；reached 保证它 ≤ max_bytes。
     let bytes_after_est = bytes_before.saturating_sub(cut_bytes);
     Some(TrimStats {
         pairs_removed: pairs_to_remove,
@@ -2865,6 +2876,26 @@ mod tests {
         ConversationState::new("test-conv").with_history(history)
     }
 
+    /// 计算一个真实可达成的 limit，使裁剪恰好需移除从 pinned_front 起的前 `pairs` 对才达标。
+    /// 返回 `(limit, bytes_before)`：`limit = bytes_before - (前 pairs 对的 est 之和)`，
+    /// 故 `excess` 等于这些对的 est 之和，移除它们后 `cut_bytes >= excess`（reached）→ 返回 Some。
+    /// 取代旧测试里的 `limit=1` 暴力值——后者在新语义下属"窗口不足"会 fail-open(None)。
+    fn limit_for_trimming_pairs(
+        state: &ConversationState,
+        has_system_pair: bool,
+        pairs: usize,
+    ) -> (usize, usize) {
+        let bytes_before = serde_json::to_string(state).unwrap().len();
+        let pinned_front = if has_system_pair { 2 } else { 0 };
+        let mut est_sum = 0usize;
+        for k in 0..pairs {
+            let u = pinned_front + k * 2;
+            est_sum += serde_json::to_string(&state.history[u]).unwrap().len()
+                + serde_json::to_string(&state.history[u + 1]).unwrap().len();
+        }
+        (bytes_before - est_sum, bytes_before)
+    }
+
     /// T01：未超限时 trim_history_to_byte_limit 返回 None，history 不变
     #[test]
     fn test_trim_no_change_when_under_limit() {
@@ -2880,29 +2911,37 @@ mod tests {
     /// T02：超限时裁剪最旧优先（裁掉第一对）
     #[test]
     fn test_trim_removes_oldest_pair_first() {
-        // 构造足够大的 history，然后人为将 limit 设为极小触发裁剪
         let mut state = make_conversation_state(4, "some content here");
         let orig_len = state.history.len(); // 8
+        // 记录最旧那对的 user 内容，裁剪后应不再是 history[0]
+        let oldest_user = if let Message::User(u) = &state.history[0] {
+            u.user_input_message.content.clone()
+        } else {
+            panic!("history[0] 应为 User")
+        };
 
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
-
-        // 设 limit 比实际小，必然触发裁剪
-        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
-        assert!(result.is_some(), "超限时应裁剪");
+        // 真实 limit：移除最旧 1 对即达标
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+        assert!(result.is_some(), "超限且可裁时应裁剪");
         let stats = result.unwrap();
-        assert!(stats.pairs_removed > 0);
+        assert_eq!(stats.pairs_removed, 1, "移除最旧 1 对即达标");
         assert!(state.history.len() < orig_len, "history 应变短");
+        if let Message::User(u) = &state.history[0] {
+            assert_ne!(
+                u.user_input_message.content, oldest_user,
+                "最旧那对应被优先裁掉"
+            );
+        }
     }
 
     /// T03：裁剪后 history 严格保持 User/Assistant 交替
     #[test]
     fn test_trim_preserves_alternating_roles() {
         let mut state = make_conversation_state(6, "content");
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
-
-        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 2);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+        assert!(result.is_some(), "应发生裁剪");
 
         // 验证剩余 history 严格交替
         for (i, msg) in state.history.iter().enumerate() {
@@ -2956,11 +2995,12 @@ mod tests {
         };
 
         let mut state = ConversationState::new("test-conv").with_history(history);
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
+        // 真实 limit：has_system_pair=true，移除 system 对之后最旧 1 对即达标
+        let (limit, bytes) = limit_for_trimming_pairs(&state, true, 1);
 
         // 触发裁剪；has_system_pair=true 保护首 2 条
-        let result = trim_history_to_byte_limit(&mut state, true, 1, bytes);
+        let result = trim_history_to_byte_limit(&mut state, true, limit, bytes);
+        assert!(result.is_some(), "应裁剪 1 对");
 
         // system 对应保留
         if let Message::User(u) = &state.history[0] {
@@ -2971,10 +3011,7 @@ mod tests {
         } else {
             panic!("裁剪后 history[0] 应仍为 User（system）");
         }
-        if result.is_some() {
-            // 如果确实裁了，长度应变短但保护对还在
-            assert!(state.history.len() >= 2, "system 对的 2 条必须保留");
-        }
+        assert!(state.history.len() >= 2, "system 对的 2 条必须保留");
     }
 
     /// T05：活跃 tool turn（尾部保留区）不被裁
@@ -3011,11 +3048,12 @@ mod tests {
 
         let mut state = ConversationState::new("test-conv").with_history(history);
         let orig_len = state.history.len(); // 8
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
+        // 真实 limit：裁掉可裁窗口的 2 对（活跃 tool turn 在尾部保留区，不受影响）
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 2);
 
         // 触发裁剪
-        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+        assert!(result.is_some(), "应发生裁剪");
 
         // 活跃 tool turn（最后 2 条）必须保留
         let new_len = state.history.len();
@@ -3044,10 +3082,10 @@ mod tests {
         let user_input = UserInputMessage::new("this is the current message", "claude-sonnet-4.5");
         state.current_message = CurrentMessage::new(user_input);
 
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
-
-        trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        // 真实 limit：移除最旧 1 对即达标（current_message 独立于 history，不受影响）
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+        assert!(result.is_some(), "应发生裁剪");
 
         assert_eq!(
             state.current_message.user_input_message.content, "this is the current message",
@@ -3105,27 +3143,26 @@ mod tests {
     #[test]
     fn test_trim_limit_plus_one_triggers_trim() {
         let mut state = make_conversation_state(4, "some long content here");
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
+        let bytes = serde_json::to_string(&state).unwrap().len();
 
-        // 将 limit 设为 bytes-1，使 bytes_before > limit
+        // limit = bytes-1 → excess=1，最旧 1 对的 est 远大于 1，移除 1 对即达标
         let result = trim_history_to_byte_limit(&mut state, false, bytes - 1, bytes);
-        // 有可裁对时应裁；无可裁对时 None（不报错）
-        // 只验证不 panic
-        let _ = result;
+        assert!(result.is_some(), "超限 1 字节且可裁时应裁剪");
+        assert_eq!(
+            result.unwrap().pairs_removed,
+            1,
+            "excess=1 时移除最旧 1 对即达标"
+        );
     }
 
     /// T09：has_system_pair=false 路径正常工作（无 system 对时 pinned_front=0）
     #[test]
     fn test_trim_no_system_pair_path() {
         let mut state = make_conversation_state(4, "content");
-        let serialized = serde_json::to_string(&state).unwrap();
-        let bytes = serialized.len();
-
-        // has_system_pair=false，pinned_front=0
-        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
-        // 有 4 对可裁，应裁成功
-        assert!(result.is_some(), "has_system_pair=false 时应正常裁剪");
+        // has_system_pair=false，pinned_front=0；真实 limit 移除最旧 1 对
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+        assert!(result.is_some(), "has_system_pair=false 且可裁时应正常裁剪");
         assert!(state.history.len() % 2 == 0, "裁剪后 history 长度应为偶数");
     }
 
@@ -3150,6 +3187,56 @@ mod tests {
         let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
         assert!(result.is_none(), "奇数长度 history 应 fail-open 返回 None");
         assert_eq!(state.history.len(), 3, "fail-open 时 history 不应改变");
+    }
+
+    /// 评论2：裁剪窗口内 role 不成对 → 真正 fail-open（返回 None，不修改 history）
+    #[test]
+    fn test_trim_mid_window_role_mismatch_fails_open() {
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+        let model_id = "claude-sonnet-4.5";
+        // 偶数长度、首条 User、通过早期检查；但可裁窗口内第 2 对 role 不成对（U,U）
+        let history = vec![
+            Message::User(HistoryUserMessage::new("u0", model_id)),
+            Message::Assistant(HistoryAssistantMessage::new("a0")),
+            Message::User(HistoryUserMessage::new("u1", model_id)),
+            Message::User(HistoryUserMessage::new("u1-broken", model_id)), // 异常：应为 Assistant
+            Message::Assistant(HistoryAssistantMessage::new("a2")),
+            Message::Assistant(HistoryAssistantMessage::new("a2b")),
+            Message::User(HistoryUserMessage::new("u3", model_id)),
+            Message::Assistant(HistoryAssistantMessage::new("a3")),
+        ];
+        let orig_len = history.len();
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        let bytes = serde_json::to_string(&state).unwrap().len();
+
+        // limit=1 → excess 极大，迫使循环走到第 2 对（索引 2,3）触发 role 异常
+        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        assert!(result.is_none(), "窗口内 role 不成对应 fail-open 返回 None");
+        assert_eq!(
+            state.history.len(),
+            orig_len,
+            "fail-open 时 history 不应被修改"
+        );
+    }
+
+    /// 评论3：删光整个可裁窗口仍不足覆盖 excess → 真正 fail-open（None，保留历史）
+    #[test]
+    fn test_trim_insufficient_window_fails_open() {
+        let mut state = make_conversation_state(4, "x"); // 小内容，4 对，可裁窗口 2 对
+        let orig_len = state.history.len();
+        let bytes = serde_json::to_string(&state).unwrap().len();
+
+        // limit=1 → excess 远超整个可裁窗口能释放的字节，无法一轮达标
+        let result = trim_history_to_byte_limit(&mut state, false, 1, bytes);
+        assert!(
+            result.is_none(),
+            "可裁窗口不足以达标时应 fail-open 返回 None"
+        );
+        assert_eq!(
+            state.history.len(),
+            orig_len,
+            "fail-open 时 history 不应被修改"
+        );
     }
 
     /// 回归护栏变体：空 tool_result 经叙述/历史处理后，assistant content 不含危险模式

@@ -96,11 +96,11 @@ fn finalize_request_body(
             serde_json::to_string(&kiro_request)
         }
         None => {
-            // 无可裁对或结构异常：fail-open，原样发送，由 map_provider_error 兜底
+            // 无可裁对 / 可裁窗口不足以达标 / 结构异常：fail-open，原样发送，由 map_provider_error 兜底
             tracing::warn!(
                 body_len = body.len(),
                 limit,
-                "payload 超限但无可裁对，原样发送（map_provider_error 兜底）"
+                "payload 超限但无法裁剪到限内，原样发送（map_provider_error 兜底）"
             );
             Ok(body)
         }
