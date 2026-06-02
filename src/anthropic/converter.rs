@@ -696,7 +696,7 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
                     if !tool_uses.is_empty() {
                         let narrated = narrate_tool_uses(&tool_uses);
                         let content = &mut a.assistant_response_message.content;
-                        if content.is_empty() {
+                        if content.trim().is_empty() {
                             *content = narrated;
                         } else {
                             content.push_str("\n\n");
@@ -710,7 +710,7 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
                 if !ctx.tool_results.is_empty() {
                     let narrated = narrate_tool_results(&ctx.tool_results, &tool_name_map);
                     let content = &mut u.user_input_message.content;
-                    if content.is_empty() {
+                    if content.trim().is_empty() {
                         *content = narrated;
                     } else {
                         content.push_str("\n\n");
@@ -1228,6 +1228,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -1259,6 +1261,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -1388,6 +1392,8 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -1560,6 +1566,8 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -1647,6 +1655,8 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -1704,6 +1714,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -1828,6 +1840,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
@@ -2257,6 +2271,8 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            temperature: None,
+            top_p: None,
             metadata: None,
         };
 
