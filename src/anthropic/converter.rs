@@ -17,6 +17,8 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
+const COMPOSITION_SCHEMA_KEYS: &[&str] = &["anyOf", "oneOf", "allOf", "$ref"];
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
@@ -31,13 +33,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type：只在缺失或无效且不是组合/$ref schema 时补 object，避免改变有效 schema 语义。
-    let has_composition = ["anyOf", "oneOf", "allOf", "$ref"]
+    let has_composition = COMPOSITION_SCHEMA_KEYS
         .iter()
         .any(|key| obj.contains_key(*key));
-    let type_is_valid = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
+    let schema_type = obj.get("type").and_then(|v| v.as_str());
+    let type_is_valid = schema_type.is_some_and(|s| !s.is_empty());
+    let mut is_object_schema = schema_type == Some("object");
     if !type_is_valid
         && (!has_composition || obj.contains_key("properties") || obj.contains_key("required"))
     {
@@ -45,15 +46,13 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
             "type".to_string(),
             serde_json::Value::String("object".to_string()),
         );
+        is_object_schema = true;
     }
 
     // properties：存在但不是 object 时修复；缺失时仅为 object schema 补空对象。
-    match (
-        obj.get("type").and_then(|v| v.as_str()),
-        obj.get("properties"),
-    ) {
+    match (is_object_schema, obj.get("properties")) {
         (_, Some(serde_json::Value::Object(_))) => {}
-        (_, Some(_)) | (Some("object"), None) => {
+        (_, Some(_)) | (true, None) => {
             obj.insert(
                 "properties".to_string(),
                 serde_json::Value::Object(serde_json::Map::new()),
@@ -79,7 +78,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         Some(_) => {
             obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
         }
-        None if obj.get("type").and_then(|v| v.as_str()) == Some("object") => {
+        None if is_object_schema => {
             obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
         }
         None => {}
