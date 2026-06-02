@@ -195,7 +195,11 @@ jobs:
 
             const staleReleases = releases
               .filter((release) => !release.draft)
-              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+              .sort((a, b) => {
+                const aTime = new Date(a.published_at ?? a.created_at).getTime();
+                const bTime = new Date(b.published_at ?? b.created_at).getTime();
+                return bTime - aTime;
+              })
               .slice(10);
 
             if (staleReleases.length === 0) {
