@@ -1848,6 +1848,122 @@ mod tests {
         }
     }
 
+    /// Regression: narrated tool-call text in assistant content causes model mimicry.
+    /// See https://github.com/WooDragon/kiro.rs/issues/22
+    #[test]
+    fn test_regression_no_tool_call_patterns_in_assistant_content() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"path": {"type": "string"}}),
+        );
+
+        // 3 轮 tool 交互 + 1 条纯用户消息，覆盖多轮历史降级
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                // 第 1 轮
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read /foo"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Reading the file."},
+                        {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"path": "/foo"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_1", "content": "foo content"}
+                    ]),
+                },
+                // 第 2 轮：assistant 只有 tool_use 没有文本
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_2", "name": "Bash", "input": {"cmd": "ls"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_2", "content": "file1\nfile2"}
+                    ]),
+                },
+                // 第 3 轮：assistant 正常回复
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Done, here are the results."),
+                },
+                // 新用户消息（无 tool_result）
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("now summarize"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "Read".to_string(),
+                    description: "Read a file".to_string(),
+                    input_schema: schema.clone(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "Run a command".to_string(),
+                    input_schema: schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("multi-turn tool request should convert");
+
+        // 会引起模型模仿的危险模式
+        let dangerous_patterns = [
+            "[Tool Call:",
+            "[Tool Call]",
+            "[Called tool",
+            "Arguments: {",
+            "tool_use_id",
+            "\"type\":\"tool_use\"",
+            "\"type\": \"tool_use\"",
+        ];
+
+        for msg in &result.conversation_state.history {
+            if let Message::Assistant(a) = msg {
+                let content = &a.assistant_response_message.content;
+                for pattern in &dangerous_patterns {
+                    assert!(
+                        !content.contains(pattern),
+                        "assistant content must not contain '{}' (causes model mimicry), found in: {:?}",
+                        pattern,
+                        content
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_extract_session_id_valid() {
         // 测试有效的 user_id 格式
