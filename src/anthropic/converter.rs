@@ -60,40 +60,23 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         _ => {}
     }
 
-    // required：存在时必须是 string 数组；缺失时仅为 object schema 补空数组。
+    // required：Kiro 只接受非空 string 数组；空数组/非法值会导致 Improperly formed request。
     match obj.remove("required") {
         Some(serde_json::Value::Array(arr)) => {
-            obj.insert(
-                "required".to_string(),
-                serde_json::Value::Array(
-                    arr.into_iter()
-                        .filter_map(|v| {
-                            v.as_str().map(|s| serde_json::Value::String(s.to_string()))
-                        })
-                        .collect(),
-                ),
-            );
+            let required: Vec<_> = arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                .collect();
+            if !required.is_empty() {
+                obj.insert("required".to_string(), serde_json::Value::Array(required));
+            }
         }
-        Some(_) => {
-            obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
-        }
-        None if is_object_schema => {
-            obj.insert("required".to_string(), serde_json::Value::Array(Vec::new()));
-        }
-        None => {}
+        Some(_) | None => {}
     }
 
-    // additionalProperties：缺失时保留缺失，存在但类型非法时再修复。
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        Some(_) => {
-            obj.insert(
-                "additionalProperties".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        None => {}
-    }
+    // additionalProperties：Kiro-Go 对应实现会递归移除该字段，避免 Kiro 400。
+    obj.remove("additionalProperties");
+    clean_nested_schema_fields(&mut obj);
 
     serde_json::Value::Object(obj)
 }
@@ -103,6 +86,42 @@ fn should_default_to_object_type(
     has_composition: bool,
 ) -> bool {
     !has_composition || obj.contains_key("properties") || obj.contains_key("required")
+}
+
+fn clean_nested_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for value in obj.values_mut() {
+        match value {
+            serde_json::Value::Object(child) => {
+                clean_schema_fields(child);
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let serde_json::Value::Object(child) = item {
+                        clean_schema_fields(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn clean_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.remove("additionalProperties");
+
+    if let Some(required) = obj.remove("required") {
+        if let serde_json::Value::Array(arr) = required {
+            let required: Vec<_> = arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                .collect();
+            if !required.is_empty() {
+                obj.insert("required".to_string(), serde_json::Value::Array(required));
+            }
+        }
+    }
+
+    clean_nested_schema_fields(obj);
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -962,34 +981,26 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-20250514")
+            .unwrap()
+            .contains("sonnet"));
+        assert!(map_model("claude-3-5-sonnet-20241022")
+            .unwrap()
+            .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-4-20250514")
+            .unwrap()
+            .contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        assert!(map_model("claude-haiku-4-20250514")
+            .unwrap()
+            .contains("haiku"));
     }
 
     #[test]
@@ -1256,24 +1267,58 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_json_schema_preserves_valid_tool_schema() {
+    fn test_normalize_json_schema_removes_kiro_rejected_fields_recursively() {
         let schema = serde_json::json!({
             "type": "object",
             "description": "Run a shell command",
             "properties": {
-                "command": {"type": "string"},
-                "timeout": {"type": "integer", "minimum": 1}
+                "command": {
+                    "type": "string",
+                    "additionalProperties": false,
+                    "required": null
+                },
+                "options": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {
+                        "timeout": {"type": "integer", "minimum": 1}
+                    }
+                }
             },
             "required": ["command"],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "anyOf": [
+                {
+                    "type": "object",
+                    "required": [],
+                    "additionalProperties": false
+                }
+            ]
         });
 
-        let normalized = normalize_json_schema(schema.clone());
-        assert_eq!(normalized, schema);
+        let normalized = normalize_json_schema(schema);
+        assert!(!schema_contains_key(&normalized, "additionalProperties"));
+        assert_eq!(normalized["required"], serde_json::json!(["command"]));
+        assert_eq!(
+            normalized["properties"]["command"].get("required"),
+            None,
+            "nested null required should be removed"
+        );
+        assert_eq!(
+            normalized["properties"]["options"].get("required"),
+            None,
+            "nested empty required should be removed"
+        );
+        assert_eq!(
+            normalized["anyOf"][0].get("required"),
+            None,
+            "composition empty required should be removed"
+        );
     }
 
     #[test]
-    fn test_normalize_json_schema_preserves_composition_schema() {
+    fn test_normalize_json_schema_preserves_composition_required_values() {
         let schema = serde_json::json!({
             "oneOf": [
                 {
@@ -1306,11 +1351,11 @@ mod tests {
         assert_eq!(normalized["type"], "object");
         assert_eq!(normalized["properties"], serde_json::json!({}));
         assert_eq!(normalized["required"], serde_json::json!(["path"]));
-        assert_eq!(normalized["additionalProperties"], true);
+        assert_eq!(normalized.get("additionalProperties"), None);
     }
 
     #[test]
-    fn test_opus_4_8_preserves_multiple_tool_schemas() {
+    fn test_opus_4_8_sanitizes_multiple_tool_schemas() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
         let mut bash_schema = std::collections::HashMap::new();
@@ -1381,8 +1426,12 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].tool_specification.name, "Bash");
         assert_eq!(
-            tools[0].tool_specification.input_schema.json["additionalProperties"],
-            false
+            tools[0]
+                .tool_specification
+                .input_schema
+                .json
+                .get("additionalProperties"),
+            None
         );
         assert_eq!(
             tools[0].tool_specification.input_schema.json["required"],
@@ -1393,6 +1442,18 @@ mod tests {
             tools[1].tool_specification.input_schema.json["required"],
             serde_json::json!(["file_path", "old_string", "new_string"])
         );
+    }
+
+    fn schema_contains_key(value: &serde_json::Value, key: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|child| schema_contains_key(child, key))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().any(|child| schema_contains_key(child, key))
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -1662,10 +1723,9 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg =
+            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1694,10 +1754,8 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1759,10 +1817,8 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1805,10 +1861,8 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1951,7 +2005,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
         ]);
 
         let mut history = vec![
