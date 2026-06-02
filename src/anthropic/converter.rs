@@ -17,6 +17,7 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
+/// JSON Schema composition/reference keys that are valid without object-only fields.
 const COMPOSITION_SCHEMA_KEYS: &[&str] = &["anyOf", "oneOf", "allOf", "$ref"];
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -39,9 +40,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let schema_type = obj.get("type").and_then(|v| v.as_str());
     let type_is_valid = schema_type.is_some_and(|s| !s.is_empty());
     let mut is_object_schema = schema_type == Some("object");
-    if !type_is_valid
-        && (!has_composition || obj.contains_key("properties") || obj.contains_key("required"))
-    {
+    if !type_is_valid && should_default_to_object_type(&obj, has_composition) {
         obj.insert(
             "type".to_string(),
             serde_json::Value::String("object".to_string()),
@@ -97,6 +96,13 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn should_default_to_object_type(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    has_composition: bool,
+) -> bool {
+    !has_composition || obj.contains_key("properties") || obj.contains_key("required")
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -1262,7 +1268,8 @@ mod tests {
             "additionalProperties": false
         });
 
-        assert_eq!(normalize_json_schema(schema.clone()), schema);
+        let normalized = normalize_json_schema(schema.clone());
+        assert_eq!(normalized, schema);
     }
 
     #[test]
@@ -1282,7 +1289,8 @@ mod tests {
             ]
         });
 
-        assert_eq!(normalize_json_schema(schema.clone()), schema);
+        let normalized = normalize_json_schema(schema.clone());
+        assert_eq!(normalized, schema);
     }
 
     #[test]
