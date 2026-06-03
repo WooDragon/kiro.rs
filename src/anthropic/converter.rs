@@ -234,7 +234,7 @@ const KEEP_RECENT_PAIRS: usize = 2;
 /// 不触碰 current_message（独立字段）。
 ///
 /// # 参数
-/// * `state` - 可变的对话状态；`history` 必须已经过 `sanitize_history_tools`
+/// * `state` - 可变的对话状态；`history` 已经过 `validate_tool_pairing` / `remove_orphaned_tool_uses` 配对校验
 /// * `has_system_pair` - build_history 注入 system 对时置 true；首 2 条永不裁
 /// * `max_bytes` - 最大允许 body 大小（字节），由调用方传入 `max_payload_bytes()`
 /// * `bytes_before` - 调用方已测量的完整 `KiroRequest` 序列化大小，复用避免重复序列化
@@ -347,15 +347,49 @@ pub(crate) fn trim_history_to_byte_limit(
         return None;
     }
 
+    // ── 调整裁剪边界到对话回合边界（删 sanitize_history_tools 后必须，#26）────────
+    // trim 机械按 (User, Assistant) 对裁，但 tool_use（Assistant 轮）对应的 tool_result
+    // 落在下一对的 User 轮——跨对依赖。历史保留结构化 tool 数据后，若 drain 边界切在
+    // 「回合中段」（tool_result 轮），被裁 tool_use 的 tool_result 会孤立 → Kiro 400。
+    // 故把 drain_end 向后吸附到下一个「真实用户输入轮」（tool_results 为空的 User）作为
+    // 回合边界：裁掉若干完整回合，剩余 history 从干净用户输入开始，无跨界孤立配对。
+    // drain_end 恒偶数（pinned_front 偶 + 偶），history 首条 User ⟹ 偶数索引恒为 User。
+    let mut drain_end = pinned_front + pairs_to_remove * 2;
+    loop {
+        let at_turn_boundary = match &history[drain_end] {
+            Message::User(u) => u
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .is_empty(),
+            Message::Assistant(_) => false,
+        };
+        if at_turn_boundary {
+            break; // drain_end 处是真实用户输入轮，可安全裁到此
+        }
+        drain_end += 2;
+        if drain_end > cuttable_end {
+            // 吸附越过保留区起点仍无干净边界 → 末尾是横跨保留区的超长 tool 回合，
+            // 无法在不孤立 tool_result 的前提下裁剪 → fail-open，原样发送交 map_provider_error。
+            tracing::warn!(
+                bytes_before,
+                max_bytes,
+                "可裁区无安全回合边界（tool 回合横跨保留区），跳过裁剪（fail-open）"
+            );
+            return None;
+        }
+    }
+
     // ── 执行裁剪：一次性 drain ────────────────────────────────────────────
-    let drain_end = pinned_front + pairs_to_remove * 2;
+    let pairs_removed = (drain_end - pinned_front) / 2;
     state.history.drain(pinned_front..drain_end);
 
-    // bytes_after_est = bytes_before - cut_bytes。因 cut_bytes 是真实删除量的安全低估，
-    // 此值是裁剪后真实 body 大小的保守上界（真实值 ≤ 此值）；reached 保证它 ≤ max_bytes。
+    // bytes_after_est = bytes_before - cut_bytes。cut_bytes 是「裁到 pairs_to_remove」的安全
+    // 低估；吸附后实际裁的对 ≥ pairs_to_remove，真实删除量 ≥ cut_bytes ≥ excess，故此值仍是
+    // 裁后真实 body 的保守上界（真实值 ≤ 此值），reached 保证它 ≤ max_bytes。
     let bytes_after_est = bytes_before.saturating_sub(cut_bytes);
     Some(TrimStats {
-        pairs_removed: pairs_to_remove,
+        pairs_removed,
         bytes_before,
         bytes_after_est,
     })
@@ -525,10 +559,6 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
-
-    // 10.5 将历史中的结构化 tool 数据降级为纯文本
-    // Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults）
-    sanitize_history_tools(&mut history, &validated_tool_results);
 
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
@@ -800,107 +830,6 @@ fn remove_orphaned_tool_uses(
             }
         }
     }
-}
-
-/// 将历史中的结构化 tool 数据降级。
-/// Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults），
-/// 历史中 assistant 的 toolUses 直接剥离（不注入文本，避免模型模仿输出格式），
-/// 历史中 user 的 toolResults 叙述为自然语言保留语义。
-fn sanitize_history_tools(history: &mut [Message], current_tool_results: &[ToolResult]) {
-    if history.is_empty() {
-        return;
-    }
-
-    // 1. 收集 tool_use_id → tool_name 映射（供 user turn 叙述时使用）
-    let mut tool_name_map: HashMap<String, String> = HashMap::new();
-    for msg in history.iter() {
-        if let Message::Assistant(a) = msg
-            && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
-        {
-            for tu in tool_uses {
-                tool_name_map.insert(tu.tool_use_id.clone(), tu.name.clone());
-            }
-        }
-    }
-
-    // 2. 判断最后一条 assistant 是否是活跃 tool turn
-    let current_result_ids: std::collections::HashSet<&str> = current_tool_results
-        .iter()
-        .map(|r| r.tool_use_id.as_str())
-        .collect();
-
-    let active_idx = history
-        .iter()
-        .rposition(|msg| matches!(msg, Message::Assistant(_)))
-        .filter(|&idx| {
-            if let Message::Assistant(a) = &history[idx] {
-                if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
-                    !tool_uses.is_empty()
-                        && tool_uses
-                            .iter()
-                            .all(|tu| current_result_ids.contains(tu.tool_use_id.as_str()))
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-
-    // 3. 遍历历史，执行降级
-    for (idx, msg) in history.iter_mut().enumerate() {
-        match msg {
-            Message::Assistant(a) => {
-                if Some(idx) == active_idx {
-                    continue;
-                }
-                // 直接剥离 toolUses，不注入叙述文本（防止模型模仿 tool call 格式）
-                a.assistant_response_message.tool_uses = None;
-                if a.assistant_response_message.content.trim().is_empty() {
-                    a.assistant_response_message.content = " ".to_string();
-                }
-            }
-            Message::User(u) => {
-                let ctx = &mut u.user_input_message.user_input_message_context;
-                if !ctx.tool_results.is_empty() {
-                    let narrated = narrate_tool_results(&ctx.tool_results, &tool_name_map);
-                    let content = &mut u.user_input_message.content;
-                    if content.trim().is_empty() {
-                        *content = narrated;
-                    } else {
-                        content.push_str("\n\n");
-                        content.push_str(&narrated);
-                    }
-                    ctx.tool_results.clear();
-                }
-                ctx.tools.clear();
-            }
-        }
-    }
-}
-
-fn narrate_tool_results(tool_results: &[ToolResult], name_map: &HashMap<String, String>) -> String {
-    let parts: Vec<String> = tool_results
-        .iter()
-        .map(|tr| {
-            let name = name_map
-                .get(&tr.tool_use_id)
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-            let text_content: String = tr
-                .content
-                .iter()
-                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if tr.is_error {
-                format!("[{}] ERROR:\n{}", name, text_content.trim_end())
-            } else {
-                format!("[{}] {}", name, text_content.trim_end())
-            }
-        })
-        .collect();
-    parts.join("\n\n")
 }
 
 /// Kiro API 工具名称最大长度限制
@@ -1207,7 +1136,8 @@ fn convert_assistant_message(
 
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
+    // 纯 tool_use 轮 content 留空串：对齐 kiro2api（content 无 omitempty → "content":""）
+    // 不再注入空格占位符——空壳轮会诱导模型只回空格/句号（见 #26）
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
             format!(
@@ -1217,8 +1147,6 @@ fn convert_assistant_message(
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
     } else {
         text_content
     };
@@ -1258,11 +1186,8 @@ fn merge_assistant_messages(
         }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
+    // 空壳不注入占位符（#26）；上方已过滤空白子消息，join 不会产生多余换行
+    let content = content_parts.join("\n\n");
 
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
@@ -1897,135 +1822,242 @@ mod tests {
         );
     }
 
+    /// Regression #26: 删除 sanitize_history_tools 降级后，多轮 agent loop 历史
+    /// 必须保留结构化 toolUses/toolResults，且绝不出现单空格 " " 空壳 assistant 轮。
+    /// 空壳轮密度过高会诱导模型只回空格/句号，导致 CC 长会话死循环（与上下文长度无关）。
+    /// See https://github.com/WooDragon/kiro.rs/issues/26
     #[test]
-    fn test_sanitize_history_strips_tool_uses_without_narration() {
-        use super::sanitize_history_tools;
-        use crate::kiro::model::requests::conversation::{
-            AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
+    fn test_regression_26_structured_tool_turns_preserved_no_empty_shells() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        // 3 轮 agent loop：每轮 (assistant 纯 tool_use 无 text) + (user tool_result)，
+        // current 为纯文本，使历史内所有 tool_use 都已配对（不被 remove_orphaned 清理）。
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("start the task"),
+                },
+                // 第 1 轮：纯 tool_use（无 text）
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"cmd": "ls"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_1", "content": "file1\nfile2"}
+                    ]),
+                },
+                // 第 2 轮：纯 tool_use（无 text）
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_2", "name": "Read", "input": {"path": "/file1"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_2", "content": "contents of file1"}
+                    ]),
+                },
+                // 第 3 轮：纯 tool_use（无 text）
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_3", "name": "Bash", "input": {"cmd": "cat /file1"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tu_3", "content": "done"}
+                    ]),
+                },
+                // 当前消息：纯文本，无 tool_result
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("now summarize what you found"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "Run a command".to_string(),
+                    input_schema: schema.clone(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "Read".to_string(),
+                    description: "Read a file".to_string(),
+                    input_schema: schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
         };
-        use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
 
-        // 构造历史：2 轮 tool 使用 + 1 轮纯文本
-        let mut history = vec![
-            Message::User(HistoryUserMessage {
-                user_input_message: UserMessage::new("read file", "claude-sonnet-4"),
-            }),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: AssistantMessage {
-                    content: "I'll read it.".to_string(),
-                    tool_uses: Some(vec![ToolUseEntry {
-                        tool_use_id: "tu_old_1".to_string(),
-                        name: "Read".to_string(),
-                        input: serde_json::json!({"path": "/foo"}),
-                    }]),
-                },
-            }),
-            Message::User(HistoryUserMessage {
-                user_input_message: {
-                    let mut m = UserMessage::new("", "claude-sonnet-4");
-                    m.user_input_message_context.tool_results =
-                        vec![ToolResult::success("tu_old_1", "file content here")];
-                    m
-                },
-            }),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: AssistantMessage {
-                    content: String::new(),
-                    tool_uses: Some(vec![ToolUseEntry {
-                        tool_use_id: "tu_active".to_string(),
-                        name: "Edit".to_string(),
-                        input: serde_json::json!({"file": "/bar"}),
-                    }]),
-                },
-            }),
-        ];
+        let result = convert_request(&req).expect("multi-turn agent loop should convert");
+        let history = &result.conversation_state.history;
 
-        // 当前 tool_results 对应最后一条 assistant 的 tool_use
-        let current_results = vec![ToolResult::success("tu_active", "edit done")];
-
-        sanitize_history_tools(&mut history, &current_results);
-
-        // 验证：历史中第一条 assistant（非活跃）tool_uses 被剥离
-        if let Message::Assistant(a) = &history[1] {
-            assert!(
-                a.assistant_response_message.tool_uses.is_none(),
-                "历史 assistant tool_uses 应被剥离"
-            );
-            // content 保持原样，不注入任何 [Tool Call:...] 文本
-            assert_eq!(a.assistant_response_message.content, "I'll read it.");
-            assert!(
-                !a.assistant_response_message.content.contains("[Tool Call"),
-                "不应注入 tool call 叙述文本"
-            );
-        } else {
-            panic!("history[1] 应为 Assistant");
+        // 不变量 1（无空壳轮）：history 里绝不出现单空格 " " 空壳 assistant 轮（#26 死循环根因），
+        // 纯 tool_use 轮 content 应为空串 "" 而非任何空白占位。
+        let mut assistant_tool_turns = 0;
+        for msg in history {
+            if let Message::Assistant(a) = msg {
+                let content = &a.assistant_response_message.content;
+                assert_ne!(
+                    content, " ",
+                    "assistant content 不得为单空格占位符（空壳轮诱导模型死循环，#26）"
+                );
+                if a.assistant_response_message.tool_uses.is_some() {
+                    assistant_tool_turns += 1;
+                    if content.trim().is_empty() {
+                        assert_eq!(content, "", "纯 tool_use 轮 content 应为空串而非空白占位");
+                    }
+                }
+            }
         }
 
-        // 验证：tool_results 被叙述进 user content
-        if let Message::User(u) = &history[2] {
-            assert!(
-                u.user_input_message
-                    .user_input_message_context
-                    .tool_results
-                    .is_empty(),
-                "结构化 tool_results 应被清除"
-            );
-            assert!(
-                u.user_input_message.content.contains("[Read]"),
-                "user content 应包含叙述化的 tool result"
-            );
-        } else {
-            panic!("history[2] 应为 User");
-        }
+        // 不变量 2（保留结构化）：3 轮纯 tool_use 的 toolUses 都应保留（非活跃历史轮也不剥离）。
+        assert!(
+            assistant_tool_turns >= 3,
+            "3 轮纯 tool_use 的 toolUses 都应结构化保留，实际 {} 轮",
+            assistant_tool_turns
+        );
 
-        // 验证：活跃 turn（最后一条 assistant）保持不变
-        if let Message::Assistant(a) = &history[3] {
-            assert!(
-                a.assistant_response_message.tool_uses.is_some(),
-                "活跃 assistant tool_uses 应保留"
-            );
-            // 空 content 不应被设为 "." 因为它是活跃 turn
-        } else {
-            panic!("history[3] 应为 Assistant");
+        // 不变量 2（续）：历史 user 轮的结构化 toolResults 必须保留（不被叙述清空）。
+        let total_tool_results: usize = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                ),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            total_tool_results >= 3,
+            "3 个 tool_result 都应结构化保留，实际 {}",
+            total_tool_results
+        );
+
+        // 不变量 3（不叙述成文本）：user content 不得含叙述化的 tool result 文本。
+        for msg in history {
+            if let Message::User(u) = msg {
+                let content = &u.user_input_message.content;
+                for pat in ["[Bash]", "[Read]", "[Tool Call", "] ERROR:"] {
+                    assert!(
+                        !content.contains(pat),
+                        "user content 不得叙述化 tool result（应保留结构化），发现 '{}': {:?}",
+                        pat,
+                        content
+                    );
+                }
+            }
         }
     }
 
+    /// Regression #26: 连续 assistant 轮合并时，纯 tool_use（空 content）子消息
+    /// 与有文本的子消息混合，content 应为非空文本本身，不产生单空格占位或多余换行。
     #[test]
-    fn test_sanitize_sets_placeholder_for_empty_assistant_content() {
-        use super::sanitize_history_tools;
-        use crate::kiro::model::requests::conversation::{
-            AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
-        };
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+    fn test_regression_26_merge_assistant_no_empty_shell() {
+        use super::super::types::Message as AnthropicMessage;
 
-        let mut history = vec![
-            Message::User(HistoryUserMessage {
-                user_input_message: UserMessage::new("do something", "claude-sonnet-4"),
-            }),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: AssistantMessage {
-                    content: String::new(), // 只有 tool_use 没有文本
-                    tool_uses: Some(vec![ToolUseEntry {
-                        tool_use_id: "tu_orphan".to_string(),
-                        name: "Bash".to_string(),
-                        input: serde_json::json!({"cmd": "ls"}),
-                    }]),
-                },
-            }),
+        let msgs = [
+            // 第一个：纯 tool_use（content 空）
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "tu_a", "name": "Bash", "input": {"cmd": "ls"}}
+                ]),
+            },
+            // 第二个：有 text
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Here is the result."),
+            },
         ];
+        let refs: Vec<&AnthropicMessage> = msgs.iter().collect();
 
-        // 没有活跃 tool_results
-        sanitize_history_tools(&mut history, &[]);
+        let merged =
+            merge_assistant_messages(&refs, &mut HashMap::new()).expect("merge should succeed");
+        let content = &merged.assistant_response_message.content;
 
-        if let Message::Assistant(a) = &history[1] {
-            assert!(a.assistant_response_message.tool_uses.is_none());
-            assert_eq!(
-                a.assistant_response_message.content, " ",
-                "空 content 应设为占位符 ' '"
-            );
-        } else {
-            panic!("history[1] 应为 Assistant");
-        }
+        assert_eq!(
+            content, "Here is the result.",
+            "合并后 content 应是非空子消息本身，不含空壳占位或多余换行"
+        );
+        assert_ne!(content, " ", "不得出现单空格占位符（#26）");
+
+        let tool_uses = merged
+            .assistant_response_message
+            .tool_uses
+            .expect("应保留 tool_uses");
+        assert_eq!(tool_uses.len(), 1, "应保留第一轮的 tool_use");
+        assert_eq!(tool_uses[0].tool_use_id, "tu_a");
+    }
+
+    /// Regression #26: 连续两个纯 tool_use assistant 轮合并，content 应为空串而非空格占位。
+    #[test]
+    fn test_regression_26_merge_two_tool_only_turns_empty_content() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let msgs = [
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "tu_x", "name": "Bash", "input": {"cmd": "a"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "tu_y", "name": "Bash", "input": {"cmd": "b"}}
+                ]),
+            },
+        ];
+        let refs: Vec<&AnthropicMessage> = msgs.iter().collect();
+
+        let merged =
+            merge_assistant_messages(&refs, &mut HashMap::new()).expect("merge should succeed");
+
+        assert_eq!(
+            merged.assistant_response_message.content, "",
+            "两个纯 tool_use 轮合并后 content 应为空串（不注入空格占位）"
+        );
+        assert_eq!(
+            merged
+                .assistant_response_message
+                .tool_uses
+                .expect("应有 tool_uses")
+                .len(),
+            2,
+            "两轮 tool_use 都应合并保留"
+        );
     }
 
     /// Regression: narrated tool-call text in assistant content causes model mimicry.
@@ -2129,6 +2161,7 @@ mod tests {
             "\"type\": \"tool_use\"",
         ];
 
+        let mut structured_tool_use_turns = 0;
         for msg in &result.conversation_state.history {
             if let Message::Assistant(a) = msg {
                 let content = &a.assistant_response_message.content;
@@ -2140,8 +2173,23 @@ mod tests {
                         content
                     );
                 }
+                // #26 强化：不得出现单空格空壳轮
+                assert_ne!(
+                    content, " ",
+                    "assistant content 不得为单空格占位符（#26 空壳轮诱导死循环）"
+                );
+                if a.assistant_response_message.tool_uses.is_some() {
+                    structured_tool_use_turns += 1;
+                }
             }
         }
+
+        // #26 强化：历史中 tool_use 轮的结构化 toolUses 必须保留（修复前会被剥离降级）
+        assert!(
+            structured_tool_use_turns >= 2,
+            "多轮历史的结构化 toolUses 应保留（非活跃轮也不剥离），实际 {} 轮",
+            structured_tool_use_turns
+        );
     }
 
     #[test]
@@ -2474,7 +2522,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
-        // Kiro API 要求 content 字段不能为空
+        // 修复 #26 后：纯 tool_use 轮 content 为空串 ""，不再注入空格占位符
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -2484,14 +2532,14 @@ mod tests {
 
         let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
-        // 验证 content 不为空（使用占位符）
-        assert!(
-            !result.assistant_response_message.content.is_empty(),
-            "content 不应为空"
-        );
+        // 验证 content 为空串（对齐 kiro2api "content":""，不再使用占位符）
         assert_eq!(
+            result.assistant_response_message.content, "",
+            "仅 tool_use 时 content 应为空串"
+        );
+        assert_ne!(
             result.assistant_response_message.content, " ",
-            "仅 tool_use 时应使用 ' ' 占位符"
+            "不得注入单空格占位符（#26 死循环根因）"
         );
 
         // 验证 tool_uses 被正确保留
@@ -3064,6 +3112,91 @@ mod tests {
         }
     }
 
+    /// T05b（#26）：删 sanitize_history_tools 后历史保留结构化 tool 数据，trim 裁剪
+    /// 边界不得切在「回合中段」（tool_result 轮）——否则被裁 tool_use 的 tool_result 孤立
+    /// → Kiro 400。drain_end 应吸附到回合边界，裁掉完整回合，无跨界孤立配对。
+    #[test]
+    fn test_trim_does_not_orphan_tool_result_at_turn_boundary() {
+        use crate::kiro::model::requests::conversation::{
+            AssistantMessage, HistoryAssistantMessage, UserMessage,
+        };
+        use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+        let model_id = "claude-sonnet-4.5";
+        let tool_use_turn = |id: &str| {
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("").with_tool_uses(vec![
+                    ToolUseEntry::new(id, "Bash").with_input(serde_json::json!({"cmd": "ls -la"})),
+                ]),
+            })
+        };
+        let tool_result_turn = |id: &str| {
+            let mut m = UserMessage::new("", model_id);
+            m.user_input_message_context.tool_results = vec![ToolResult::success(
+                id,
+                "tool output here, padded for byte size",
+            )];
+            Message::User(HistoryUserMessage {
+                user_input_message: m,
+            })
+        };
+
+        // 2 个完整 tool 回合，每回合 = User问题 + Assistant(tool_use) + User(tool_result) + Assistant(答案)
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "question one, padded for byte size",
+                model_id,
+            )),
+            tool_use_turn("tu_1"),
+            tool_result_turn("tu_1"),
+            Message::Assistant(HistoryAssistantMessage::new(
+                "answer one, padded for byte size",
+            )),
+            Message::User(HistoryUserMessage::new(
+                "question two, padded for byte size",
+                model_id,
+            )),
+            tool_use_turn("tu_2"),
+            tool_result_turn("tu_2"),
+            Message::Assistant(HistoryAssistantMessage::new(
+                "answer two, padded for byte size",
+            )),
+        ];
+
+        let mut state = ConversationState::new("test-conv").with_history(history);
+        // limit 使「机械裁 1 对」即达标——drain_end=2 会切在 history[2]（tool_result tu_1 轮）中段
+        let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
+        let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
+
+        // 修复后：吸附到回合边界（history[4]）裁掉整个回合 1，应发生裁剪
+        assert!(result.is_some(), "应吸附到回合边界并裁剪");
+
+        // 核心断言：裁后 history 无孤立 tool_result（每个 tool_result 的 tool_use_id
+        // 都能在剩余 history 的某个 tool_use 找到）。修复前裁 1 对会留孤立 tu_1 → 此断言失败。
+        let all_tool_use_ids: std::collections::HashSet<String> = state
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|tu| tu.tool_use_id.clone())
+            .collect();
+
+        for msg in &state.history {
+            if let Message::User(u) = msg {
+                for tr in &u.user_input_message.user_input_message_context.tool_results {
+                    assert!(
+                        all_tool_use_ids.contains(&tr.tool_use_id),
+                        "裁后出现孤立 tool_result（对应 tool_use 被裁），tool_use_id={} —— #26 trim 配对 regression",
+                        tr.tool_use_id
+                    );
+                }
+            }
+        }
+    }
+
     /// T06：current_message 独立于 history，裁剪前后不变
     #[test]
     fn test_trim_does_not_touch_current_message() {
@@ -3244,7 +3377,7 @@ mod tests {
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
-        // 构造：第1轮 tool 调用返回空 result（会被叙述进 history），第2轮正常
+        // 构造：第1轮 tool 调用返回空 result（修复 #26 后结构化保留、不再叙述），第2轮正常
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
