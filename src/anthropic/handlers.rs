@@ -752,10 +752,11 @@ async fn handle_non_stream_request(
                                 if let Some(input_tokens) = snapshot.input_tokens {
                                     upstream_input_tokens = Some(input_tokens.max(1));
                                 } else if let Some(total_tokens) = snapshot.total_tokens
-                                    && let Some(output_tokens) = snapshot.output_tokens {
-                                        upstream_input_tokens =
-                                            Some((total_tokens - output_tokens).max(1));
-                                    }
+                                    && let Some(output_tokens) = snapshot.output_tokens
+                                {
+                                    upstream_input_tokens =
+                                        Some((total_tokens - output_tokens).max(1));
+                                }
                                 if let Some(output_tokens) = snapshot.output_tokens {
                                     upstream_output_tokens = Some(output_tokens.max(0));
                                 }

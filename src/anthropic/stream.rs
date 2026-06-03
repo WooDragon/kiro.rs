@@ -700,10 +700,10 @@ impl StreamContext {
                     if let Some(input_tokens) = snapshot.input_tokens {
                         self.upstream_input_tokens = Some(input_tokens.max(1));
                     } else if let Some(total_tokens) = snapshot.total_tokens
-                        && let Some(output_tokens) = snapshot.output_tokens {
-                            self.upstream_input_tokens =
-                                Some((total_tokens - output_tokens).max(1));
-                        }
+                        && let Some(output_tokens) = snapshot.output_tokens
+                    {
+                        self.upstream_input_tokens = Some((total_tokens - output_tokens).max(1));
+                    }
                     if let Some(output_tokens) = snapshot.output_tokens {
                         self.upstream_output_tokens = Some(output_tokens.max(0));
                     }
@@ -843,11 +843,12 @@ impl StreamContext {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty()
-                        && let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
+                    }
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
@@ -883,11 +884,12 @@ impl StreamContext {
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty()
-                            && let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
+                            && let Some(thinking_index) = self.thinking_block_index
+                        {
+                            events.push(
+                                self.create_thinking_delta_event(thinking_index, &safe_content),
+                            );
+                        }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
@@ -918,9 +920,10 @@ impl StreamContext {
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
         if let Some(idx) = self.text_block_index
-            && !self.state_manager.is_block_open_of_type(idx, "text") {
-                self.text_block_index = None;
-            }
+            && !self.state_manager.is_block_open_of_type(idx, "text")
+        {
+            self.text_block_index = None;
+        }
 
         // 获取或创建文本块索引
         let text_index = if let Some(idx) = self.text_block_index {
@@ -993,39 +996,40 @@ impl StreamContext {
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
-        if self.thinking_enabled && self.in_thinking_block
-            && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
-                let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty()
-                    && let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
+        if self.thinking_enabled
+            && self.in_thinking_block
+            && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
+        {
+            let thinking_content = self.thinking_buffer[..end_pos].to_string();
+            if !thinking_content.is_empty()
+                && let Some(thinking_index) = self.thinking_block_index
+            {
+                events.push(self.create_thinking_delta_event(thinking_index, &thinking_content));
+            }
 
-                // 结束 thinking 块
-                self.in_thinking_block = false;
-                self.thinking_extracted = true;
+            // 结束 thinking 块
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
-                }
-
-                // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + "</thinking>".len();
-                let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
-                self.thinking_buffer.clear();
-                if !remaining.is_empty() {
-                    events.extend(self.create_text_delta_events(&remaining));
+            if let Some(thinking_index) = self.thinking_block_index {
+                // 先发送空的 thinking_delta
+                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                // 再发送 content_block_stop
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
                 }
             }
+
+            // 把结束标签后的内容当作普通文本（通常为空或空白）
+            let after_pos = end_pos + "</thinking>".len();
+            let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
+            self.thinking_buffer.clear();
+            if !remaining.is_empty() {
+                events.extend(self.create_text_delta_events(&remaining));
+            }
+        }
 
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
@@ -1094,9 +1098,10 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop
-            && let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+            && let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index)
+        {
+            events.push(stop_event);
+        }
 
         events
     }
@@ -1114,11 +1119,12 @@ impl StreamContext {
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty()
-                        && let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
+                    }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1326,14 +1332,15 @@ impl BufferedStreamContext {
         for event in &mut self.event_buffer {
             if event.event == "message_start"
                 && let Some(message) = event.data.get_mut("message")
-                    && let Some(usage) = message.get_mut("usage") {
-                        *usage = build_usage_value(
-                            final_input_tokens,
-                            1,
-                            self.inner.prompt_cache_usage,
-                            self.inner.include_prompt_cache_fields,
-                        );
-                    }
+                && let Some(usage) = message.get_mut("usage")
+            {
+                *usage = build_usage_value(
+                    final_input_tokens,
+                    1,
+                    self.inner.prompt_cache_usage,
+                    self.inner.include_prompt_cache_fields,
+                );
+            }
         }
 
         std::mem::take(&mut self.event_buffer)
@@ -1454,14 +1461,15 @@ impl PrefixBufferedStreamContext {
         for event in &mut self.event_buffer {
             if event.event == "message_start"
                 && let Some(message) = event.data.get_mut("message")
-                    && let Some(usage) = message.get_mut("usage") {
-                        *usage = build_usage_value(
-                            final_input_tokens,
-                            1,
-                            self.inner.prompt_cache_usage,
-                            self.inner.include_prompt_cache_fields,
-                        );
-                    }
+                && let Some(usage) = message.get_mut("usage")
+            {
+                *usage = build_usage_value(
+                    final_input_tokens,
+                    1,
+                    self.inner.prompt_cache_usage,
+                    self.inner.include_prompt_cache_fields,
+                );
+            }
         }
         std::mem::take(&mut self.event_buffer)
     }

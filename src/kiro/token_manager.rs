@@ -1085,10 +1085,9 @@ impl MultiTokenManager {
                 Ok(ctx) => return Ok(ctx),
                 Err(e) => {
                     self.report_no_result(id);
-                    if sticky_hit
-                        && let Some(session_id) = session_id {
-                            self.clear_sticky_session_if_matches(session_id, id);
-                        }
+                    if sticky_hit && let Some(session_id) = session_id {
+                        self.clear_sticky_session_if_matches(session_id, id);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -1125,15 +1124,16 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
-            && best.id != *current_id {
-                tracing::info!(
-                    "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
-                    *current_id,
-                    best.id,
-                    best.credentials.priority
-                );
-                *current_id = best.id;
-            }
+            && best.id != *current_id
+        {
+            tracing::info!(
+                "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
+                *current_id,
+                best.id,
+                best.credentials.priority
+            );
+            *current_id = best.id;
+        }
     }
 
     /// 尝试使用指定凭据获取有效 Token
@@ -1411,9 +1411,10 @@ impl MultiTokenManager {
     pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
         self.report_success(id);
         if self.load_balancing_mode.lock().as_str() == "balanced"
-            && let Some(session_id) = session_id.filter(|s| !s.is_empty()) {
-                self.bind_sticky_session(session_id, id);
-            }
+            && let Some(session_id) = session_id.filter(|s| !s.is_empty())
+        {
+            self.bind_sticky_session(session_id, id);
+        }
     }
 
     /// 报告请求已结束但不应影响凭据健康或成功计数。
@@ -1919,10 +1920,9 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed
-                && let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
-                }
+            if changed && let Err(e) = self.persist_credentials() {
+                tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+            }
         }
 
         Ok(usage_limits)

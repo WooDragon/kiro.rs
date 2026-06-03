@@ -106,15 +106,16 @@ fn clean_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.remove("additionalProperties");
 
     if let Some(required) = obj.remove("required")
-        && let serde_json::Value::Array(arr) = required {
-            let required: Vec<_> = arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect();
-            if !required.is_empty() {
-                obj.insert("required".to_string(), serde_json::Value::Array(required));
-            }
+        && let serde_json::Value::Array(arr) = required
+    {
+        let required: Vec<_> = arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+            .collect();
+        if !required.is_empty() {
+            obj.insert("required".to_string(), serde_json::Value::Array(required));
         }
+    }
 
     clean_nested_schema_fields(obj);
 }
@@ -423,9 +424,10 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(session_id) = json.get("session_id").and_then(|v| v.as_str())
-            && is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
+        && is_valid_uuid(session_id)
+    {
+        return Some(session_id.to_string());
+    }
 
     // 回退到字符串格式: 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
@@ -451,13 +453,14 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 
     for msg in history {
         if let Message::Assistant(assistant_msg) = msg
-            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
-                    }
+            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            for tool_use in tool_uses {
+                if !tool_names.contains(&tool_use.name) {
+                    tool_names.push(tool_use.name.clone());
                 }
             }
+        }
     }
 
     tool_names
@@ -645,9 +648,10 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source
-                                && let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
+                                && let Some(format) = get_image_format(&source.media_type)
+                            {
+                                images.push(KiroImage::from_base64(format, source.data));
+                            }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
@@ -810,20 +814,21 @@ fn remove_orphaned_tool_uses(
 
     for msg in history.iter_mut() {
         if let Message::Assistant(assistant_msg) = msg
-            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            let original_len = tool_uses.len();
+            tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
-                // 如果移除后为空，设置为 None
-                if tool_uses.is_empty() {
-                    assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
-                }
+            // 如果移除后为空，设置为 None
+            if tool_uses.is_empty() {
+                assistant_msg.assistant_response_message.tool_uses = None;
+            } else if tool_uses.len() != original_len {
+                tracing::debug!(
+                    "从 assistant 消息中移除了 {} 个孤立的 tool_use",
+                    original_len - tool_uses.len()
+                );
             }
+        }
     }
 }
 
@@ -1010,7 +1015,6 @@ fn build_history(
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
     for msg in messages.iter().take(history_end_index) {
-
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -1750,14 +1754,15 @@ mod tests {
         let mut found = false;
         for msg in history {
             if let Message::Assistant(a) = msg
-                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
-                    for tu in tool_uses {
-                        if tu.tool_use_id == "toolu_01" {
-                            assert_eq!(tu.name, short_name, "历史中的 tool_use name 应该是短名称");
-                            found = true;
-                        }
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_01" {
+                        assert_eq!(tu.name, short_name, "历史中的 tool_use name 应该是短名称");
+                        found = true;
                     }
                 }
+            }
         }
         assert!(found, "应该在历史中找到 tool_use");
     }
@@ -2748,10 +2753,11 @@ mod tests {
         for msg in &state.history {
             if let Message::Assistant(assistant_msg) = msg
                 && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
-                    && tool_uses.iter().any(|t| t.tool_use_id == "toolu_01XYZ") {
-                        found_tool_use = true;
-                        break;
-                    }
+                && tool_uses.iter().any(|t| t.tool_use_id == "toolu_01XYZ")
+            {
+                found_tool_use = true;
+                break;
+            }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
     }
@@ -3126,8 +3132,10 @@ mod tests {
         };
         let tool_result_turn = |id: &str| {
             let mut m = UserMessage::new("", model_id);
-            m.user_input_message_context.tool_results =
-                vec![ToolResult::success(id, "tool output here, padded for byte size")];
+            m.user_input_message_context.tool_results = vec![ToolResult::success(
+                id,
+                "tool output here, padded for byte size",
+            )];
             Message::User(HistoryUserMessage {
                 user_input_message: m,
             })
@@ -3281,7 +3289,10 @@ mod tests {
         let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
         let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
         assert!(result.is_some(), "has_system_pair=false 且可裁时应正常裁剪");
-        assert!(state.history.len().is_multiple_of(2), "裁剪后 history 长度应为偶数");
+        assert!(
+            state.history.len().is_multiple_of(2),
+            "裁剪后 history 长度应为偶数"
+        );
     }
 
     /// T10：fail-open 路径——奇数长度 history 不 panic，返回 None

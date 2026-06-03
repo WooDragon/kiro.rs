@@ -200,15 +200,15 @@ impl AdminService {
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint
-            && !self.known_endpoints.contains(name) {
-                let mut known: Vec<&str> =
-                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
-                known.sort();
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "未知端点 \"{}\"，已注册端点: {:?}",
-                    name, known
-                )));
-            }
+            && !self.known_endpoints.contains(name)
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            known.sort();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知端点 \"{}\"，已注册端点: {:?}",
+                name, known
+            )));
+        }
 
         // 构建凭据对象
         let email = req.email.clone();
