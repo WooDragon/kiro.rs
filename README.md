@@ -358,10 +358,17 @@ docker-compose up
 
 ### 环境变量
 
-可通过环境变量配置日志级别：
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RUST_LOG` | `info` | 日志级别（`error`/`warn`/`info`/`debug`/`trace`） |
+| `KIRO_MAX_PAYLOAD_BYTES` | `921600`（900 KiB） | 发送给 Kiro 上游的请求体大小上限。超限时在发送前主动裁剪**最旧**的历史对（保护 system 对与活跃 tool turn），避免撞上游 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 而浪费一次 roundtrip。每次请求现读，可热调无需重启。详见 [docs/payload-size-and-empty-tool-result.md](docs/payload-size-and-empty-tool-result.md)。 |
 
 ```bash
+# 调整日志级别
 RUST_LOG=debug ./target/release/kiro-rs
+
+# 按真实流量调低裁剪阈值（例：800 KiB）
+KIRO_MAX_PAYLOAD_BYTES=819200 ./target/release/kiro-rs
 ```
 
 ## API 端点
