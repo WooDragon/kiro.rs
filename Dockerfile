@@ -1,10 +1,12 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
+# 先 COPY manifest + lockfile（早于源码），install 层可被 Docker 缓存复用
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
 # pin pnpm@9：pnpm 10 默认拦截依赖 build script，导致 esbuild/@swc native binary 不就位、
 # pnpm install 直接 exit 1（ERR_PNPM_IGNORED_BUILDS）。pnpm 9 默认运行 build script。
-RUN npm install -g pnpm@9 && pnpm install
+# --frozen-lockfile：按 lockfile 锁定版本安装，保证可复现；lockfile 与 package.json 不一致即报错。
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 
