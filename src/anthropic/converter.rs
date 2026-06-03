@@ -60,17 +60,14 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     // required：Kiro 只接受非空 string 数组；空数组/非法值会导致 Improperly formed request。
-    match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => {
-            let required: Vec<_> = arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect();
-            if !required.is_empty() {
-                obj.insert("required".to_string(), serde_json::Value::Array(required));
-            }
+    if let Some(serde_json::Value::Array(arr)) = obj.remove("required") {
+        let required: Vec<_> = arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+            .collect();
+        if !required.is_empty() {
+            obj.insert("required".to_string(), serde_json::Value::Array(required));
         }
-        Some(_) | None => {}
     }
 
     // additionalProperties：Kiro-Go 对应实现会递归移除该字段，避免 Kiro 400。
@@ -108,15 +105,15 @@ fn clean_nested_schema_fields(obj: &mut serde_json::Map<String, serde_json::Valu
 fn clean_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.remove("additionalProperties");
 
-    if let Some(required) = obj.remove("required") {
-        if let serde_json::Value::Array(arr) = required {
-            let required: Vec<_> = arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect();
-            if !required.is_empty() {
-                obj.insert("required".to_string(), serde_json::Value::Array(required));
-            }
+    if let Some(required) = obj.remove("required")
+        && let serde_json::Value::Array(arr) = required
+    {
+        let required: Vec<_> = arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+            .collect();
+        if !required.is_empty() {
+            obj.insert("required".to_string(), serde_json::Value::Array(required));
         }
     }
 
@@ -391,12 +388,11 @@ impl std::error::Error for ConversionError {}
 /// 提取 session UUID 作为 conversationId
 fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(session_id) = json.get("session_id").and_then(|v| v.as_str())
+        && is_valid_uuid(session_id)
+    {
+        return Some(session_id.to_string());
     }
 
     // 回退到字符串格式: 查找 "session_" 后面的内容
@@ -422,12 +418,12 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
 
     for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
-                    }
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            for tool_use in tool_uses {
+                if !tool_names.contains(&tool_use.name) {
+                    tool_names.push(tool_use.name.clone());
                 }
             }
         }
@@ -621,10 +617,10 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
+                            if let Some(source) = block.source
+                                && let Some(format) = get_image_format(&source.media_type)
+                            {
+                                images.push(KiroImage::from_base64(format, source.data));
                             }
                         }
                         "tool_result" => {
@@ -787,20 +783,20 @@ fn remove_orphaned_tool_uses(
     }
 
     for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            let original_len = tool_uses.len();
+            tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
-                // 如果移除后为空，设置为 None
-                if tool_uses.is_empty() {
-                    assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
-                }
+            // 如果移除后为空，设置为 None
+            if tool_uses.is_empty() {
+                assistant_msg.assistant_response_message.tool_uses = None;
+            } else if tool_uses.len() != original_len {
+                tracing::debug!(
+                    "从 assistant 消息中移除了 {} 个孤立的 tool_use",
+                    original_len - tool_uses.len()
+                );
             }
         }
     }
@@ -810,7 +806,7 @@ fn remove_orphaned_tool_uses(
 /// Kiro API 只接受一组活跃的结构化 tool turn（最后一条 assistant toolUses ⟺ 当前 toolResults），
 /// 历史中 assistant 的 toolUses 直接剥离（不注入文本，避免模型模仿输出格式），
 /// 历史中 user 的 toolResults 叙述为自然语言保留语义。
-fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[ToolResult]) {
+fn sanitize_history_tools(history: &mut [Message], current_tool_results: &[ToolResult]) {
     if history.is_empty() {
         return;
     }
@@ -818,11 +814,11 @@ fn sanitize_history_tools(history: &mut Vec<Message>, current_tool_results: &[To
     // 1. 收集 tool_use_id → tool_name 映射（供 user turn 叙述时使用）
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
     for msg in history.iter() {
-        if let Message::Assistant(a) = msg {
-            if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
-                for tu in tool_uses {
-                    tool_name_map.insert(tu.tool_use_id.clone(), tu.name.clone());
-                }
+        if let Message::Assistant(a) = msg
+            && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+        {
+            for tu in tool_uses {
+                tool_name_map.insert(tu.tool_use_id.clone(), tu.name.clone());
             }
         }
     }
@@ -1089,9 +1085,7 @@ fn build_history(
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages.iter().take(history_end_index) {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -1834,13 +1828,13 @@ mod tests {
         let history = &result.conversation_state.history;
         let mut found = false;
         for msg in history {
-            if let Message::Assistant(a) = msg {
-                if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
-                    for tu in tool_uses {
-                        if tu.tool_use_id == "toolu_01" {
-                            assert_eq!(tu.name, short_name, "历史中的 tool_use name 应该是短名称");
-                            found = true;
-                        }
+            if let Message::Assistant(a) = msg
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_01" {
+                        assert_eq!(tu.name, short_name, "历史中的 tool_use name 应该是短名称");
+                        found = true;
                     }
                 }
             }
@@ -2709,13 +2703,12 @@ mod tests {
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
         for msg in &state.history {
-            if let Message::Assistant(assistant_msg) = msg {
-                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                    if tool_uses.iter().any(|t| t.tool_use_id == "toolu_01XYZ") {
-                        found_tool_use = true;
-                        break;
-                    }
-                }
+            if let Message::Assistant(assistant_msg) = msg
+                && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
+                && tool_uses.iter().any(|t| t.tool_use_id == "toolu_01XYZ")
+            {
+                found_tool_use = true;
+                break;
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
@@ -3163,7 +3156,10 @@ mod tests {
         let (limit, bytes) = limit_for_trimming_pairs(&state, false, 1);
         let result = trim_history_to_byte_limit(&mut state, false, limit, bytes);
         assert!(result.is_some(), "has_system_pair=false 且可裁时应正常裁剪");
-        assert!(state.history.len() % 2 == 0, "裁剪后 history 长度应为偶数");
+        assert!(
+            state.history.len().is_multiple_of(2),
+            "裁剪后 history 长度应为偶数"
+        );
     }
 
     /// T10：fail-open 路径——奇数长度 history 不 panic，返回 None

@@ -33,7 +33,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// # 参数
 /// - `api_key`: API 密钥，用于验证客户端请求
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
-
+///
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
     api_key: impl Into<String>,

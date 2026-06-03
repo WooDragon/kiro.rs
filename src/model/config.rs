@@ -6,44 +6,32 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum TlsBackend {
+    #[default]
     Rustls,
     NativeTls,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum PromptCacheMode {
     Off,
     Passthrough,
     Emulated,
+    #[default]
     Auto,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum CcStreamingMode {
     Buffered,
+    #[default]
     Prefix,
     Streaming,
-}
-
-impl Default for PromptCacheMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-impl Default for CcStreamingMode {
-    fn default() -> Self {
-        Self::Prefix
-    }
-}
-
-impl Default for TlsBackend {
-    fn default() -> Self {
-        Self::Rustls
-    }
 }
 
 /// KNA 应用配置
@@ -260,8 +248,10 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
+            let config = Self {
+                config_path: Some(path.to_path_buf()),
+                ..Default::default()
+            };
             return Ok(config);
         }
 

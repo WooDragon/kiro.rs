@@ -464,6 +464,7 @@ fn build_prompt_cache_profile(
 }
 
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -627,6 +628,7 @@ fn create_sse_stream(
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -697,7 +699,7 @@ async fn handle_non_stream_request(
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
+                                .or_default();
                             buffer.push_str(&tool_use.input);
 
                             // 如果是完整的工具调用，添加到列表
@@ -749,11 +751,11 @@ async fn handle_non_stream_request(
                             if let Some(snapshot) = extract_usage_snapshot_from_metering(&payload) {
                                 if let Some(input_tokens) = snapshot.input_tokens {
                                     upstream_input_tokens = Some(input_tokens.max(1));
-                                } else if let Some(total_tokens) = snapshot.total_tokens {
-                                    if let Some(output_tokens) = snapshot.output_tokens {
-                                        upstream_input_tokens =
-                                            Some((total_tokens - output_tokens).max(1));
-                                    }
+                                } else if let Some(total_tokens) = snapshot.total_tokens
+                                    && let Some(output_tokens) = snapshot.output_tokens
+                                {
+                                    upstream_input_tokens =
+                                        Some((total_tokens - output_tokens).max(1));
                                 }
                                 if let Some(output_tokens) = snapshot.output_tokens {
                                     upstream_output_tokens = Some(output_tokens.max(0));
@@ -926,75 +928,6 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request_for_model(model: &str) -> MessagesRequest {
-        MessagesRequest {
-            model: model.to_string(),
-            max_tokens: 1024,
-            messages: vec![super::super::types::Message {
-                role: "user".to_string(),
-                content: serde_json::json!("hello"),
-            }],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            temperature: None,
-            top_p: None,
-            metadata: None,
-        }
-    }
-
-    #[test]
-    fn test_available_models_includes_opus_4_7() {
-        let models = available_models();
-        assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
-        assert!(models.iter().any(|m| m.id == "claude-opus-4-7-thinking"));
-    }
-
-    #[test]
-    fn test_available_models_includes_opus_4_8() {
-        let models = available_models();
-        assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
-        assert!(models.iter().any(|m| m.id == "claude-opus-4-8-thinking"));
-    }
-
-    #[test]
-    fn test_override_thinking_opus_4_8_uses_adaptive() {
-        let mut payload = request_for_model("claude-opus-4-8-thinking");
-
-        override_thinking_from_model_name(&mut payload);
-
-        let thinking = payload.thinking.unwrap();
-        assert_eq!(thinking.thinking_type, "adaptive");
-        assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(
-            payload.output_config.as_ref().map(|c| c.effort.as_str()),
-            Some("high")
-        );
-    }
-
-    #[test]
-    fn test_override_thinking_opus_4_7_uses_adaptive() {
-        let mut payload = request_for_model("claude-opus-4-7-thinking");
-
-        override_thinking_from_model_name(&mut payload);
-
-        let thinking = payload.thinking.unwrap();
-        assert_eq!(thinking.thinking_type, "adaptive");
-        assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(
-            payload.output_config.as_ref().map(|c| c.effort.as_str()),
-            Some("high")
-        );
-    }
 }
 
 /// POST /cc/v1/messages
@@ -1190,6 +1123,7 @@ pub async fn post_messages_cc(
 }
 
 /// 处理流式请求（前缀缓冲版本）
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request_prefix_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1334,6 +1268,7 @@ fn create_prefix_buffered_sse_stream(
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1449,4 +1384,73 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_for_model(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_available_models_includes_opus_4_7() {
+        let models = available_models();
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn test_available_models_includes_opus_4_8() {
+        let models = available_models();
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-8-thinking"));
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_8_uses_adaptive() {
+        let mut payload = request_for_model("claude-opus-4-8-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_uses_adaptive() {
+        let mut payload = request_for_model("claude-opus-4-7-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("high")
+        );
+    }
 }

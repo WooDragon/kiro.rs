@@ -307,6 +307,7 @@ pub fn build_usage_value(
     Value::Object(result)
 }
 
+#[allow(dead_code)]
 pub fn extract_usage_from_metering(value: &Value) -> Option<PromptCacheUsage> {
     extract_usage_snapshot_from_metering(value).and_then(|snapshot| snapshot.prompt_cache_usage)
 }
@@ -586,9 +587,9 @@ fn parse_ttl(value: Option<&Value>) -> Option<Duration> {
 }
 
 fn normalize_ttl(ttl: Duration) -> Duration {
-    if ttl > Duration::from_secs(60 * 60) {
-        Duration::from_secs(60 * 60)
-    } else if ttl > DEFAULT_PROMPT_CACHE_TTL {
+    // 超过默认 5m TTL 的一律归一化到 1h 档，其余保持 5m 默认。
+    // ttl > 1h 必然蕴含 ttl > DEFAULT_PROMPT_CACHE_TTL（5m），故无需单独判 1h 上限。
+    if ttl > DEFAULT_PROMPT_CACHE_TTL {
         Duration::from_secs(60 * 60)
     } else {
         DEFAULT_PROMPT_CACHE_TTL
@@ -626,10 +627,7 @@ fn prune_expired(
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model = model
-        .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-");
+    let model = model.to_ascii_lowercase().replace(['_', ' '], "-");
     if model.contains("opus") {
         OPUS_MIN_CACHEABLE_TOKENS
     } else if model.contains("haiku-3") {
@@ -708,10 +706,11 @@ fn is_anthropic_billing_header_block(value: &Value) -> bool {
     let Some(map) = value.as_object() else {
         return false;
     };
-    if let Some(Value::String(block_type)) = map.get("type") {
-        if !block_type.is_empty() && block_type != "text" {
-            return false;
-        }
+    if let Some(Value::String(block_type)) = map.get("type")
+        && !block_type.is_empty()
+        && block_type != "text"
+    {
+        return false;
     }
     let Some(text) = map.get("text").and_then(Value::as_str) else {
         return false;
@@ -732,10 +731,10 @@ fn collect_usage_maps<'a>(value: &'a Value, out: &mut Vec<&'a Map<String, Value>
             out.push(map);
             for (key, child) in map {
                 let lower = key.to_ascii_lowercase();
-                if lower == "usage" || lower == "tokenusage" || lower == "token_usage" {
-                    if let Some(child_map) = child.as_object() {
-                        out.push(child_map);
-                    }
+                if (lower == "usage" || lower == "tokenusage" || lower == "token_usage")
+                    && let Some(child_map) = child.as_object()
+                {
+                    out.push(child_map);
                 }
                 collect_usage_maps(child, out);
             }
