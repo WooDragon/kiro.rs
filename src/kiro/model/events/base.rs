@@ -119,7 +119,7 @@ impl Event {
             EventType::Metering => {
                 let payload = frame
                     .payload_as_json::<serde_json::Value>()
-                    .unwrap_or_else(|_| serde_json::Value::Null);
+                    .unwrap_or(serde_json::Value::Null);
                 Ok(Self::Metering(payload))
             }
             EventType::ContextUsage => {

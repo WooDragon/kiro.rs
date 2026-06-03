@@ -53,27 +53,24 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 /// 4. 兜底：基于随机种子派生，按 `credentials.id` 在进程内缓存（首次触发 warn 日志）
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
     // 如果配置了凭据级 machineId，优先使用
-    if let Some(ref machine_id) = credentials.machine_id {
-        if let Some(normalized) = normalize_machine_id(machine_id) {
+    if let Some(ref machine_id) = credentials.machine_id
+        && let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
-    }
 
     // 如果配置了全局 machineId，作为默认值
-    if let Some(ref machine_id) = config.machine_id {
-        if let Some(normalized) = normalize_machine_id(machine_id) {
+    if let Some(ref machine_id) = config.machine_id
+        && let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
-    }
 
     // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
     if credentials.is_api_key_credential() {
         // API Key 凭据：基于 kiroApiKey 派生
-        if let Some(ref api_key) = credentials.kiro_api_key {
-            if !api_key.is_empty() {
+        if let Some(ref api_key) = credentials.kiro_api_key
+            && !api_key.is_empty() {
                 return sha256_hex(&format!("KiroAPIKey/{}", api_key));
             }
-        }
     } else if let Some(ref refresh_token) = credentials.refresh_token {
         // OAuth 凭据：基于 refreshToken 派生
         if !refresh_token.is_empty() {
@@ -142,8 +139,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_credential_machine_id_overrides_config() {
-        let mut credentials = KiroCredentials::default();
-        credentials.machine_id = Some("b".repeat(64));
+        let credentials = KiroCredentials { machine_id: Some("b".repeat(64)), ..Default::default() };
 
         let mut config = Config::default();
         config.machine_id = Some("a".repeat(64));
@@ -154,8 +150,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_refresh_token() {
-        let mut credentials = KiroCredentials::default();
-        credentials.refresh_token = Some("test_refresh_token".to_string());
+        let credentials = KiroCredentials { refresh_token: Some("test_refresh_token".to_string()), ..Default::default() };
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -175,8 +170,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_api_key() {
-        let mut credentials = KiroCredentials::default();
-        credentials.kiro_api_key = Some("ksk_test_api_key".to_string());
+        let credentials = KiroCredentials { kiro_api_key: Some("ksk_test_api_key".to_string()), ..Default::default() };
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -188,9 +182,11 @@ mod tests {
     #[test]
     fn test_api_key_and_refresh_token_are_mutually_exclusive() {
         // 同时存在 kiroApiKey 和 refreshToken 时，应走 API Key 分支
-        let mut credentials = KiroCredentials::default();
-        credentials.kiro_api_key = Some("ksk_test".to_string());
-        credentials.refresh_token = Some("should_not_be_used".to_string());
+        let credentials = KiroCredentials {
+            kiro_api_key: Some("ksk_test".to_string()),
+            refresh_token: Some("should_not_be_used".to_string()),
+            ..Default::default()
+        };
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -200,10 +196,12 @@ mod tests {
     #[test]
     fn test_api_key_auth_method_empty_uses_fallback_not_refresh_token() {
         // auth_method=api_key 但 kiro_api_key 为空：不回落到 refreshToken，走兜底分支
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(u64::MAX - 1);
-        credentials.auth_method = Some("api_key".to_string());
-        credentials.refresh_token = Some("should_not_be_used".to_string());
+        let credentials = KiroCredentials {
+            id: Some(u64::MAX - 1),
+            auth_method: Some("api_key".to_string()),
+            refresh_token: Some("should_not_be_used".to_string()),
+            ..Default::default()
+        };
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -215,8 +213,7 @@ mod tests {
     #[test]
     fn test_fallback_is_stable_per_credential() {
         // 同一凭据（按 id 区分）多次调用兜底应返回同一值
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(u64::MAX - 10);
+        let credentials = KiroCredentials { id: Some(u64::MAX - 10), ..Default::default() };
         let config = Config::default();
 
         let first = generate_from_credentials(&credentials, &config);
@@ -227,10 +224,8 @@ mod tests {
     #[test]
     fn test_fallback_differs_across_credentials() {
         // 不同凭据（不同 id）的兜底值应互不相同
-        let mut cred_a = KiroCredentials::default();
-        cred_a.id = Some(u64::MAX - 20);
-        let mut cred_b = KiroCredentials::default();
-        cred_b.id = Some(u64::MAX - 21);
+        let cred_a = KiroCredentials { id: Some(u64::MAX - 20), ..Default::default() };
+        let cred_b = KiroCredentials { id: Some(u64::MAX - 21), ..Default::default() };
         let config = Config::default();
 
         let id_a = generate_from_credentials(&cred_a, &config);
@@ -271,8 +266,10 @@ mod tests {
 
     #[test]
     fn test_generate_with_uuid_machine_id() {
-        let mut credentials = KiroCredentials::default();
-        credentials.machine_id = Some("2582956e-cc88-4669-b546-07adbffcb894".to_string());
+        let credentials = KiroCredentials {
+            machine_id: Some("2582956e-cc88-4669-b546-07adbffcb894".to_string()),
+            ..Default::default()
+        };
 
         let config = Config::default();
 

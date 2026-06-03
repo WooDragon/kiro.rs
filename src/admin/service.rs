@@ -199,8 +199,8 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
+        if let Some(ref name) = req.endpoint
+            && !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
                 known.sort();
@@ -209,7 +209,6 @@ impl AdminService {
                     name, known
                 )));
             }
-        }
 
         // 构建凭据对象
         let email = req.email.clone();
