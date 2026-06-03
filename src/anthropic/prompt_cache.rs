@@ -587,7 +587,9 @@ fn parse_ttl(value: Option<&Value>) -> Option<Duration> {
 }
 
 fn normalize_ttl(ttl: Duration) -> Duration {
-    if ttl > Duration::from_secs(60 * 60) || ttl > DEFAULT_PROMPT_CACHE_TTL {
+    // 超过默认 5m TTL 的一律归一化到 1h 档，其余保持 5m 默认。
+    // ttl > 1h 必然蕴含 ttl > DEFAULT_PROMPT_CACHE_TTL（5m），故无需单独判 1h 上限。
+    if ttl > DEFAULT_PROMPT_CACHE_TTL {
         Duration::from_secs(60 * 60)
     } else {
         DEFAULT_PROMPT_CACHE_TTL
