@@ -2,7 +2,9 @@ FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+# pin pnpm@9：pnpm 10 默认拦截依赖 build script，导致 esbuild/@swc native binary 不就位、
+# pnpm install 直接 exit 1（ERR_PNPM_IGNORED_BUILDS）。pnpm 9 默认运行 build script。
+RUN npm install -g pnpm@9 && pnpm install
 COPY admin-ui ./
 RUN pnpm build
 

@@ -75,6 +75,14 @@ jobs:
             echo "is_beta=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Compute lowercase image name
+        id: image
+        # GHCR 要求镜像名全小写；owner 名可能含大写（如 fork 到 WooDragon），需转小写。
+        # owner 经 env 传入再引用，避免任何表达式内联进 shell 的注入风险。
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "name=ghcr.io/$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')/kiro-rs" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -94,7 +102,7 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
@@ -111,10 +119,13 @@ jobs:
           password: ${{ github.token }}
 
       - name: Create and push multi-arch manifest
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ needs.build.outputs.version }}
+          IS_BETA: ${{ needs.build.outputs.is_beta }}
         run: |
-          VERSION="${{ needs.build.outputs.version }}"
-          IS_BETA="${{ needs.build.outputs.is_beta }}"
-          IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
+          # GHCR 镜像名须全小写；owner 经 env 传入并转小写，避免表达式内联进 shell
+          IMAGE="ghcr.io/$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')/kiro-rs"
 
           # Create manifest for version tag
           docker manifest create ${IMAGE}:${VERSION} \
