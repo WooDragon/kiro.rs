@@ -3,9 +3,9 @@ target/
 Cargo.lock
 
 # Node.js dependencies and build artifacts
+# 注意：保留 pnpm-lock.yaml 进 build context —— Dockerfile 用它 --frozen-lockfile 做可复现安装
 admin-ui/node_modules/
 admin-ui/dist/
-admin-ui/pnpm-lock.yaml
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/.vite/
 
