@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// 注意：裁剪只作用于 `conversation_state.history`，不触碰 `payload.messages`（prompt cache 指纹）。
 ///
 /// # 参数
-/// * `conversation_state` - 已经过 sanitize_history_tools 的对话状态
+/// * `conversation_state` - 已经过 validate_tool_pairing / remove_orphaned_tool_uses 配对校验的对话状态
 /// * `inference_config` - 推理配置（max_tokens / temperature / top_p）
 /// * `has_system_pair` - build_history 返回的 flag；为 true 时保护 history 首 2 条不被裁
 fn finalize_request_body(
