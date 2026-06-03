@@ -34,9 +34,6 @@ pub enum CcStreamingMode {
     Streaming,
 }
 
-
-
-
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -251,7 +248,10 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let config = Self { config_path: Some(path.to_path_buf()), ..Default::default() };
+            let config = Self {
+                config_path: Some(path.to_path_buf()),
+                ..Default::default()
+            };
             return Ok(config);
         }
 

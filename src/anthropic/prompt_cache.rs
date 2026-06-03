@@ -625,9 +625,7 @@ fn prune_expired(
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model = model
-        .to_ascii_lowercase()
-        .replace(['_', ' '], "-");
+    let model = model.to_ascii_lowercase().replace(['_', ' '], "-");
     if model.contains("opus") {
         OPUS_MIN_CACHEABLE_TOKENS
     } else if model.contains("haiku-3") {
@@ -707,9 +705,11 @@ fn is_anthropic_billing_header_block(value: &Value) -> bool {
         return false;
     };
     if let Some(Value::String(block_type)) = map.get("type")
-        && !block_type.is_empty() && block_type != "text" {
-            return false;
-        }
+        && !block_type.is_empty()
+        && block_type != "text"
+    {
+        return false;
+    }
     let Some(text) = map.get("text").and_then(Value::as_str) else {
         return false;
     };
@@ -730,9 +730,10 @@ fn collect_usage_maps<'a>(value: &'a Value, out: &mut Vec<&'a Map<String, Value>
             for (key, child) in map {
                 let lower = key.to_ascii_lowercase();
                 if (lower == "usage" || lower == "tokenusage" || lower == "token_usage")
-                    && let Some(child_map) = child.as_object() {
-                        out.push(child_map);
-                    }
+                    && let Some(child_map) = child.as_object()
+                {
+                    out.push(child_map);
+                }
                 collect_usage_maps(child, out);
             }
         }

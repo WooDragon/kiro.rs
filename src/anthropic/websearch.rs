@@ -256,10 +256,7 @@ fn generate_websearch_events(
     include_prompt_cache_fields: bool,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
+    let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     // 1. message_start
     events.push(SseEvent::new(
