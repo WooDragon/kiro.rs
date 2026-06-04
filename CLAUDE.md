@@ -24,7 +24,7 @@ docker compose run --rm kiro cargo clippy
 ```
 src/
 ├── main.rs              # 入口
-├── token.rs             # API key 验证
+├── token.rs             # token 计数（输入/输出 token 估算）
 ├── anthropic/           # Anthropic API 兼容层
 │   ├── handlers.rs      # 请求处理（含 payload 裁剪）
 │   ├── converter.rs     # Anthropic → Kiro 请求转换
