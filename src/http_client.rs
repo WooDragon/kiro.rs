@@ -196,6 +196,281 @@ pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    // ─────────────────────────────────────────────────────────────────
+    // Mock 上游 helper
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 启动一个 chunked HTTP/1.1 流式 mock 上游。
+    ///
+    /// 行为：accept 一个连接 → 丢弃请求头（读一次 buf 即可）→ 发 SSE 响应头
+    /// → 每隔 `interval_ms` 毫秒发一个 chunked payload（`data: tick\n\n`）
+    /// → 共 `chunk_count` 个 → 发终止帧 `0\r\n\r\n` 正常结束流。
+    ///
+    /// 返回 mock server 的 `SocketAddr`（端口由 OS 随机分配）。
+    async fn spawn_dribbling_upstream(
+        chunk_count: usize,
+        interval_ms: u64,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+
+            // 读掉客户端请求头（不做完整 HTTP 解析，读一次 buf 足够）
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            // 发 SSE 响应头
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+
+            // 按 interval_ms 间隔发 chunk_count 个 chunked 帧
+            let payload = b"data: tick\n\n";
+            let chunk_header = format!("{:x}\r\n", payload.len());
+            for _ in 0..chunk_count {
+                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                stream
+                    .write_all(chunk_header.as_bytes())
+                    .await
+                    .expect("写 chunk header 失败");
+                stream
+                    .write_all(payload)
+                    .await
+                    .expect("写 chunk payload 失败");
+                stream.write_all(b"\r\n").await.expect("写 chunk CRLF 失败");
+            }
+
+            // 发终止帧，流正常结束
+            stream.write_all(b"0\r\n\r\n").await.expect("写终止帧失败");
+        });
+
+        addr
+    }
+
+    /// 启动一个「假死」mock 上游。
+    ///
+    /// 行为：accept 一个连接 → 发响应头 + 1 个 chunk → 挂起 30s（不发终止帧、不关连接）。
+    /// 用于坐实 idle 超时能正确检测上游静止场景。
+    async fn spawn_hanging_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+
+            // 读掉客户端请求头
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            // 发响应头
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+
+            // 发 1 个 chunk，然后故意挂死 30s（模拟上游静止）
+            let payload = b"data: first\n\n";
+            let chunk_header = format!("{:x}\r\n", payload.len());
+            stream
+                .write_all(chunk_header.as_bytes())
+                .await
+                .expect("写 chunk header 失败");
+            stream
+                .write_all(payload)
+                .await
+                .expect("写 chunk payload 失败");
+            stream.write_all(b"\r\n").await.expect("写 chunk CRLF 失败");
+
+            // 挂死 30s，不发终止帧——触发 client 的 idle 超时
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        });
+
+        addr
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 黑盒坐实测试（#ignore 含 sleep，不进常规快测）
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 坐实根因：全局 total 超时会误杀「慢但持续吐字节的健康长流」。
+    ///
+    /// mock 上游每 400ms 发一个 chunk，共 5 个（约 2s 才发完）；
+    /// client 设 total=1s——上游一直在吐字节，但 total 超时不重置，
+    /// 必然在 ~1s 时炸掉，即便流没有任何真实问题。
+    #[ignore]
+    #[tokio::test]
+    async fn blackbox_idle_total_kills_healthy_long_stream() {
+        use futures::StreamExt;
+
+        // mock：每 400ms 发一个 chunk，共 5 个（≈2s 完成）
+        let addr = spawn_dribbling_upstream(5, 400).await;
+
+        // 旧策略：全局 total = 1s
+        let client = build_client(None, 1, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let start = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 时超时，而非 send 阶段）");
+
+        let mut stream = resp.bytes_stream();
+        let mut got_err: Option<reqwest::Error> = None;
+
+        // 循环读 stream，预期在 total=1s 触发后收到 Err
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(_) => {}
+                Err(e) => {
+                    got_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+
+        // 必须拿到 Err：total 超时撞线
+        let err = got_err.expect("total=1s 应触发超时 Err，但流正常结束——断言失败");
+        let desc = describe_reqwest_error(&err);
+
+        println!("[A] total=1s client 在 {elapsed_ms}ms 后被杀；desc={desc}");
+
+        // 超时必须在合理窗口内（0.5~3s），kind 必须为 timeout
+        assert!(
+            elapsed_ms >= 500 && elapsed_ms <= 3000,
+            "超时耗时 {elapsed_ms}ms 不在预期窗口 [500, 3000]ms"
+        );
+        assert!(
+            desc.contains("kind=timeout"),
+            "期望 kind=timeout，实际：{desc}"
+        );
+    }
+
+    /// 坐实修复：idle 超时不会杀「慢但持续吐字节的健康长流」。
+    ///
+    /// mock 上游与测试 A 完全相同（每 400ms 一个 chunk，共 5 个）；
+    /// 唯一变量是 client 策略改为 idle=1s。
+    /// 每 400ms < 1s idle，每次收到字节后 idle 计时器重置，永不触发——
+    /// 流应完整读完、无任何 Err。
+    #[ignore]
+    #[tokio::test]
+    async fn blackbox_idle_survives_healthy_long_stream() {
+        use futures::StreamExt;
+
+        // mock 与 A 完全相同：每 400ms 一个 chunk，共 5 个
+        let addr = spawn_dribbling_upstream(5, 400).await;
+
+        // 新策略：idle = 1s（每次收到字节后重置，400ms < 1s，永不触发）
+        let client = build_idle_client(None, 1, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let start = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+
+        let mut stream = resp.bytes_stream();
+        let mut total_bytes: usize = 0;
+
+        // 循环读到 None（流正常结束），累计字节数
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => total_bytes += bytes.len(),
+                Err(e) => {
+                    panic!(
+                        "idle=1s 不应触发超时，但收到 Err：{}",
+                        describe_reqwest_error(&e)
+                    );
+                }
+            }
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+
+        println!("[B] idle=1s client 完整读完 {total_bytes} 字节、耗时 {elapsed_ms}ms、无超时");
+
+        // 流必须正常结束，累计字节数 > 0
+        assert!(total_bytes > 0, "累计字节数为 0，mock 未发任何数据");
+        // 总耗时应在 ~2s 附近（5 个 chunk × 400ms），放宽窗口 [1.5s, 5s]
+        assert!(
+            elapsed_ms >= 1500 && elapsed_ms <= 5000,
+            "总耗时 {elapsed_ms}ms 不在预期窗口 [1500, 5000]ms"
+        );
+    }
+
+    /// 坐实诊断：上游真实挂起（idle 静止）时，idle 超时触发 kind=timeout。
+    ///
+    /// mock 上游发 1 个 chunk 后挂死 30s；client idle=1s。
+    /// 约 1s 后上游无字节到达，idle 超时触发——必须收到 Err 且 kind=timeout。
+    ///
+    /// 注：reqwest issue #2839——body 读阶段超时被包成 Kind::Decode，
+    /// 但 `is_timeout()` 仍返回 true，故 describe_reqwest_error 先判 is_timeout()，
+    /// 可正确分类为 kind=timeout 而非 kind=decode。
+    #[ignore]
+    #[tokio::test]
+    async fn blackbox_idle_hang_classified_as_timeout() {
+        use futures::StreamExt;
+
+        // mock：发 1 个 chunk 后挂死 30s
+        let addr = spawn_hanging_upstream().await;
+
+        // idle=1s：上游挂死时约 1s 后触发
+        let client = build_idle_client(None, 1, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let start = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+
+        let mut stream = resp.bytes_stream();
+        let mut got_err: Option<reqwest::Error> = None;
+
+        // 循环读 stream，预期在 idle=1s 触发后收到 Err
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(_) => {}
+                Err(e) => {
+                    got_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+
+        // 必须拿到 Err
+        let err = got_err.expect("idle=1s 上游挂死应触发 Err，但流正常结束——断言失败");
+        let desc = describe_reqwest_error(&err);
+
+        // 打印完整 desc（含 source_chain），让 reviewer 确认 timed out 字样
+        println!("[C] idle=1s client 挂起 {elapsed_ms}ms 后超时；desc={desc}");
+
+        // 超时必须在合理窗口内（0.5~3s）
+        assert!(
+            elapsed_ms >= 500 && elapsed_ms <= 3000,
+            "idle 超时耗时 {elapsed_ms}ms 不在预期窗口 [500, 3000]ms"
+        );
+        // kind 必须为 timeout（#2839：is_timeout() 先于 is_decode() 判定）
+        assert!(
+            desc.contains("kind=timeout"),
+            "期望 kind=timeout，实际：{desc}"
+        );
+    }
+
     #[test]
     fn test_proxy_config_new() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
