@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{
+    ProxyConfig, UPSTREAM_IDLE_TIMEOUT_SECS, build_client, build_idle_client,
+};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -25,6 +27,19 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// Client 类型：区分业务长响应与短请求，保证超时策略解耦。
+///
+/// - `Idle`：业务 generateAssistantResponse（流式/非流式），使用 idle/read 超时，
+///   只要上游持续吐字节就不触发，避免误杀慢但健康的长响应。
+/// - `Short`：MCP、WebSearch 等短请求，使用全局总超时死线，防止 Slowloris。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ClientKind {
+    /// 业务长响应：idle/read 超时，无全局总超时
+    Idle,
+    /// 短请求：全局总超时
+    Short,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -34,9 +49,11 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// Client 缓存：key = (effective proxy config, ClientKind)
+    ///
+    /// 按代理+类型双维度缓存，业务 idle client 与短请求 total client 严格隔离，
+    /// 防止超时策略交叉污染。
+    client_cache: Mutex<HashMap<(Option<ProxyConfig>, ClientKind), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -70,11 +87,12 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client
+        // 预热：构建全局代理对应的业务 idle client（短请求 client 按需懒创建）
         let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+            build_idle_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
+                .expect("创建业务 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        cache.insert((proxy.clone(), ClientKind::Idle), initial_client);
 
         Self {
             token_manager,
@@ -86,15 +104,41 @@ impl KiroProvider {
         }
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    /// 根据凭据的代理配置和 client 类型获取（或创建并缓存）对应的 `reqwest::Client`。
+    ///
+    /// 语义边界：
+    /// - `ClientKind::Idle`：业务 generateAssistantResponse，idle/read 超时，无全局总超时。
+    ///   只要上游持续吐字节就不触发，避免慢但健康的长流被误杀。
+    /// - `ClientKind::Short`：MCP/WebSearch 等短请求，全局总超时 720s，防 Slowloris。
+    ///
+    /// # 参数
+    /// * `credentials` - 当前凭据（用于提取 effective proxy）
+    /// * `kind` - client 类型
+    ///
+    /// # 返回
+    /// 缓存命中则克隆已有 client；未命中则按 kind 构建后写入缓存
+    fn client_for(
+        &self,
+        credentials: &KiroCredentials,
+        kind: ClientKind,
+    ) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let cache_key = (effective.clone(), kind.clone());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&cache_key) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let client = match kind {
+            // 业务长响应：idle/read 超时，不设全局总超时
+            ClientKind::Idle => build_idle_client(
+                effective.as_ref(),
+                UPSTREAM_IDLE_TIMEOUT_SECS,
+                self.tls_backend,
+            )?,
+            // 短请求：全局总超时 720s，与业务 client 解耦，防 Slowloris
+            ClientKind::Short => build_client(effective.as_ref(), 720, self.tls_backend)?,
+        };
+        cache.insert(cache_key, client.clone());
         Ok(client)
     }
 
@@ -193,7 +237,8 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let client = match self.client_for(&ctx.credentials) {
+            // MCP/WebSearch 属于短请求，使用全局总超时 client，防止 Slowloris
+            let client = match self.client_for(&ctx.credentials, ClientKind::Short) {
                 Ok(client) => client,
                 Err(e) => {
                     self.token_manager.report_no_result(ctx.id);
@@ -382,7 +427,8 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let client = match self.client_for(&ctx.credentials) {
+            // generateAssistantResponse 属于业务长响应（流式/非流式），使用 idle/read 超时 client
+            let client = match self.client_for(&ctx.credentials, ClientKind::Idle) {
                 Ok(client) => client,
                 Err(e) => {
                     self.token_manager.report_no_result(ctx.id);

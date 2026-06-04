@@ -591,7 +591,7 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!("读取响应流失败: {}", crate::http_client::describe_reqwest_error(&e));
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -653,11 +653,16 @@ async fn handle_non_stream_request(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            // 服务端日志打结构化诊断串，便于区分 idle 超时 / 上游 reset / 真截断
+            tracing::error!(
+                "读取响应体失败: {}",
+                crate::http_client::describe_reqwest_error(&e)
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
+                    // 客户端响应只暴露 Display，不外泄 source chain
                     format!("读取响应失败: {}", e),
                 )),
             )
@@ -1235,7 +1240,7 @@ fn create_prefix_buffered_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!("读取响应流失败: {}", crate::http_client::describe_reqwest_error(&e));
                             let final_events = ctx.finish();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -1361,7 +1366,10 @@ fn create_buffered_sse_stream(
                         // 继续读取下一个 chunk，不发送任何数据
                     }
                     Some(Err(e)) => {
-                        tracing::error!("读取响应流失败: {}", e);
+                        tracing::error!(
+                            "读取响应流失败: {}",
+                            crate::http_client::describe_reqwest_error(&e)
+                        );
                         // 发生错误，完成处理并返回所有事件
                         let all_events = ctx.finish_and_get_all_events();
                         let bytes: Vec<Result<Bytes, Infallible>> = all_events
