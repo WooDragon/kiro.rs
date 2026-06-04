@@ -88,8 +88,9 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的业务 idle client（短请求 client 按需懒创建）
-        let initial_client = build_idle_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
-            .expect("创建业务 HTTP 客户端失败");
+        let initial_client =
+            build_idle_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
+                .expect("创建业务 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert((proxy.clone(), ClientKind::Idle), initial_client);
 
@@ -116,7 +117,11 @@ impl KiroProvider {
     ///
     /// # 返回
     /// 缓存命中则克隆已有 client；未命中则按 kind 构建后写入缓存
-    fn client_for(&self, credentials: &KiroCredentials, kind: ClientKind) -> anyhow::Result<Client> {
+    fn client_for(
+        &self,
+        credentials: &KiroCredentials,
+        kind: ClientKind,
+    ) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let cache_key = (effective.clone(), kind.clone());
         let mut cache = self.client_cache.lock();

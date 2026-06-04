@@ -62,7 +62,10 @@ impl ProxyConfig {
 ///
 /// # 返回
 /// 配置了代理与 TLS 的 `ClientBuilder`，尚未添加超时
-fn base_builder(proxy: Option<&ProxyConfig>, tls_backend: TlsBackend) -> anyhow::Result<ClientBuilder> {
+fn base_builder(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<ClientBuilder> {
     let mut builder = Client::builder();
 
     match tls_backend {
@@ -230,24 +233,43 @@ mod tests {
 
     /// 测试 describe_reqwest_error 对 connect 类错误的分类。
     ///
-    /// reqwest::Error 无公开构造器，通过向本地未监听端口发请求拿到真实 connect error，
-    /// 断言返回串包含 `kind=connect`，验证分类逻辑与 source chain walk 不 panic。
+    /// reqwest::Error 无公开构造器，只能用真实请求拿到 error。为稳定产生 connect
+    /// 类错误（ECONNREFUSED）而非偶发超时：绑定 `127.0.0.1:0` 让 OS 分配一个空闲
+    /// 端口，随即释放监听——该端口短期内无人占用，连接必被立即拒绝。client 显式设
+    /// 短 connect_timeout，避免极端环境（如防火墙 DROP）下连接挂起拖死测试。
     #[tokio::test]
     async fn test_describe_reqwest_error_connect_kind() {
-        // 127.0.0.1:1 是本地保留端口，正常情况下无进程监听，触发 connect refused
-        let result = reqwest::get("http://127.0.0.1:1").await;
-        let err = result.expect_err("预期连接被拒绝，但请求意外成功");
+        // 绑定临时端口后立即释放，得到一个确定无人监听的本地地址
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口失败");
+        let addr = listener.local_addr().expect("获取本地地址失败");
+        drop(listener);
+
+        // 显式短 connect_timeout，确保即便连接不被立即拒绝也不会挂死
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("构建测试 client 失败");
+        let err = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect_err("预期连接被拒绝，但请求意外成功");
 
         let desc = describe_reqwest_error(&err);
 
         // 核心断言：connect 类错误必须被分类为 kind=connect
         assert!(
             desc.contains("kind=connect"),
-            "期望 kind=connect，实际诊断串：{}",
-            desc
+            "期望 kind=connect，实际诊断串：{desc}"
         );
         // 诊断串必须包含 display= 和 source_chain= 字段（格式完整性）
-        assert!(desc.contains("display="), "诊断串缺少 display= 字段：{}", desc);
-        assert!(desc.contains("source_chain="), "诊断串缺少 source_chain= 字段：{}", desc);
+        assert!(
+            desc.contains("display="),
+            "诊断串缺少 display= 字段：{desc}"
+        );
+        assert!(
+            desc.contains("source_chain="),
+            "诊断串缺少 source_chain= 字段：{desc}"
+        );
     }
 }

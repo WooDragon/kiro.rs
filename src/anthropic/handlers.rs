@@ -654,7 +654,10 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             // 服务端日志打结构化诊断串，便于区分 idle 超时 / 上游 reset / 真截断
-            tracing::error!("读取响应体失败: {}", crate::http_client::describe_reqwest_error(&e));
+            tracing::error!(
+                "读取响应体失败: {}",
+                crate::http_client::describe_reqwest_error(&e)
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -1363,7 +1366,10 @@ fn create_buffered_sse_stream(
                         // 继续读取下一个 chunk，不发送任何数据
                     }
                     Some(Err(e)) => {
-                        tracing::error!("读取响应流失败: {}", crate::http_client::describe_reqwest_error(&e));
+                        tracing::error!(
+                            "读取响应流失败: {}",
+                            crate::http_client::describe_reqwest_error(&e)
+                        );
                         // 发生错误，完成处理并返回所有事件
                         let all_events = ctx.finish_and_get_all_events();
                         let bytes: Vec<Result<Bytes, Infallible>> = all_events
