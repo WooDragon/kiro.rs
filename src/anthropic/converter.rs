@@ -673,8 +673,7 @@ fn process_message_content(
                                 // （两种场景都 hoist 图片）
                                 if !result_images.is_empty() {
                                     if !is_error && result_content.trim().is_empty() {
-                                        result_content =
-                                            TOOL_RESULT_IMAGE_PLACEHOLDER.to_string();
+                                        result_content = TOOL_RESULT_IMAGE_PLACEHOLDER.to_string();
                                     }
                                     images.extend(result_images);
                                 }
@@ -722,9 +721,7 @@ fn get_image_format(media_type: &str) -> Option<String> {
 ///
 /// # 返回
 /// `(文本内容, 图片列表)`：文本供写入 ToolResult，图片 hoist 到 userInputMessage.images
-fn extract_tool_result_content(
-    content: &Option<serde_json::Value>,
-) -> (String, Vec<KiroImage>) {
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
     let mut images = Vec::new();
     let text = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -3584,10 +3581,7 @@ mod tests {
         let req = make_req_with_tool_result_image(content);
         let result = convert_request(&req).expect("应成功转换");
 
-        let user_input = &result
-            .conversation_state
-            .current_message
-            .user_input_message;
+        let user_input = &result.conversation_state.current_message.user_input_message;
 
         // 图片应 hoist 到 images
         assert_eq!(user_input.images.len(), 1, "应有 1 张图片 hoist 到 images");
@@ -3649,10 +3643,7 @@ mod tests {
         let req = make_req_with_tool_result_image(content);
         let result = convert_request(&req).expect("应成功转换");
 
-        let user_input = &result
-            .conversation_state
-            .current_message
-            .user_input_message;
+        let user_input = &result.conversation_state.current_message.user_input_message;
 
         // 图片进 images
         assert_eq!(user_input.images.len(), 1, "图片应 hoist 到 images");
@@ -3733,7 +3724,10 @@ mod tests {
 
         assert_eq!(tool_results.len(), 1);
         let text = tool_results[0].content[0]["text"].as_str().unwrap();
-        assert_eq!(text, "(empty result)", "无图空 tool_result 应仍用 (empty result) 占位");
+        assert_eq!(
+            text, "(empty result)",
+            "无图空 tool_result 应仍用 (empty result) 占位"
+        );
     }
 
     /// TC-35-07：端到端——完整请求转换后 images 非空 + tool_result 文本为图片占位符
@@ -3750,10 +3744,7 @@ mod tests {
         let req = make_req_with_tool_result_image(content);
         let result = convert_request(&req).expect("端到端转换应成功");
 
-        let user_input = &result
-            .conversation_state
-            .current_message
-            .user_input_message;
+        let user_input = &result.conversation_state.current_message.user_input_message;
 
         // 1. images 非空
         assert!(
@@ -3836,10 +3827,7 @@ mod tests {
         };
 
         let result = convert_request(&req).expect("应成功转换");
-        let user_input = &result
-            .conversation_state
-            .current_message
-            .user_input_message;
+        let user_input = &result.conversation_state.current_message.user_input_message;
 
         // (a) 图片仍 hoist 到 images
         assert_eq!(
@@ -3864,9 +3852,6 @@ mod tests {
         );
 
         // (c) tool_result 的 is_error 为 true
-        assert!(
-            tool_results[0].is_error,
-            "tool_result.is_error 应为 true"
-        );
+        assert!(tool_results[0].is_error, "tool_result.is_error 应为 true");
     }
 }
