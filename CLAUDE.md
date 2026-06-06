@@ -4,20 +4,23 @@ Rust 编写的 Anthropic Claude API 兼容代理，将 Anthropic API 请求转�
 
 ## 构建与测试
 
-本机无 Rust toolchain，通过 Docker 构建和测试：
+本机无 Rust toolchain，cargo 经 docker 镜像 `rust:1.92-alpine` 跑——**不是** `docker compose`：compose 服务名为 `kiro-rs`（非 `kiro`）且用 runtime 发布镜像，**不含 cargo**，仅用于起服务。
 
 ```bash
-# 构建
-docker compose build
+# 测试（唯一阻塞门槛）
+docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'cargo test --workspace'
 
-# 测试
-docker compose run --rm kiro cargo test
+# 格式化（merge 前必跑——CI 的 Check formatting 会拦）
+docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component add rustfmt && cargo fmt'
 
-# lint（非阻塞，仅参考）
-docker compose run --rm kiro cargo clippy
+# lint（非阻塞，仅参考；alpine 需先装组件）
+docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component add clippy && cargo clippy'
+
+# 构建发布镜像 / 起服务（compose）
+docker compose build && docker compose up -d
 ```
 
-阻塞门槛仅 `cargo test`，clippy 警告不阻塞合并。
+阻塞门槛仅 `cargo test`，clippy 警告不阻塞合并（仓库有存量 clippy）；但 `cargo fmt` 失败应修。
 
 ## 项目结构
 
