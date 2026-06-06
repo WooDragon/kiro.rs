@@ -667,10 +667,12 @@ fn process_message_content(
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 // 图片 hoist 到当轮 userInputMessage.images（复用 user 贴图路径）；
-                                // 仅图无文时给明确占位，避免 ToolResult::success 兜底成
-                                // "(empty result)" 误导模型以为工具返回空
+                                // 仅 success 场景在空文本时写图片占位，避免 ToolResult::success 兜底成
+                                // "(empty result)" 误导模型以为工具返回空；error 场景保持空文本，
+                                // 让 ToolResult::error 用其专用占位符，不丢 error 语义
+                                // （两种场景都 hoist 图片）
                                 if !result_images.is_empty() {
-                                    if result_content.trim().is_empty() {
+                                    if !is_error && result_content.trim().is_empty() {
                                         result_content =
                                             TOOL_RESULT_IMAGE_PLACEHOLDER.to_string();
                                     }
@@ -3771,5 +3773,100 @@ mod tests {
         // 3. 序列化后不含空 text
         let json = serde_json::to_string(&result.conversation_state).unwrap();
         assert!(!json.contains("\"text\":\"\""), "序列化结果不应含空 text");
+    }
+
+    /// TC-35-08：is_error=true 且 content 仅含 image（无文本）→
+    ///   图片仍 hoist 到 images，但 tool_result 文本走 error 专用占位
+    ///   "(tool returned no error message)"，而非 TOOL_RESULT_IMAGE_PLACEHOLDER
+    #[test]
+    fn test_issue35_error_tool_result_image_only_keeps_error_placeholder() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        // 内联构造带 is_error=true 的 tool_result 请求
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run a tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_err_img", "name": "Read", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_err_img",
+                        "is_error": true,
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": test_png_base64()
+                            }
+                        }]
+                    }]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Read".to_string(),
+                description: "Read file".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("应成功转换");
+        let user_input = &result
+            .conversation_state
+            .current_message
+            .user_input_message;
+
+        // (a) 图片仍 hoist 到 images
+        assert_eq!(
+            user_input.images.len(),
+            1,
+            "error 场景图片也应 hoist 到 images"
+        );
+
+        let tool_results = &user_input.user_input_message_context.tool_results;
+        assert_eq!(tool_results.len(), 1, "应有 1 个 tool_result");
+
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+
+        // (b) 文本应为 error 专用占位，而非图片占位
+        assert_eq!(
+            text, "(tool returned no error message)",
+            "error+仅图时应走 error 专用占位，不应用 TOOL_RESULT_IMAGE_PLACEHOLDER"
+        );
+        assert_ne!(
+            text, TOOL_RESULT_IMAGE_PLACEHOLDER,
+            "不应用图片占位符——那会丢失 error 语义"
+        );
+
+        // (c) tool_result 的 is_error 为 true
+        assert!(
+            tool_results[0].is_error,
+            "tool_result.is_error 应为 true"
+        );
     }
 }
