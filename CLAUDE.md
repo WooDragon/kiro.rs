@@ -63,6 +63,7 @@ repo 内不保留 `docs/` 目录，所有设计文档、实现细节归私有侧
 - 转换层引入降级/裁剪/占位/改写前须黑盒实测背书，禁止基于推断（#26）
 - 业务长响应（generateAssistantResponse 流式/非流式）走 idle/read 超时（930s，>ALB 900），不设全局总超时——上游在吐字节就不超时；短请求（MCP/WebSearch/oauth/count_tokens）保留 total 死线，与业务 client 按 ClientKind 解耦防 Slowloris（#31）
 - 上游 body 读错误诊断须先判 is_timeout 再分类——reqwest 把 body 读超时无差别包成 Decode（Display 恒为 "error decoding response body"），真因藏 source chain（reqwest #2839，#31）
+- tool_result 内的 image content block 提取后 hoist 到当轮 `userInputMessage.images`（复用 user 贴图路径），tool_result content 保留纯文本、仅图无文时塞占位——上游 `toolResults[].content` 只认 text 不承载图片；图片与 tool_result 落同一 userInputMessage、下游 with_images 零改动（kiro-go 源码 + 黑盒 A/B + e2e 三重背书，#35）
 
 ## 私有文档
 

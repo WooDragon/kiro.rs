@@ -133,6 +133,13 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// tool_result 仅含图片、无文本时的占位文案。
+/// 图片已 hoist 到 userInputMessage.images；此处给模型一句说明，
+/// 避免 ToolResult::success 把空文本兜底成 "(empty result)"
+/// 而误导模型以为工具返回空。
+const TOOL_RESULT_IMAGE_PLACEHOLDER: &str =
+    "[Tool returned an image; the image is attached to this message.]";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -655,8 +662,21 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (mut result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
+
+                                // 图片 hoist 到当轮 userInputMessage.images（复用 user 贴图路径）；
+                                // 仅 success 场景在空文本时写图片占位，避免 ToolResult::success 兜底成
+                                // "(empty result)" 误导模型以为工具返回空；error 场景保持空文本，
+                                // 让 ToolResult::error 用其专用占位符，不丢 error 语义
+                                // （两种场景都 hoist 图片）
+                                if !result_images.is_empty() {
+                                    if !is_error && result_content.trim().is_empty() {
+                                        result_content = TOOL_RESULT_IMAGE_PLACEHOLDER.to_string();
+                                    }
+                                    images.extend(result_images);
+                                }
 
                                 let mut result = if is_error {
                                     ToolResult::error(&tool_use_id, result_content)
@@ -694,22 +714,52 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
-/// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
+/// 提取工具结果内容，同时将 image block 提取为 KiroImage 列表
+///
+/// # 参数
+/// * `content` - tool_result 的 content 字段（可为字符串、数组或 None）
+///
+/// # 返回
+/// `(文本内容, 图片列表)`：文本供写入 ToolResult，图片 hoist 到 userInputMessage.images
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
+    let mut images = Vec::new();
+    let text = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
+                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                    // 文本 block：拼入文本
+                    parts.push(t.to_string());
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                    && let Some(img) = extract_image_from_json(item)
+                {
+                    // image block：提取图片（复用 user 贴图路径 get_image_format）
+                    images.push(img);
                 }
+                // 其他未知 block 类型：静默跳过，与 user 贴图路径一致
             }
             parts.join("\n")
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+    (text, images)
+}
+
+/// 从 tool_result content 的 image block（动态 JSON）提取 KiroImage
+///
+/// # 参数
+/// * `item` - 形如 `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` 的 JSON
+///
+/// # 返回
+/// `Some(KiroImage)` 若字段完整且 media_type 受支持，否则 `None`（静默跳过）
+fn extract_image_from_json(item: &serde_json::Value) -> Option<KiroImage> {
+    let source = item.get("source")?;
+    let media_type = source.get("media_type").and_then(|v| v.as_str())?;
+    let format = get_image_format(media_type)?; // media_type 不支持时返回 None，静默跳过
+    let data = source.get("data").and_then(|v| v.as_str())?;
+    Some(KiroImage::from_base64(format, data))
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -3451,5 +3501,357 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Issue #35：tool_result 图片 hoist 到 userInputMessage.images
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 构造完整 MessagesRequest，末尾 user 消息含 tool_result（带图片 content）
+    ///
+    /// # 参数
+    /// * `tool_result_content` - tool_result 的 content 数组（JSON Value）
+    ///
+    /// # 返回
+    /// 可直接传给 convert_request 的 MessagesRequest
+    fn make_req_with_tool_result_image(tool_result_content: serde_json::Value) -> MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read a file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_read_img", "name": "Read", "input": {"file_path": "/tmp/a.png"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_read_img",
+                        "content": tool_result_content
+                    }]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Read".to_string(),
+                description: "Read file".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        }
+    }
+
+    /// 构造标准 PNG base64 数据（1×1 红点）供测试用
+    fn test_png_base64() -> &'static str {
+        // 最小合法 base64，测试只关心字段传递不关心像素
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg=="
+    }
+
+    /// TC-35-01：tool_result content 含单个 image block → images 非空、format 正确、bytes 是原 data
+    #[test]
+    fn test_issue35_single_image_block_hoisted() {
+        let content = serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": test_png_base64()
+            }
+        }]);
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("应成功转换");
+
+        let user_input = &result.conversation_state.current_message.user_input_message;
+
+        // 图片应 hoist 到 images
+        assert_eq!(user_input.images.len(), 1, "应有 1 张图片 hoist 到 images");
+        assert_eq!(user_input.images[0].format, "png", "格式应为 png");
+        assert_eq!(
+            user_input.images[0].source.bytes,
+            test_png_base64(),
+            "bytes 应是原 base64 data"
+        );
+    }
+
+    /// TC-35-02：仅图无文的 tool_result → ToolResult content 是 TOOL_RESULT_IMAGE_PLACEHOLDER，非 "(empty result)"
+    #[test]
+    fn test_issue35_image_only_uses_image_placeholder() {
+        let content = serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": test_png_base64()
+            }
+        }]);
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("应成功转换");
+
+        let tool_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_results.len(), 1, "应有 1 个 tool_result");
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, TOOL_RESULT_IMAGE_PLACEHOLDER,
+            "仅图无文时应用图片占位符，不应是 (empty result)"
+        );
+        assert_ne!(
+            text, "(empty result)",
+            "不应用空结果占位符——那会误导模型以为工具没返回内容"
+        );
+    }
+
+    /// TC-35-03：文本 + 图片混合 → 文本进 tool_result content，图片进 images，两者都不丢
+    #[test]
+    fn test_issue35_text_and_image_mixed() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "file contents above image"},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": test_png_base64()
+                }
+            }
+        ]);
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("应成功转换");
+
+        let user_input = &result.conversation_state.current_message.user_input_message;
+
+        // 图片进 images
+        assert_eq!(user_input.images.len(), 1, "图片应 hoist 到 images");
+
+        // 文本进 tool_result content
+        let tool_results = &user_input.user_input_message_context.tool_results;
+        assert_eq!(tool_results.len(), 1);
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, "file contents above image",
+            "文本不应丢失，应完整写入 tool_result content"
+        );
+    }
+
+    /// TC-35-04：多个 image block → 全部 hoist 进 images
+    #[test]
+    fn test_issue35_multiple_images_all_hoisted() {
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": test_png_base64()}
+            },
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/fake_jpeg=="}
+            }
+        ]);
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("应成功转换");
+
+        let images = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images;
+
+        assert_eq!(images.len(), 2, "两张图片都应 hoist");
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[1].format, "jpeg");
+    }
+
+    /// TC-35-05：不支持的 media_type（image/svg+xml）→ 静默跳过，images 空，不 panic
+    #[test]
+    fn test_issue35_unsupported_media_type_silently_skipped() {
+        let content = serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/svg+xml",
+                "data": "PHN2ZyB4bWxucz0i"
+            }
+        }]);
+        let req = make_req_with_tool_result_image(content);
+        // 不应 panic
+        let result = convert_request(&req).expect("应成功转换，不支持的格式静默跳过");
+
+        let images = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images;
+        assert!(images.is_empty(), "不支持的格式应静默跳过，images 应为空");
+    }
+
+    /// TC-35-06：回归——无图的空 tool_result 仍兜底 "(empty result)"（向后兼容）
+    #[test]
+    fn test_issue35_regression_empty_tool_result_still_uses_empty_placeholder() {
+        let content = serde_json::json!("");
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("应成功转换");
+
+        let tool_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_results.len(), 1);
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, "(empty result)",
+            "无图空 tool_result 应仍用 (empty result) 占位"
+        );
+    }
+
+    /// TC-35-07：端到端——完整请求转换后 images 非空 + tool_result 文本为图片占位符
+    #[test]
+    fn test_issue35_e2e_image_hoist_and_placeholder() {
+        let content = serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": test_png_base64()
+            }
+        }]);
+        let req = make_req_with_tool_result_image(content);
+        let result = convert_request(&req).expect("端到端转换应成功");
+
+        let user_input = &result.conversation_state.current_message.user_input_message;
+
+        // 1. images 非空
+        assert!(
+            !user_input.images.is_empty(),
+            "userInputMessage.images 应非空（图片已 hoist）"
+        );
+
+        // 2. tool_result 文本为图片占位符
+        let tool_results = &user_input.user_input_message_context.tool_results;
+        assert_eq!(tool_results.len(), 1, "应有 1 个 tool_result");
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, TOOL_RESULT_IMAGE_PLACEHOLDER,
+            "仅图时 tool_result 文本应为图片占位符"
+        );
+
+        // 3. 序列化后不含空 text
+        let json = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!json.contains("\"text\":\"\""), "序列化结果不应含空 text");
+    }
+
+    /// TC-35-08：is_error=true 且 content 仅含 image（无文本）→
+    ///   图片仍 hoist 到 images，但 tool_result 文本走 error 专用占位
+    ///   "(tool returned no error message)"，而非 TOOL_RESULT_IMAGE_PLACEHOLDER
+    #[test]
+    fn test_issue35_error_tool_result_image_only_keeps_error_placeholder() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        // 内联构造带 is_error=true 的 tool_result 请求
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run a tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tu_err_img", "name": "Read", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_err_img",
+                        "is_error": true,
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": test_png_base64()
+                            }
+                        }]
+                    }]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "Read".to_string(),
+                description: "Read file".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("应成功转换");
+        let user_input = &result.conversation_state.current_message.user_input_message;
+
+        // (a) 图片仍 hoist 到 images
+        assert_eq!(
+            user_input.images.len(),
+            1,
+            "error 场景图片也应 hoist 到 images"
+        );
+
+        let tool_results = &user_input.user_input_message_context.tool_results;
+        assert_eq!(tool_results.len(), 1, "应有 1 个 tool_result");
+
+        let text = tool_results[0].content[0]["text"].as_str().unwrap();
+
+        // (b) 文本应为 error 专用占位，而非图片占位
+        assert_eq!(
+            text, "(tool returned no error message)",
+            "error+仅图时应走 error 专用占位，不应用 TOOL_RESULT_IMAGE_PLACEHOLDER"
+        );
+        assert_ne!(
+            text, TOOL_RESULT_IMAGE_PLACEHOLDER,
+            "不应用图片占位符——那会丢失 error 语义"
+        );
+
+        // (c) tool_result 的 is_error 为 true
+        assert!(tool_results[0].is_error, "tool_result.is_error 应为 true");
     }
 }
