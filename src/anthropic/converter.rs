@@ -3512,7 +3512,6 @@ mod tests {
     ///
     /// # 参数
     /// * `tool_result_content` - tool_result 的 content 数组（JSON Value）
-    /// * `image_in_tool_result` - tool_result content 是否含图片
     ///
     /// # 返回
     /// 可直接传给 convert_request 的 MessagesRequest
