@@ -3854,4 +3854,298 @@ mod tests {
         // (c) tool_result 的 is_error 为 true
         assert!(tool_results[0].is_error, "tool_result.is_error 应为 true");
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // plan mode 信号回归测试（issue #40）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// plan-mode-T1：system block 中的 plan reminder 文本经 convert_request 后完整保留，
+    /// billing header 行正常剥离（双断言——证伪 without_anthropic_billing_headers 回归用）
+    #[test]
+    fn test_plan_mode_reminder_in_system_preserved() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    // 真实 billing header 行——应被 without_anthropic_billing_headers 剥离
+                    text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=test;".to_string(),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    // plan reminder 元素——应完整保留
+                    text: "You are an assistant.\n<system-reminder>Plan Mode is enabled. Never write files.</system-reminder>".to_string(),
+                    cache_control: None,
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("request should convert");
+        let system_content = match &result.conversation_state.history[0] {
+            Message::User(msg) => &msg.user_input_message.content,
+            _ => panic!("history[0] should be User (system pair)"),
+        };
+
+        // billing header 已剥离（非平凡断言——fixture 含 billing 行，若 strip 回归此处 fail）
+        assert!(
+            !system_content.contains("x-anthropic-billing-header"),
+            "billing header line should be stripped"
+        );
+        assert!(
+            !system_content.contains("cch=test"),
+            "billing header content should be stripped"
+        );
+        // plan reminder 文本完整保留
+        assert!(
+            system_content.contains("Plan Mode is enabled"),
+            "plan reminder text should survive convert_request"
+        );
+        assert!(
+            system_content.contains("Never write files"),
+            "plan reminder tail should survive convert_request"
+        );
+    }
+
+    /// plan-mode-T2：user content 文本块中的 plan reminder 经 convert_request 后完整保留
+    ///
+    /// 2a：current_message 路径（process_message_content）
+    /// 2b：历史轮路径（merge_user_messages — if !text.is_empty() skip 路径）
+    #[test]
+    fn test_plan_mode_reminder_in_user_content_preserved() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // ── 2a：current_message 路径 ──────────────────────────────────────
+        let req_2a = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": "<system-reminder>Plan Mode enabled. In plan mode, never write files.</system-reminder>"
+                }]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result_2a = convert_request(&req_2a).expect("2a: request should convert");
+        let current_content = &result_2a
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            current_content.contains("Plan Mode enabled"),
+            "2a: plan reminder in current_message user content should be preserved"
+        );
+
+        // ── 2b：历史轮路径（merge_user_messages） ───────────────────────────
+        // msg[0] user + msg[1] assistant → history pair
+        // msg[2] user with plan reminder → history (via merge_user_messages)
+        // msg[3] user "final" → current_message
+        let req_2b = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("start"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("OK"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": "<system-reminder>Plan Mode is enabled.</system-reminder>\nWhat should I do next?"
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("final message"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result_2b = convert_request(&req_2b).expect("2b: request should convert");
+        // msg[2] は build_history の trailing user_buffer を経て merge_user_messages で処理される。
+        // history には [user(start+reminder), assistant(OK)] のように merge される場合と
+        // [user(start), assistant(OK), user(reminder)] の場合がある。
+        // いずれにせよ history 内のいずれかの User メッセージに reminder text が含まれること。
+        let reminder_in_history = result_2b.conversation_state.history.iter().any(|msg| {
+            if let Message::User(u) = msg {
+                u.user_input_message
+                    .content
+                    .contains("Plan Mode is enabled")
+            } else {
+                false
+            }
+        });
+        assert!(
+            reminder_in_history,
+            "2b: plan reminder in historical user turn should be preserved through merge_user_messages"
+        );
+    }
+
+    /// plan-mode-T3：ExitPlanMode / EnterPlanMode 工具名经 convert_request 后完整保留，
+    /// 且无名称缩短（tool_name_map 为空）
+    #[test]
+    fn test_plan_mode_tools_exit_enter_preserved() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let schema = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("type".to_string(), serde_json::json!("object"));
+            m.insert("properties".to_string(), serde_json::json!({}));
+            m
+        };
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("should I exit plan mode?"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "ExitPlanMode".to_string(),
+                    description: "Exit plan mode".to_string(),
+                    input_schema: schema.clone(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "EnterPlanMode".to_string(),
+                    description: "Enter plan mode".to_string(),
+                    input_schema: schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("request should convert");
+
+        // 名称が 63 文字以下なので短縮なし
+        assert!(
+            result.tool_name_map.is_empty(),
+            "ExitPlanMode/EnterPlanMode are under TOOL_NAME_MAX_LEN; tool_name_map should be empty"
+        );
+
+        // convert_tools の出力が着地する正確なフィールドパス
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.len(), 2, "both plan mode tools should be present");
+        assert_eq!(
+            tools[0].tool_specification.name, "ExitPlanMode",
+            "first tool name should be ExitPlanMode unchanged"
+        );
+        assert_eq!(
+            tools[1].tool_specification.name, "EnterPlanMode",
+            "second tool name should be EnterPlanMode unchanged"
+        );
+    }
+
+    /// plan-mode-T4：payload 圧力下でも system pair の plan reminder は trim されない
+    #[test]
+    fn test_plan_mode_system_pair_not_trimmed_under_payload_pressure() {
+        use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+
+        let model_id = "claude-sonnet-4.5";
+
+        // system pair（history[0..=1]）：plan reminder text
+        let sys_user = Message::User(HistoryUserMessage::new(
+            "<system-reminder>Plan Mode is enabled.</system-reminder>",
+            model_id,
+        ));
+        let sys_assistant = Message::Assistant(HistoryAssistantMessage::new(
+            "I will follow these instructions.",
+        ));
+
+        // 6 pairs of regular history after the system pair
+        let mut history = vec![sys_user, sys_assistant];
+        for i in 0..6 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("regular user message {i} with some padding content"),
+                model_id,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "regular assistant reply {i} with some padding content"
+            ))));
+        }
+
+        let mut state = ConversationState::new("test-conv").with_history(history);
+
+        // limit: remove 1 regular pair (oldest non-system pair at history[2..=3])
+        let (limit, bytes) = limit_for_trimming_pairs(&state, true, 1);
+
+        let result = trim_history_to_byte_limit(&mut state, true, limit, bytes);
+        assert!(
+            result.is_some(),
+            "trim should occur (excess matches 1 pair removal)"
+        );
+
+        // system pair user entry must still be at history[0]
+        assert!(
+            matches!(state.history[0], Message::User(_)),
+            "history[0] should still be User (system pair) after trim"
+        );
+        let system_content = match &state.history[0] {
+            Message::User(u) => &u.user_input_message.content,
+            _ => panic!("history[0] should be User"),
+        };
+        assert!(
+            system_content.contains("Plan Mode is enabled"),
+            "plan reminder text in system pair must survive trim under payload pressure"
+        );
+    }
 }
