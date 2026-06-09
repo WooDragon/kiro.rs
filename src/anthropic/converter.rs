@@ -3316,10 +3316,10 @@ mod tests {
         };
 
         let result_2b = convert_request(&req_2b).expect("2b: request should convert");
-        // msg[2] は build_history の trailing user_buffer を経て merge_user_messages で処理される。
-        // history には [user(start+reminder), assistant(OK)] のように merge される場合と
-        // [user(start), assistant(OK), user(reminder)] の場合がある。
-        // いずれにせよ history 内のいずれかの User メッセージに reminder text が含まれること。
+        // msg[2] 经 build_history 的 trailing user_buffer 走 merge_user_messages 处理。
+        // history 可能 merge 成 [user(start+reminder), assistant(OK)]，
+        // 也可能是 [user(start), assistant(OK), user(reminder)]。
+        // 无论哪种，history 中总有某条 User 消息包含 reminder 文本。
         let reminder_in_history = result_2b.conversation_state.history.iter().any(|msg| {
             if let Message::User(u) = msg {
                 u.user_input_message
@@ -3385,13 +3385,13 @@ mod tests {
 
         let result = convert_request(&req).expect("request should convert");
 
-        // 名称が 63 文字以下なので短縮なし
+        // 名称在 63 字符以内，不触发缩短
         assert!(
             result.tool_name_map.is_empty(),
             "ExitPlanMode/EnterPlanMode are under TOOL_NAME_MAX_LEN; tool_name_map should be empty"
         );
 
-        // convert_tools の出力が着地する正確なフィールドパス
+        // convert_tools 的输出落地的精确字段路径
         let tools = &result
             .conversation_state
             .current_message
