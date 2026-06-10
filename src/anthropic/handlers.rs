@@ -749,6 +749,19 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
+    // #43 非流式路径同款检测：上游把工具调用 XML 当纯文本吐出且本轮无结构化 tool_use → warn。
+    // 非流式持有完整 text_content，直接全文检测，无需滑动窗口。纯可观测，不改透传/不打印文本内容。
+    if !has_tool_use && let Some(marker) = super::stream::detect_text_tool_call_leak(&text_content)
+    {
+        tracing::warn!(
+            "检测到工具调用明文泄漏(#43,非流式): marker={:?} model={} text_len={} stop_reason={}",
+            marker,
+            model,
+            text_content.len(),
+            stop_reason
+        );
+    }
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
