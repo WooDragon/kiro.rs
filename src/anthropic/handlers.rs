@@ -903,7 +903,7 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: total_tokens.max(1),
     })
 }
 
