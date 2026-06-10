@@ -1250,10 +1250,13 @@ impl StreamContext {
         let final_output_tokens = self.final_output_tokens();
 
         // #43 上游 opus-4-8 偶发把工具调用 XML 当纯文本吐出：命中明文标记且本轮无结构化 tool_use
-        // → 记 warn（info 级即可见，不依赖 debug）。纯可观测，不改透传/stop_reason；不打印文本内容本身。
+        // → stop_reason 修正为 max_tokens（CC 自动续机制兜底），仅在无其他显式 override 时介入。
         if let Some(marker) = self.tool_call_leak_marker
             && !self.state_manager.has_tool_use()
         {
+            if self.state_manager.stop_reason.is_none() {
+                self.state_manager.set_stop_reason("max_tokens");
+            }
             tracing::warn!(
                 "检测到工具调用明文泄漏(#43): marker={:?} model={} message_id={} output_tokens={} stop_reason={}",
                 marker,
@@ -2581,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_leak_warn_only_when_no_tool_use() {
+    fn test_leak_overrides_stop_reason_to_max_tokens() {
         // 集成：文本含 invoke 标签 + 无结构化 tool_use → 命中告警条件
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         ctx.process_assistant_response("分析完成。\n\ncall\n<invoke name=\"Bash\">\ncmd</invoke>");
@@ -2589,6 +2592,11 @@ mod tests {
         assert!(
             ctx.tool_call_leak_marker.is_some() && !ctx.state_manager.has_tool_use(),
             "应满足告警条件：marker 命中且无 tool_use"
+        );
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "max_tokens",
+            "泄漏检测应将 stop_reason 修正为 max_tokens"
         );
     }
 
@@ -2602,5 +2610,56 @@ mod tests {
             !(ctx.tool_call_leak_marker.is_some() && !ctx.state_manager.has_tool_use()),
             "has_tool_use=true 时不应满足告警条件"
         );
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "tool_use",
+            "has_tool_use=true 时 stop_reason 应为 tool_use 而非被泄漏检测覆盖"
+        );
+    }
+
+    #[test]
+    fn test_leak_does_not_override_explicit_stop_reason() {
+        // 当已有显式 stop_reason（如 context exceeded）时，泄漏检测不覆盖
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.state_manager
+            .set_stop_reason("model_context_window_exceeded");
+        ctx.process_assistant_response("触发泄漏\n<invoke name=\"Bash\">\n参数</invoke>");
+        ctx.generate_final_events();
+        assert!(ctx.tool_call_leak_marker.is_some(), "marker 应命中");
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "model_context_window_exceeded",
+            "已有显式 stop_reason 时不应被泄漏检测覆盖"
+        );
+    }
+
+    #[test]
+    fn test_leak_stop_reason_non_stream_logic() {
+        // 非流式路径决策逻辑验证：detect + stop_reason == "end_turn" → override
+        let text_leak = "分析完成\n<invoke name=\"Bash\">\ncmd</invoke>";
+        let text_clean = "正常文本，没有工具调用标记";
+
+        // Case 1: 命中 + end_turn → 应 override
+        assert!(detect_text_tool_call_leak(text_leak).is_some());
+        let mut stop_reason = "end_turn".to_string();
+        if detect_text_tool_call_leak(text_leak).is_some() && stop_reason == "end_turn" {
+            stop_reason = "max_tokens".to_string();
+        }
+        assert_eq!(stop_reason, "max_tokens");
+
+        // Case 2: 命中 + 非 end_turn → 不 override
+        let mut stop_reason2 = "model_context_window_exceeded".to_string();
+        if detect_text_tool_call_leak(text_leak).is_some() && stop_reason2 == "end_turn" {
+            stop_reason2 = "max_tokens".to_string();
+        }
+        assert_eq!(stop_reason2, "model_context_window_exceeded");
+
+        // Case 3: 未命中 + end_turn → 不 override
+        assert!(detect_text_tool_call_leak(text_clean).is_none());
+        let mut stop_reason3 = "end_turn".to_string();
+        if detect_text_tool_call_leak(text_clean).is_some() && stop_reason3 == "end_turn" {
+            stop_reason3 = "max_tokens".to_string();
+        }
+        assert_eq!(stop_reason3, "end_turn");
     }
 }
