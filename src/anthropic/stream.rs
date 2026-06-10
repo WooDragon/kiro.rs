@@ -1254,7 +1254,7 @@ impl StreamContext {
         if let Some(marker) = self.tool_call_leak_marker
             && !self.state_manager.has_tool_use()
         {
-            if self.state_manager.stop_reason.is_none() {
+            if self.state_manager.get_stop_reason() == "end_turn" {
                 self.state_manager.set_stop_reason("max_tokens");
             }
             tracing::warn!(
@@ -2606,6 +2606,7 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         ctx.process_assistant_response("文本里讨论了 <invoke name=\"X\"> 的语法");
         ctx.state_manager.set_has_tool_use(true);
+        ctx.generate_final_events();
         assert!(
             !(ctx.tool_call_leak_marker.is_some() && !ctx.state_manager.has_tool_use()),
             "has_tool_use=true 时不应满足告警条件"
