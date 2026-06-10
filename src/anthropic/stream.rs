@@ -16,6 +16,27 @@ use super::prompt_cache::{
     decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
 
+/// #43 上游 opus-4-8 偶发把 Claude 内部工具调用协议明文（`<invoke name="...">` /
+/// `<function_calls>`）当普通文本吐进 assistantResponseEvent，而非走结构化 tool_use 通道，
+/// 导致 CC 屏幕"突然停止 + call 字样"、用户被迫「继续」。
+///
+/// 本函数仅做**可观测检测**（命中返回标记字面），不改任何透传行为、不改 stop_reason。
+/// 误报收敛由调用方组合 `!has_tool_use`（真退化时模型没走结构化通道）完成。
+///
+/// 最长标记 `<function_calls>` = 16 字节，流式滑动窗口保留 15 字符即可覆盖跨 chunk 截断。
+const TOOL_CALL_LEAK_MARKERS: [&str; 2] = ["<invoke name=\"", "<function_calls>"];
+
+/// 滑动窗口需保留的字符数：max(markers.len()) - 1，覆盖跨 chunk 截断的最坏情况。
+const TOOL_CALL_LEAK_TAIL_CHARS: usize = 15;
+
+/// 检测文本中是否含工具调用 XML 明文标记，命中返回该标记字面，否则 None。
+pub(crate) fn detect_text_tool_call_leak(text: &str) -> Option<&'static str> {
+    TOOL_CALL_LEAK_MARKERS
+        .iter()
+        .find(|m| text.contains(**m))
+        .copied()
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -329,6 +350,11 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
+    /// 本轮是否产生过结构化 tool_use（用于 #43 文本化工具调用泄漏检测的误报收敛）
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
+    }
+
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         self.stop_reason = Some(reason.into());
@@ -554,6 +580,11 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// #43 文本化工具调用泄漏检测：O(1) 滑动窗口，仅保留最近 TOOL_CALL_LEAK_TAIL_CHARS 个字符，
+    /// 用于覆盖标记跨 chunk 截断的情况。不做全量缓冲（本服务是流式代理，禁止驻留整段响应）。
+    tool_call_leak_tail: String,
+    /// 命中的工具调用明文标记字面（命中后置位，后续 chunk 短路跳过检测）。
+    tool_call_leak_marker: Option<&'static str>,
 }
 
 impl StreamContext {
@@ -590,6 +621,8 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            tool_call_leak_tail: String::new(),
+            tool_call_leak_marker: None,
         }
     }
 
@@ -749,6 +782,9 @@ impl StreamContext {
             return Vec::new();
         }
 
+        // #43 文本化工具调用泄漏检测（O(1) 滑动窗口，纯可观测，不改透传）
+        self.scan_tool_call_leak(content);
+
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
@@ -760,6 +796,33 @@ impl StreamContext {
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
         self.create_text_delta_events(content)
+    }
+
+    /// #43 滑动窗口扫描工具调用明文泄漏。命中后短路（marker 已置位则不再做任何拼接/检测/截断，
+    /// 避免在流剩余几千 token 上做无用功）。窗口仅保留最近 TOOL_CALL_LEAK_TAIL_CHARS 个字符，
+    /// 按 UTF-8 字符边界安全截断，内存 O(1)。
+    fn scan_tool_call_leak(&mut self, content: &str) {
+        if self.tool_call_leak_marker.is_some() {
+            return;
+        }
+        self.tool_call_leak_tail.push_str(content);
+        if let Some(m) = detect_text_tool_call_leak(&self.tool_call_leak_tail) {
+            self.tool_call_leak_marker = Some(m);
+            self.tool_call_leak_tail.clear();
+            return;
+        }
+        // 仅保留最后 TOOL_CALL_LEAK_TAIL_CHARS 个字符，覆盖跨 chunk 截断的标记
+        let char_count = self.tool_call_leak_tail.chars().count();
+        if char_count > TOOL_CALL_LEAK_TAIL_CHARS {
+            let skip = char_count - TOOL_CALL_LEAK_TAIL_CHARS;
+            let byte_start = self
+                .tool_call_leak_tail
+                .char_indices()
+                .nth(skip)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.tool_call_leak_tail.drain(..byte_start);
+        }
     }
 
     /// 处理包含thinking块的内容
@@ -1185,6 +1248,21 @@ impl StreamContext {
 
         let final_input_tokens = self.final_input_tokens();
         let final_output_tokens = self.final_output_tokens();
+
+        // #43 上游 opus-4-8 偶发把工具调用 XML 当纯文本吐出：命中明文标记且本轮无结构化 tool_use
+        // → 记 warn（info 级即可见，不依赖 debug）。纯可观测，不改透传/stop_reason；不打印文本内容本身。
+        if let Some(marker) = self.tool_call_leak_marker
+            && !self.state_manager.has_tool_use()
+        {
+            tracing::warn!(
+                "检测到工具调用明文泄漏(#43): marker={:?} model={} message_id={} output_tokens={} stop_reason={}",
+                marker,
+                self.model,
+                self.message_id,
+                final_output_tokens,
+                self.state_manager.get_stop_reason()
+            );
+        }
 
         self.update_prompt_cache();
 
@@ -2427,6 +2505,102 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    // ===== #43 工具调用明文泄漏检测 =====
+
+    #[test]
+    fn test_detect_tool_call_leak_positive() {
+        // 正例：含 <invoke name=" 命中
+        assert_eq!(
+            detect_text_tool_call_leak("进第12轮验证。\n\ncall\n<invoke name=\"Bash\">\n"),
+            Some("<invoke name=\"")
+        );
+        // 正例：含 <function_calls> 命中
+        assert_eq!(
+            detect_text_tool_call_leak("foo<function_calls>bar"),
+            Some("<function_calls>")
+        );
+    }
+
+    #[test]
+    fn test_detect_tool_call_leak_negative() {
+        // 反例：正常文本含 call/function/parameter 单词不命中
+        assert_eq!(detect_text_tool_call_leak("call the function please"), None);
+        assert_eq!(
+            detect_text_tool_call_leak("参数 parameter 的说明如下"),
+            None
+        );
+        assert_eq!(detect_text_tool_call_leak("我们来 invoke 这个工具"), None);
+        assert_eq!(detect_text_tool_call_leak(""), None);
+    }
+
+    #[test]
+    fn test_leak_sliding_window_cross_chunk() {
+        // 标记 `<invoke name="` 跨 chunk 边界切断，滑动窗口拼接后仍应命中
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.process_assistant_response("一些前置正常文本，长到足以触发窗口截断的内容……<inv");
+        assert!(ctx.tool_call_leak_marker.is_none(), "半截标记不应误命中");
+        ctx.process_assistant_response("oke name=\"Bash\">");
+        assert_eq!(
+            ctx.tool_call_leak_marker,
+            Some("<invoke name=\""),
+            "跨 chunk 拼接后应命中"
+        );
+    }
+
+    #[test]
+    fn test_leak_window_is_bounded() {
+        // 滑动窗口内存 O(1)：喂入大量无标记文本后，tail 长度不超过窗口上限
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        for _ in 0..1000 {
+            ctx.process_assistant_response("这是一段没有任何工具调用标记的普通长文本内容。");
+        }
+        assert!(ctx.tool_call_leak_marker.is_none());
+        assert!(
+            ctx.tool_call_leak_tail.chars().count() <= TOOL_CALL_LEAK_TAIL_CHARS,
+            "窗口字符数应被限制在 {} 以内，实际 {}",
+            TOOL_CALL_LEAK_TAIL_CHARS,
+            ctx.tool_call_leak_tail.chars().count()
+        );
+    }
+
+    #[test]
+    fn test_leak_short_circuit_after_hit() {
+        // 命中后短路：marker 已置位则后续 chunk 不再拼接（tail 保持清空）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.process_assistant_response("<invoke name=\"Bash\">");
+        assert_eq!(ctx.tool_call_leak_marker, Some("<invoke name=\""));
+        assert!(ctx.tool_call_leak_tail.is_empty());
+        ctx.process_assistant_response("后续还有很多文本但不应再被拼接进窗口");
+        assert!(
+            ctx.tool_call_leak_tail.is_empty(),
+            "命中后窗口应保持清空（短路）"
+        );
+    }
+
+    #[test]
+    fn test_leak_warn_only_when_no_tool_use() {
+        // 集成：文本含 invoke 标签 + 无结构化 tool_use → 命中告警条件
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.process_assistant_response("分析完成。\n\ncall\n<invoke name=\"Bash\">\ncmd</invoke>");
+        ctx.generate_final_events();
+        assert!(
+            ctx.tool_call_leak_marker.is_some() && !ctx.state_manager.has_tool_use(),
+            "应满足告警条件：marker 命中且无 tool_use"
+        );
+    }
+
+    #[test]
+    fn test_leak_no_warn_when_real_tool_use() {
+        // 回归：真结构化 tool_use 在场时，即便文本恰含 invoke 标签也不告警（不误报）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.process_assistant_response("文本里讨论了 <invoke name=\"X\"> 的语法");
+        ctx.state_manager.set_has_tool_use(true);
+        assert!(
+            !(ctx.tool_call_leak_marker.is_some() && !ctx.state_manager.has_tool_use()),
+            "has_tool_use=true 时不应满足告警条件"
         );
     }
 }
