@@ -203,6 +203,11 @@ pub struct ConversionResult {
     pub tool_name_map: HashMap<String, String>,
     /// 推理配置
     pub inference_config: Option<crate::kiro::model::requests::kiro::InferenceConfig>,
+    /// 稳定会话 ID：客户端显式传入的 session UUID（从 metadata.user_id 提取）。
+    /// Some = 客户端确实给了稳定 session_id（可作为跨凭据缓存分桶键）；
+    /// None = 无稳定 ID（随机兜底路径），此时缓存应退回 credential_id 分桶。
+    /// ⚠️ 绝不能把随机 Uuid::new_v4() 当作此字段的值——每次请求新 UUID 等于每次新桶，永远 miss。
+    pub stable_conversation_id: Option<String>,
 }
 
 /// 转换错误
@@ -320,12 +325,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
+    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId。
+    // stable_conversation_id 只在客户端确实传了 session_id 时为 Some；
+    // 随机兜底 UUID 仅用于 Kiro 上游请求，不透出给缓存分桶——每请求新 UUID 等于每次新桶，永远 miss。
+    let stable_conversation_id: Option<String> = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
+        .and_then(|user_id| extract_session_id(user_id));
+    let conversation_id = stable_conversation_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
@@ -422,6 +431,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         conversation_state,
         tool_name_map,
         inference_config,
+        stable_conversation_id,
     })
 }
 
@@ -734,10 +744,16 @@ fn convert_tools(
                 description.push_str(suffix);
             }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let mut description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
+            // 限制描述长度为 10000 字符（安全截断 UTF-8）。
+            // fast-path：字节数 <= 10000 时字符数必 <= 10000（UTF-8 每字符 >= 1 字节），
+            // 直接跳过 O(N) 字符边界迭代——正常工具描述远短于此，热点通路省迭代。
+            let mut description = if description.len() > 10000 {
+                match description.char_indices().nth(10000) {
+                    Some((idx, _)) => description[..idx].to_string(),
+                    None => description,
+                }
+            } else {
+                description
             };
 
             // 空 description 兜底：上游 Kiro/Bedrock 的 toolSpecification.description
@@ -1409,6 +1425,58 @@ mod tests {
             );
             assert_eq!(desc, &format!("Tool: {}", name));
         }
+    }
+
+    /// #46 边界：超长工具名 + 空 description 组合——占位须用缩短后的 mapped_name，
+    /// 与 tool_specification.name 严格一致，不能用原始长名。
+    #[test]
+    fn test_convert_tools_empty_description_long_name_uses_mapped_name() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let long_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        assert!(long_name.len() > TOOL_NAME_MAX_LEN);
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: None,
+            stream: true,
+            tools: Some(vec![AnthropicTool {
+                name: long_name.to_string(),
+                description: String::new(), // 空 description
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        let spec = &tools[0].tool_specification;
+        // 占位文本中的名字必须与落地的 name 字段一致（均为缩短后的短名）
+        assert_eq!(spec.description, format!("Tool: {}", spec.name));
+        assert!(spec.name.len() <= TOOL_NAME_MAX_LEN);
+        assert!(!spec.description.trim().is_empty());
     }
 
     /// #46 反向：非空 description 不应被改写（占位逻辑不得误伤正常工具）。
