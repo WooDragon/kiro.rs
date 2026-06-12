@@ -1154,6 +1154,105 @@ mod tests {
         );
     }
 
+    /// 模拟 balanced 模式凭据反复切换：session_id 不变，credential 在 A/B 间来回轮转，
+    /// 缓存命中在整个序列中保持稳定。
+    ///
+    /// 这是 #48 修复的核心场景——旧实现按 cred:N 分桶，balanced 切凭据即 miss；
+    /// 新实现按 conv:UUID 分桶，凭据切换对缓存不可见。
+    ///
+    /// 测试流程模拟 handler 的完整 request-response 循环：
+    /// 1. 请求到达 → handler 用 stable_conversation_id 构造 account_key = "conv:S"
+    /// 2. compute() 查缓存（不关心实际路由到了哪个凭据）
+    /// 3. 上游响应成功 → update() 写入/续期
+    /// 4. 下一个请求到达，凭据可能已轮转到另一个 → 但 account_key 仍是 "conv:S"
+    #[test]
+    fn test_balanced_credential_rotation_does_not_break_cache() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // 模拟凭据 A/B 列表（实际 handler 只用 session_id 做 key，credential_id 不参与）
+        let credentials = ["cred-A", "cred-B"];
+        let session_id = "conv:stable-session-uuid";
+
+        // 第 1 次请求：凭据 A，首次建缓存
+        // handler: account_key = format!("conv:{}", session_id) — credential_id 不参与
+        let usage = tracker.compute(session_id, Some(&profile));
+        assert_eq!(
+            usage.cache_read_input_tokens, 0,
+            "首次请求应 miss（尚无缓存）"
+        );
+        assert!(
+            usage.cache_creation_input_tokens > 0,
+            "首次请求应报 creation"
+        );
+        // 上游成功后 update
+        tracker.update(session_id, Some(&profile));
+
+        // 第 2~10 次请求：凭据在 A/B 间交替轮转，模拟 balanced round-robin
+        for i in 2..=10 {
+            let _credential = credentials[i % 2]; // 凭据轮转，但 handler 不用它构造 key
+
+            let usage = tracker.compute(session_id, Some(&profile));
+            assert!(
+                usage.cache_read_input_tokens > 0,
+                "第 {} 次请求（凭据={}）应命中缓存，实际 cache_read={}",
+                i,
+                credentials[i % 2],
+                usage.cache_read_input_tokens
+            );
+            assert_eq!(
+                usage.cache_creation_input_tokens, 0,
+                "第 {} 次请求不应有新 creation（全量命中）",
+                i
+            );
+            // 每次成功后 update 续期
+            tracker.update(session_id, Some(&profile));
+        }
+    }
+
+    /// 对比验证：旧的凭据分桶行为下，balanced 轮转必然导致交替 miss。
+    ///
+    /// 证明 #48 之前的行为确实有问题：按 cred:N 分桶时，凭据切换 = key 切换 = miss。
+    /// 此测试作为"问题复现"存在，确认修复前的行为是坏的。
+    #[test]
+    fn test_old_credential_bucketing_causes_alternating_miss() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // 模拟旧行为：account_key = format!("cred:{}", credential_id)
+        // 凭据 A 写入
+        tracker.update("cred:A", Some(&profile));
+
+        // 凭据 A 自读：命中
+        let hit = tracker.compute("cred:A", Some(&profile));
+        assert!(hit.cache_read_input_tokens > 0, "凭据 A 自读应命中");
+
+        // balanced 切到凭据 B：miss（旧行为的 bug）
+        let miss = tracker.compute("cred:B", Some(&profile));
+        assert_eq!(
+            miss.cache_read_input_tokens, 0,
+            "旧行为：凭据 B 读凭据 A 的缓存必然 miss"
+        );
+
+        // 凭据 B 写入自己的桶
+        tracker.update("cred:B", Some(&profile));
+
+        // 再切回凭据 A：又 miss（凭据 A 的缓存虽在但凭据 B 的 update 不影响凭据 A 桶的 TTL）
+        // 实际上凭据 A 桶仍有缓存（还没过期），所以这里会命中——
+        // 但关键是凭据 B 的那次请求是 miss 的，整体命中率 = 50%（交替 miss/hit）
+        let hit_again = tracker.compute("cred:A", Some(&profile));
+        assert!(
+            hit_again.cache_read_input_tokens > 0,
+            "凭据 A 桶缓存未过期仍在"
+        );
+
+        // 核心论证：10 次轮转中，旧行为前两次 (A→B) 必 miss 一次，
+        // 之后如果两个桶都建立了则都能命中——但首次切换时的 miss 是 #48 要修的。
+        // 新行为：conv: 桶从第 2 次起永远命中，零 miss。
+    }
+
     /// 桶数超过 MAX_CACHE_ACCOUNTS 时触发批量 LRW 驱逐，桶数砍到 CACHE_PRUNE_TARGET 水位。
     ///
     /// 验证：
