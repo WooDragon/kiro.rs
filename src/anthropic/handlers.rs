@@ -325,8 +325,9 @@ pub async fn post_messages(
         }
     };
 
-    // 先取出 tool_name_map（后续透传给流式/非流式处理器），再构建并序列化请求体
+    // 先取出 tool_name_map 和 stable_conversation_id（后续透传给流式/非流式处理器），再构建并序列化请求体
     let tool_name_map = conversion_result.tool_name_map;
+    let stable_conversation_id = conversion_result.stable_conversation_id;
 
     // 构建 Kiro 请求体（profile_arn 由 provider 层注入）
     let request_body = match finalize_request_body(
@@ -377,6 +378,7 @@ pub async fn post_messages(
             state.prompt_cache_mode,
             state.prompt_cache.clone(),
             cache_profile,
+            stable_conversation_id,
         )
         .await
     } else {
@@ -392,6 +394,7 @@ pub async fn post_messages(
             state.prompt_cache_mode,
             state.prompt_cache.clone(),
             cache_profile,
+            stable_conversation_id,
         )
         .await
     }
@@ -424,6 +427,7 @@ async fn handle_stream_request(
     prompt_cache_mode: PromptCacheMode,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    stable_conversation_id: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_stream_with_context(request_body).await {
@@ -431,7 +435,13 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    let account_key = api_response.credential_id.to_string();
+    // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
+    // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
+    // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    let account_key = match stable_conversation_id {
+        Some(ref id) => format!("conv:{}", id),
+        None => format!("cred:{}", api_response.credential_id),
+    };
     let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 创建流处理上下文
@@ -588,6 +598,7 @@ async fn handle_non_stream_request(
     prompt_cache_mode: PromptCacheMode,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    stable_conversation_id: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_with_context(request_body).await {
@@ -595,7 +606,13 @@ async fn handle_non_stream_request(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    let account_key = api_response.credential_id.to_string();
+    // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
+    // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
+    // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    let account_key = match stable_conversation_id {
+        Some(ref id) => format!("conv:{}", id),
+        None => format!("cred:{}", api_response.credential_id),
+    };
     let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 读取响应体
@@ -998,8 +1015,9 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 先取出 tool_name_map（后续透传给流式/非流式处理器），再构建并序列化请求体
+    // 先取出 tool_name_map 和 stable_conversation_id（后续透传给流式/非流式处理器），再构建并序列化请求体
     let tool_name_map = conversion_result.tool_name_map;
+    let stable_conversation_id = conversion_result.stable_conversation_id;
 
     // 构建 Kiro 请求体（profile_arn 由 provider 层注入）
     let request_body = match finalize_request_body(
@@ -1051,6 +1069,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache_mode,
                     state.prompt_cache.clone(),
                     cache_profile,
+                    stable_conversation_id,
                 )
                 .await
             }
@@ -1065,6 +1084,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache_mode,
                     state.prompt_cache.clone(),
                     cache_profile,
+                    stable_conversation_id,
                 )
                 .await
             }
@@ -1079,6 +1099,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache_mode,
                     state.prompt_cache.clone(),
                     cache_profile,
+                    stable_conversation_id,
                 )
                 .await
             }
@@ -1096,6 +1117,7 @@ pub async fn post_messages_cc(
             state.prompt_cache_mode,
             state.prompt_cache.clone(),
             cache_profile,
+            stable_conversation_id,
         )
         .await
     }
@@ -1113,13 +1135,20 @@ async fn handle_stream_request_prefix_buffered(
     prompt_cache_mode: PromptCacheMode,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    stable_conversation_id: Option<String>,
 ) -> Response {
     let api_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    let account_key = api_response.credential_id.to_string();
+    // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
+    // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
+    // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    let account_key = match stable_conversation_id {
+        Some(ref id) => format!("conv:{}", id),
+        None => format!("cred:{}", api_response.credential_id),
+    };
     let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     let ctx = PrefixBufferedStreamContext::new(
@@ -1258,6 +1287,7 @@ async fn handle_stream_request_buffered(
     prompt_cache_mode: PromptCacheMode,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    stable_conversation_id: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_stream_with_context(request_body).await {
@@ -1265,7 +1295,13 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    let account_key = api_response.credential_id.to_string();
+    // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
+    // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
+    // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    let account_key = match stable_conversation_id {
+        Some(ref id) => format!("conv:{}", id),
+        None => format!("cred:{}", api_response.credential_id),
+    };
     let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
 
     // 创建缓冲流处理上下文

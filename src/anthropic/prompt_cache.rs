@@ -2,6 +2,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// 缓存桶容量上限，对齐 sticky session 的 MAX_STICKY_SESSIONS。
+/// 桶维度从凭据数（几个）换为会话数（可能上万）后必须加上限防内存膨胀。
+const MAX_CACHE_ACCOUNTS: usize = 10_000;
+
+/// 批量驱逐目标水位：超限时砍到 80%，一次摊销 ~20% 的桶。
+/// 批量驱逐让 N 次插入才触发一次 O(N) 排序，摊销回 O(1) 插入代价。
+const CACHE_PRUNE_TARGET: usize = MAX_CACHE_ACCOUNTS * 4 / 5; // 8_000，整数算术避免浮点
+
+/// 全量 TTL 扫描的节流间隔，对齐 STICKY_SESSION_PRUNE_INTERVAL。
+const CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -50,9 +61,39 @@ struct PromptCacheEntry {
     expires_at: Instant,
 }
 
+/// 单个账号/会话的缓存桶。
+///
+/// `last_touched` 仅在 `update`（写入）时刷新，`compute`（纯读）不刷新。
+/// 这是 **LRW（Least Recently Written）** 策略而非真正的 LRU：
+/// - 写即保活：正常每请求必然 update，活跃会话会持续刷新 last_touched。
+/// - 读不改状态：避免只读路径持有写锁时发生争用。
+/// - 已知折中：纯读命中的长会话（只读不写）在桶数超限时可能因 last_touched
+///   较旧被过早驱逐；实际场景中 update 与 compute 总是配对，此折中可接受。
+#[derive(Debug)]
+struct AccountBucket {
+    entries: HashMap<[u8; 32], PromptCacheEntry>,
+    last_touched: Instant,
+}
+
+impl AccountBucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_touched: now,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PromptCacheTracker {
-    entries_by_account: Mutex<HashMap<String, HashMap<[u8; 32], PromptCacheEntry>>>,
+    entries_by_account: Mutex<HashMap<String, AccountBucket>>,
+    /// 上次执行全量 TTL 扫描的时刻，用于节流 prune_expired。
+    ///
+    /// 锁顺序约定：`last_prune_at` 只能在已持有 `entries_by_account` 锁期间访问
+    /// （目前仅 `maybe_prune_expired` 一处，且总在持 entries 锁时调用）。
+    /// 新增访问点必须遵守此顺序，禁止先锁 last_prune_at 再锁 entries_by_account，
+    /// 否则会与 compute/update 形成 ABBA 死锁。
+    last_prune_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,9 +192,9 @@ impl PromptCacheTracker {
             .entries_by_account
             .lock()
             .expect("prompt cache lock poisoned");
-        prune_expired(&mut entries_by_account, now);
+        maybe_prune_expired(&mut entries_by_account, &self.last_prune_at, now);
 
-        let Some(entries) = entries_by_account.get_mut(account_key) else {
+        let Some(bucket) = entries_by_account.get_mut(account_key) else {
             let effective_creation = if last_tokens >= min_tokens {
                 last_tokens
             } else {
@@ -178,7 +219,7 @@ impl PromptCacheTracker {
             if breakpoint.cumulative_tokens < min_tokens {
                 continue;
             }
-            let Some(entry) = entries.get_mut(&breakpoint.fingerprint) else {
+            let Some(entry) = bucket.entries.get_mut(&breakpoint.fingerprint) else {
                 continue;
             };
             if entry.expires_at <= now {
@@ -215,16 +256,18 @@ impl PromptCacheTracker {
             .entries_by_account
             .lock()
             .expect("prompt cache lock poisoned");
-        prune_expired(&mut entries_by_account, now);
+        maybe_prune_expired(&mut entries_by_account, &self.last_prune_at, now);
 
-        let entries = entries_by_account
+        // 写入时刷新 last_touched（LRW 策略：写即保活）。
+        let bucket = entries_by_account
             .entry(account_key.to_string())
-            .or_default();
+            .or_insert_with(|| AccountBucket::new(now));
+        bucket.last_touched = now;
         for breakpoint in &profile.breakpoints {
             if breakpoint.cumulative_tokens < min_tokens {
                 continue;
             }
-            entries.insert(
+            bucket.entries.insert(
                 breakpoint.fingerprint,
                 PromptCacheEntry {
                     expires_at: now + breakpoint.ttl,
@@ -616,14 +659,53 @@ fn compute_ttl_breakdown(profile: &PromptCacheProfile, matched_tokens: i32) -> (
     (cache_5m, cache_1h)
 }
 
-fn prune_expired(
-    entries_by_account: &mut HashMap<String, HashMap<[u8; 32], PromptCacheEntry>>,
+/// 节流的缓存清理入口，每次 compute/update 调用。
+///
+/// 节流逻辑（对齐 token_manager.rs 的 maybe_prune_sticky_sessions）：
+/// - 距上次全量扫描 < CACHE_PRUNE_INTERVAL：仅做超限批量驱逐，跳过 TTL 全扫。
+/// - 距上次全量扫描 >= CACHE_PRUNE_INTERVAL 或首次调用：执行完整 prune（TTL + 驱逐）。
+fn maybe_prune_expired(
+    entries_by_account: &mut HashMap<String, AccountBucket>,
+    last_prune_at: &Mutex<Option<Instant>>,
     now: Instant,
 ) {
-    entries_by_account.retain(|_, entries| {
-        entries.retain(|_, entry| entry.expires_at > now);
-        !entries.is_empty()
-    });
+    let should_ttl_scan = {
+        let last = last_prune_at.lock().expect("last_prune_at lock poisoned");
+        last.map(|t| now.duration_since(t) >= CACHE_PRUNE_INTERVAL)
+            .unwrap_or(true)
+    };
+
+    if should_ttl_scan {
+        // 全量 TTL 清理：清空过期指纹，删除空桶。
+        entries_by_account.retain(|_, bucket| {
+            bucket.entries.retain(|_, entry| entry.expires_at > now);
+            !bucket.entries.is_empty()
+        });
+        *last_prune_at.lock().expect("last_prune_at lock poisoned") = Some(now);
+    }
+
+    // 批量 LRW 驱逐：仅当桶数超限才触发，一次砍到目标水位。
+    //
+    // 策略说明：这是 LRW（Least Recently Written）而非真 LRU——
+    // 按 last_touched（最后写入时刻）升序排列，踢掉最久未写入的桶。
+    // compute（纯读）不更新 last_touched，因此纯读命中的长会话在桶超限时
+    // 可能被过早驱逐——这是已知折中，实际场景中 update 与 compute 配对出现，影响可接受。
+    //
+    // 批量摊销：N 次插入才触发一次 O(N) 排序，单次插入摊销代价为 O(1)。
+    // 绝不能"每次超限只踢最老一个"——那会让每次插入都是 O(N) 扫描（写放大）。
+    if entries_by_account.len() > MAX_CACHE_ACCOUNTS {
+        let mut keys: Vec<_> = entries_by_account
+            .iter()
+            .map(|(k, bucket)| (k.clone(), bucket.last_touched))
+            .collect();
+        // 按 last_touched 升序：最旧的排前面，优先驱逐。
+        keys.sort_by_key(|(_, touched)| *touched);
+
+        let remove_count = entries_by_account.len().saturating_sub(CACHE_PRUNE_TARGET);
+        for (key, _) in keys.into_iter().take(remove_count) {
+            entries_by_account.remove(&key);
+        }
+    }
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
@@ -922,7 +1004,7 @@ mod tests {
             let entries_by_account = tracker.entries_by_account.lock().unwrap();
             entries_by_account
                 .get("account")
-                .and_then(|entries| entries.get(&fingerprint))
+                .and_then(|bucket| bucket.entries.get(&fingerprint))
                 .map(|entry| entry.expires_at)
                 .unwrap()
         };
@@ -934,7 +1016,7 @@ mod tests {
             let entries_by_account = tracker.entries_by_account.lock().unwrap();
             entries_by_account
                 .get("account")
-                .and_then(|entries| entries.get(&fingerprint))
+                .and_then(|bucket| bucket.entries.get(&fingerprint))
                 .map(|entry| entry.expires_at)
                 .unwrap()
         };
@@ -958,6 +1040,189 @@ mod tests {
         assert_eq!(
             min_cacheable_tokens_for_model("claude-sonnet-4-5"),
             DEFAULT_MIN_CACHEABLE_TOKENS
+        );
+    }
+
+    /// 构造含 cache_control 标记的最小请求，确保 build_profile 能拿到 breakpoints。
+    fn make_cacheable_req(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(long_text()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: long_text(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        }
+    }
+
+    /// 同一 account_key（模拟 "conv:S"）下，用 update 写入后再 compute 仍命中。
+    ///
+    /// 验证核心语义：只要 account_key 不变，凭据信息根本不进 key，
+    /// 换凭据（凭据 A → 凭据 B）不会丢失缓存命中。
+    /// 对比：用不同 key（"cred:A" vs "cred:B"）写入后读取必然 miss，
+    /// 证明旧的凭据分桶行为才会导致跨凭据 miss。
+    #[test]
+    fn test_fallback_credential_preserves_cache_hit() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // 模拟凭据 A 写入缓存，account_key 是会话维度的 "conv:S"。
+        tracker.update("conv:S", Some(&profile));
+
+        // 模拟 fallback 到凭据 B，但 account_key 仍是同一会话 "conv:S" ——应命中。
+        let hit = tracker.compute("conv:S", Some(&profile));
+        assert!(
+            hit.cache_read_input_tokens > 0,
+            "同会话 key 换凭据后应仍命中，cache_read={}",
+            hit.cache_read_input_tokens
+        );
+
+        // 对比：若 key 按凭据分桶（旧行为），凭据 A 写的缓存，凭据 B 读时 key 不同 → miss。
+        let miss = tracker.compute("cred:B", Some(&profile));
+        assert_eq!(
+            miss.cache_read_input_tokens, 0,
+            "不同 key 不应命中（旧凭据桶与新凭据桶独立）"
+        );
+    }
+
+    /// 两个不同 account_key（"conv:S1" / "conv:S2"）即使使用相同 profile，也不互相命中。
+    ///
+    /// 防止跨会话缓存串扰：S1 的缓存不能被 S2 读到。
+    #[test]
+    fn test_distinct_conversations_do_not_cross_hit() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // S1 写入缓存。
+        tracker.update("conv:S1", Some(&profile));
+
+        // S1 自读应命中。
+        let s1_hit = tracker.compute("conv:S1", Some(&profile));
+        assert!(s1_hit.cache_read_input_tokens > 0, "S1 自读应命中");
+
+        // S2 读 S1 写入的缓存：不同 key，应 miss。
+        let s2_miss = tracker.compute("conv:S2", Some(&profile));
+        assert_eq!(
+            s2_miss.cache_read_input_tokens, 0,
+            "S2 不应读到 S1 的缓存，防串扰"
+        );
+    }
+
+    /// 无稳定会话 ID 时退回 credential_id 分桶（"cred:N"），行为同现状。
+    ///
+    /// 验证兜底路径：handler 在 stable_conversation_id 为 None 时用 "cred:N" 作 key，
+    /// 该 key 作为普通桶正常写读命中，不 panic、不比现状差。
+    /// 同时验证：换凭据（cred:1 → cred:2）在兜底路径下仍会 miss（这是已知折中，
+    /// 因为无会话 ID 无法做跨凭据共享，等同旧行为，不退化）。
+    #[test]
+    fn test_no_session_id_falls_back_to_credential_bucket() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // 凭据 1 兜底桶写入后自读应命中。
+        tracker.update("cred:1", Some(&profile));
+        let hit = tracker.compute("cred:1", Some(&profile));
+        assert!(
+            hit.cache_read_input_tokens > 0,
+            "兜底 cred 桶自读应命中，cache_read={}",
+            hit.cache_read_input_tokens
+        );
+
+        // 换到凭据 2 兜底桶：无会话 ID 时无法跨凭据共享，miss 属已知折中（等同旧行为）。
+        let miss = tracker.compute("cred:2", Some(&profile));
+        assert_eq!(
+            miss.cache_read_input_tokens, 0,
+            "无会话 ID 兜底路径换凭据 miss，等同旧行为不退化"
+        );
+    }
+
+    /// 桶数超过 MAX_CACHE_ACCOUNTS 时触发批量 LRW 驱逐，桶数砍到 CACHE_PRUNE_TARGET 水位。
+    ///
+    /// 验证：
+    /// 1. 驱逐后桶数 <= CACHE_PRUNE_TARGET。
+    /// 2. 最近写入（last_touched 最新）的桶保留。
+    /// 3. 最早写入（last_touched 最旧）的桶被驱逐。
+    ///
+    /// 实现方式：直接向 entries_by_account 注入带有不同 last_touched 的桶，
+    /// 然后调用 maybe_prune_expired 触发驱逐逻辑，不依赖实际 TTL 过期。
+    #[test]
+    fn test_cache_bucket_lru_eviction() {
+        let tracker = PromptCacheTracker::default();
+        let req = make_cacheable_req("claude-sonnet-4-5");
+        let profile = tracker.build_profile(&req, 3000).unwrap();
+
+        // 构造超过上限的桶数：注入 MAX_CACHE_ACCOUNTS + 10 个桶。
+        // 前 10 个桶 last_touched 最旧（应被驱逐），后续桶 last_touched 更新（应保留）。
+        let overflow_count = MAX_CACHE_ACCOUNTS + 10;
+        {
+            let mut map = tracker.entries_by_account.lock().unwrap();
+            let base = Instant::now();
+            for i in 0..overflow_count {
+                // 越早的 key（i 越小）last_touched 越旧，越应被驱逐。
+                let last_touched = base + Duration::from_secs(i as u64);
+                let mut bucket = AccountBucket::new(last_touched);
+                // 插入一条未过期指纹，让桶不会因 TTL 清理而被删除。
+                for bp in &profile.breakpoints {
+                    bucket.entries.insert(
+                        bp.fingerprint,
+                        PromptCacheEntry {
+                            expires_at: last_touched + Duration::from_secs(3600),
+                        },
+                    );
+                }
+                map.insert(format!("conv:evict-test-{}", i), bucket);
+            }
+        }
+
+        // 触发 prune：由于节流间隔，这里手动调用底层函数。
+        {
+            let mut map = tracker.entries_by_account.lock().unwrap();
+            let now = Instant::now();
+            // 直接调用 maybe_prune_expired（跳过节流，因为 last_prune_at 为 None）。
+            maybe_prune_expired(&mut map, &tracker.last_prune_at, now);
+        }
+
+        let map = tracker.entries_by_account.lock().unwrap();
+        let final_count = map.len();
+
+        // 驱逐后桶数应 <= CACHE_PRUNE_TARGET（8_000）。
+        assert!(
+            final_count <= CACHE_PRUNE_TARGET,
+            "驱逐后桶数应 <= CACHE_PRUNE_TARGET({})，实际={}",
+            CACHE_PRUNE_TARGET,
+            final_count
+        );
+
+        // 最旧的桶（conv:evict-test-0 ~ conv:evict-test-9）应被驱逐。
+        for i in 0..10 {
+            let key = format!("conv:evict-test-{}", i);
+            assert!(!map.contains_key(&key), "最旧桶 {} 应被驱逐", key);
+        }
+
+        // 最新写入的桶（conv:evict-test-(overflow_count-1)）应保留。
+        let newest_key = format!("conv:evict-test-{}", overflow_count - 1);
+        assert!(
+            map.contains_key(&newest_key),
+            "最新桶 {} 应保留",
+            newest_key
         );
     }
 }
