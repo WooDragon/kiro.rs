@@ -61,6 +61,7 @@ repo 内不保留 `docs/` 目录，所有设计文档、实现细节归私有侧
 - 请求转换流程：Anthropic 格式 → build_history → validate_tool_pairing / remove_orphaned（配对校验）→ 发送
 - prompt cache 是纯本地模拟（进程内 HashMap），从不向 Kiro 透传 cache_control
 - 空 tool_result 统一替换为占位文本，不发空串
+- 空 tool description 在 `convert_tools` 出口兜底填 `Tool: {name}` 占位——Anthropic 原生 description 对自定义工具是 optional（空串合法），但上游 Kiro/Bedrock `toolSpecification.description` 硬约束 length>=1，空串 400 拒整个请求；不删字段（缺失=length 0 同样拒）、不删工具（历史 tool_use 落单撞 validate_tool_pairing）；占位非空白避免诱导退化（#46）
 - 历史保留结构化 toolUses/toolResults，纯 tool_use 轮 content 留空串——绝不注入空格占位空壳轮（会诱导模型只回空格/句号，CC 长会话死循环根因，#26）
 - 转换层引入降级/裁剪/占位/改写前须黑盒实测背书，禁止基于推断（#26）
 - 业务长响应（generateAssistantResponse 流式/非流式）走 idle/read 超时（930s，>ALB 900），不设全局总超时——上游在吐字节就不超时；短请求（MCP/WebSearch/oauth/count_tokens）保留 total 死线，与业务 client 按 ClientKind 解耦防 Slowloris（#31）
