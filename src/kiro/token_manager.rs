@@ -776,13 +776,26 @@ impl MultiTokenManager {
 
         let mut sessions = self.sticky_sessions.lock();
         self.maybe_prune_sticky_sessions(&mut sessions);
-        sessions.insert(
-            session_id.to_string(),
-            StickySessionEntry {
-                credential_id,
-                last_used_at: Instant::now(),
-            },
-        );
+
+        if let Some(entry) = sessions.get_mut(session_id) {
+            // 已绑定，仅刷新 last_used_at 保活，绝不覆盖 credential_id。
+            // 两种情形走此分支：①命中自己（正常保活）；②本次因 fallback 用了别的凭据
+            // （重试漂移）——此时也只刷新时间、不改绑定，正是为防止漂移覆盖。
+            // 不变量：bind 永不改写已存在 entry 的 credential_id；
+            // credential_id 变更只能由"凭据真失效 → clear → 下次首绑"完成。
+            // 热路径零 String 堆分配。
+            entry.last_used_at = Instant::now();
+        } else {
+            // 首次绑定：写入新 entry
+            sessions.insert(
+                session_id.to_string(),
+                StickySessionEntry {
+                    credential_id,
+                    last_used_at: Instant::now(),
+                },
+            );
+        }
+
         if sessions.len() > MAX_STICKY_SESSIONS {
             Self::prune_sticky_sessions(&mut sessions);
         }
@@ -972,7 +985,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, sticky_hit) = {
+            let (id, credentials, _sticky_hit) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 let sticky_hit = if is_balanced {
@@ -997,9 +1010,9 @@ impl MultiTokenManager {
                             (reserved_id, reserved_credentials, true)
                         }
                         None => {
-                            if let Some(session_id) = session_id {
-                                self.clear_sticky_session_if_matches(session_id, hit_id);
-                            }
+                            // sticky 命中但 reserve 失败（窄竞态：选择到 reserve 之间凭据被禁用）。
+                            // 不清 sticky：凭据禁用时 report_quota_exhausted / report_refresh_failure
+                            // 会调 clear_sticky_sessions_for_credential 批量清，acquire 路径不做 clear。
                             let mut best =
                                 self.select_next_credential_excluding(model, excluded_ids);
                             if best.is_none() {
@@ -1085,9 +1098,9 @@ impl MultiTokenManager {
                 Ok(ctx) => return Ok(ctx),
                 Err(e) => {
                     self.report_no_result(id);
-                    if sticky_hit && let Some(session_id) = session_id {
-                        self.clear_sticky_session_if_matches(session_id, id);
-                    }
+                    // token 瞬态刷新失败 ≠ 凭据真失效，不清 sticky。
+                    // 真失效（refreshToken 永久失效 / 过多失败）走 report_refresh_token_invalid /
+                    // report_refresh_failure 累计禁用，禁用时 clear_sticky_sessions_for_credential 负责清。
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -3334,5 +3347,161 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ----------------------------------------------------------------
+    // BDD: sticky 路由稳定性（Step 4 不变量验证）
+    // ----------------------------------------------------------------
+
+    /// Scenario: 重试漂移不覆盖 sticky 绑定
+    ///
+    /// Given  balanced 模式，session-A 已成功绑定到凭据 1
+    /// When   本次请求走 fallback，调 bind(session-A, 凭据 2)（模拟重试后绑回不同凭据）
+    /// Then   sticky 仍指向凭据 1（bind 永不覆盖已有 entry 的 credential_id）
+    #[test]
+    fn test_retry_drift_preserves_sticky() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 首次绑定：session 绑到凭据 1
+        manager.bind_sticky_session("session-A", 1);
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-A")
+                .map(|e| e.credential_id),
+            Some(1),
+            "首次绑定后 sticky 应指向凭据 1"
+        );
+
+        // 模拟重试漂移：fallback 用凭据 2 成功，调 bind(session-A, 2)
+        manager.bind_sticky_session("session-A", 2);
+
+        // 不变量：credential_id 绝不被覆盖，仍为 1
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-A")
+                .map(|e| e.credential_id),
+            Some(1),
+            "bind 不应覆盖已有 entry 的 credential_id（重试漂移保护）"
+        );
+    }
+
+    /// Scenario: 凭据被禁用清除 sticky 后，允许重新首绑到新凭据
+    ///
+    /// Given  session-B 已绑定到凭据 1
+    /// When   凭据 1 被禁用（report_quota_exhausted 触发 clear_sticky_sessions_for_credential）
+    /// And    再次调 bind(session-B, 凭据 2)
+    /// Then   sticky 指向凭据 2（首绑路径，clear 后视为新 entry）
+    #[test]
+    fn test_disabled_credential_allows_rebind() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 首次绑定：session 绑到凭据 1
+        manager.bind_sticky_session("session-B", 1);
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-B")
+                .map(|e| e.credential_id),
+            Some(1),
+            "首次绑定后 sticky 应指向凭据 1"
+        );
+
+        // 模拟凭据 1 真失效：report_quota_exhausted 内部调 clear_sticky_sessions_for_credential(1)
+        // 此处直接调内部清除方法验证"首绑路径"，不走完整 acquire 流程
+        manager.clear_sticky_sessions_for_credential(1);
+        assert!(
+            !manager.sticky_sessions.lock().contains_key("session-B"),
+            "凭据禁用后 sticky 应被清除"
+        );
+
+        // 清除后首次绑定到凭据 2
+        manager.bind_sticky_session("session-B", 2);
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-B")
+                .map(|e| e.credential_id),
+            Some(2),
+            "凭据真失效清除 sticky 后，应允许重新绑定到新凭据"
+        );
+    }
+
+    /// Scenario: token 刷新瞬态失败不清 sticky（acquire 路径收敛验证）
+    ///
+    /// 直接验证 bind 不变量：即使多次调用 bind(同 session, 不同 credential_id)，
+    /// 已绑定的 credential_id 也绝不被覆盖。
+    /// acquire 路径删除了 try_ensure_token 失败后的 clear，
+    /// 该行为由代码审查（clear_sticky_session_if_matches 唯一调用方为 select_sticky_credential）
+    /// + grep 确认（见交付报告）共同保证。
+    #[test]
+    fn test_token_refresh_failure_does_not_drift() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 建立初始绑定：session 绑到凭据 1
+        manager.bind_sticky_session("session-C", 1);
+
+        // 多次"重试漂移"模拟：token 刷新失败后重试可能选中任意凭据并 bind
+        for _ in 0..5 {
+            manager.bind_sticky_session("session-C", 2);
+        }
+
+        // 不变量：credential_id 永远不变
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-C")
+                .map(|e| e.credential_id),
+            Some(1),
+            "多次 bind 不同 credential_id 不应改变已绑定的 sticky（token 瞬态失败保护）"
+        );
+
+        // 补充：clear_sticky_session_if_matches 唯一调用方应为 select_sticky_credential
+        // （acquire 路径已删除两处 clear 调用，grep 确认见交付报告）
     }
 }
