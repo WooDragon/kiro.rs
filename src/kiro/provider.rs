@@ -521,7 +521,6 @@ impl KiroProvider {
                         detail: e.to_string(),
                     });
                     self.token_manager.report_no_result(ctx.id);
-                    failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -637,7 +636,6 @@ impl KiroProvider {
                     body: body.clone(),
                 });
                 self.token_manager.report_no_result(ctx.id);
-                failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }

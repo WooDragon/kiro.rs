@@ -85,7 +85,7 @@ fn map_provider_error(err: Error) -> Response {
                     "Token acquisition failed ({}/{}). Service temporarily unavailable.",
                     available, total
                 ),
-                Some(30u64),
+                Some(60u64),
             ),
             ProviderError::UpstreamClientError { status, body } => {
                 if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
@@ -1611,7 +1611,7 @@ mod tests {
         .into();
         let r = map_provider_error(err);
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response_retry_after_value(&r), Some(30));
+        assert_eq!(response_retry_after_value(&r), Some(60));
         assert_eq!(response_error_type(r).await, "overloaded_error");
     }
 
