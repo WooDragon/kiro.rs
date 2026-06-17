@@ -21,6 +21,55 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+/// Provider 层类型化错误，供 handlers 层 downcast 后映射到正确 HTTP 状态码。
+#[derive(Debug)]
+pub enum ProviderError {
+    /// 所有凭据均已禁用 — 503
+    AllCredentialsDisabled { available: usize, total: usize },
+    /// 所有凭据额度已用尽 — 429
+    AllCredentialsQuotaExhausted { detail: String },
+    /// Token 获取/刷新全部失败 — 503
+    TokenAcquisitionFailed { available: usize, total: usize },
+    /// 上游返回客户端错误（400系，非瞬态）— 透传或 502
+    UpstreamClientError { status: u16, body: String },
+    /// 上游瞬态错误重试耗尽 — 429 或 503
+    UpstreamTransientExhausted { last_status: u16, body: String },
+    /// 网络/连接失败重试耗尽 — 503
+    ConnectionFailed { detail: String },
+    /// 内部配置错误 — 500
+    InternalConfig { detail: String },
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderError::AllCredentialsDisabled { available, total } => {
+                write!(f, "所有凭据均已禁用 ({}/{})", available, total)
+            }
+            ProviderError::AllCredentialsQuotaExhausted { detail } => {
+                write!(f, "所有凭据额度已用尽: {}", detail)
+            }
+            ProviderError::TokenAcquisitionFailed { available, total } => {
+                write!(f, "Token 获取失败 ({}/{})", available, total)
+            }
+            ProviderError::UpstreamClientError { status, body } => {
+                write!(f, "上游客户端错误 {}: {}", status, body)
+            }
+            ProviderError::UpstreamTransientExhausted { last_status, body } => {
+                write!(f, "上游瞬态错误重试耗尽 {}: {}", last_status, body)
+            }
+            ProviderError::ConnectionFailed { detail } => {
+                write!(f, "网络连接失败重试耗尽: {}", detail)
+            }
+            ProviderError::InternalConfig { detail } => {
+                write!(f, "内部配置错误: {}", detail)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -148,10 +197,12 @@ impl KiroProvider {
             .endpoint
             .as_deref()
             .unwrap_or(&self.default_endpoint);
-        self.endpoints
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+        self.endpoints.get(name).cloned().ok_or_else(|| {
+            ProviderError::InternalConfig {
+                detail: format!("未知端点: {}", name),
+            }
+            .into()
+        })
     }
 
     /// 发送非流式 API 请求
@@ -377,7 +428,7 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroApiResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut last_error: Option<ProviderError> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut failed_credential_ids: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -399,8 +450,19 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    let err_str = e.to_string();
+                    let pe = if err_str.contains("所有凭据均已禁用") {
+                        ProviderError::AllCredentialsDisabled {
+                            available: self.token_manager.available_count(),
+                            total: self.token_manager.total_count(),
+                        }
+                    } else {
+                        ProviderError::TokenAcquisitionFailed {
+                            available: self.token_manager.available_count(),
+                            total: self.token_manager.total_count(),
+                        }
+                    };
+                    return Err(pe.into());
                 }
             };
 
@@ -410,7 +472,9 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    last_error = Some(e);
+                    last_error = Some(ProviderError::InternalConfig {
+                        detail: e.to_string(),
+                    });
                     self.token_manager.report_failure(ctx.id);
                     failed_credential_ids.insert(ctx.id);
                     continue;
@@ -453,7 +517,9 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    last_error = Some(ProviderError::ConnectionFailed {
+                        detail: e.to_string(),
+                    });
                     self.token_manager.report_no_result(ctx.id);
                     failed_credential_ids.insert(ctx.id);
                     if attempt + 1 < max_retries {
@@ -490,27 +556,26 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(ProviderError::AllCredentialsQuotaExhausted {
+                        detail: format!("{} {}", status, body),
+                    }
+                    .into());
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(ProviderError::AllCredentialsQuotaExhausted {
+                    detail: format!("{} {}", status, body),
+                });
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(ProviderError::UpstreamClientError {
+                    status: status.as_u16(),
+                    body,
+                }
+                .into());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -543,20 +608,17 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(ProviderError::UpstreamClientError {
+                        status: status.as_u16(),
+                        body,
+                    }
+                    .into());
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(ProviderError::UpstreamClientError {
+                    status: status.as_u16(),
+                    body: body.clone(),
+                });
                 continue;
             }
 
@@ -570,12 +632,10 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(ProviderError::UpstreamTransientExhausted {
+                    last_status: status.as_u16(),
+                    body: body.clone(),
+                });
                 self.token_manager.report_no_result(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
@@ -587,7 +647,11 @@ impl KiroProvider {
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(ProviderError::UpstreamClientError {
+                    status: status.as_u16(),
+                    body,
+                }
+                .into());
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -598,12 +662,10 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+            last_error = Some(ProviderError::UpstreamTransientExhausted {
+                last_status: status.as_u16(),
+                body: body.clone(),
+            });
             self.token_manager.report_no_result(ctx.id);
             failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
@@ -612,13 +674,15 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
-            )
-        }))
+        Err(last_error
+            .unwrap_or(ProviderError::UpstreamTransientExhausted {
+                last_status: 0,
+                body: format!(
+                    "{} API 请求失败：已达到最大重试次数（{}次）",
+                    api_type, max_retries
+                ),
+            })
+            .into())
     }
 
     /// 从请求体中提取模型信息

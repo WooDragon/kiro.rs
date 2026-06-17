@@ -59,42 +59,120 @@ fn finalize_request_body(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
+    use crate::kiro::provider::ProviderError;
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
+    if let Some(pe) = err.downcast_ref::<ProviderError>() {
+        let (status, error_type, message, retry_after) = match pe {
+            ProviderError::AllCredentialsDisabled { available, total } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                format!(
+                    "All credentials disabled ({}/{}). Service temporarily unavailable.",
+                    available, total
+                ),
+                Some(60u64),
+            ),
+            ProviderError::AllCredentialsQuotaExhausted { detail } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                format!("All credentials quota exhausted: {}", detail),
+                Some(60u64),
+            ),
+            ProviderError::TokenAcquisitionFailed { available, total } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                format!(
+                    "Token acquisition failed ({}/{}). Service temporarily unavailable.",
+                    available, total
+                ),
+                Some(30u64),
+            ),
+            ProviderError::UpstreamClientError { status, body } => {
+                if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "Context window is full. Reduce conversation history, system prompt, or tools.".to_string(),
+                        None,
+                    )
+                } else if body.contains("Input is too long") {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "Input is too long. Reduce the size of your messages.".to_string(),
+                        None,
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        format!("Upstream error: {} {}", status, body),
+                        None,
+                    )
+                }
+            }
+            ProviderError::UpstreamTransientExhausted { last_status, body } => {
+                if *last_status == 429 {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        format!("Upstream rate limited (retries exhausted): {}", body),
+                        Some(30u64),
+                    )
+                } else {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "overloaded_error",
+                        format!(
+                            "Upstream service error (retries exhausted): {} {}",
+                            last_status, body
+                        ),
+                        Some(30u64),
+                    )
+                }
+            }
+            ProviderError::ConnectionFailed { detail } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                format!("Connection failed (retries exhausted): {}", detail),
+                Some(15u64),
+            ),
+            ProviderError::InternalConfig { detail } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("Internal configuration error: {}", detail),
+                None,
+            ),
+        };
+
+        match status {
+            StatusCode::BAD_REQUEST => tracing::warn!(error = %err, "上游拒绝请求（不应重试）"),
+            StatusCode::INTERNAL_SERVER_ERROR => tracing::error!("内部配置错误: {}", err),
+            _ => tracing::error!("Kiro API 调用失败: {}", err),
+        }
+
+        let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
+
+        if let Some(seconds) = retry_after {
+            if let Ok(val) = header::HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(header::HeaderName::from_static("retry-after"), val);
+            }
+        }
+
+        response
+    } else {
+        tracing::error!("Kiro API 调用失败（未分类错误）: {}", err);
+        (
+            StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
+                "api_error",
+                format!("上游 API 调用失败: {}", err),
             )),
         )
-            .into_response();
+            .into_response()
     }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-    tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
 }
 
 /// GET /v1/models
@@ -1470,5 +1548,175 @@ mod tests {
             payload.output_config.as_ref().map(|c| c.effort.as_str()),
             Some("high")
         );
+    }
+
+    // --- map_provider_error tests ---
+
+    fn response_status(r: Response) -> StatusCode {
+        r.status()
+    }
+
+    fn response_has_retry_after(r: &Response) -> bool {
+        r.headers().contains_key("retry-after")
+    }
+
+    fn response_retry_after_value(r: &Response) -> Option<u64> {
+        r.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+    }
+
+    async fn response_error_type(r: Response) -> String {
+        use axum::body::to_bytes;
+        let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["error"]["type"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn test_map_all_credentials_disabled_gives_503() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::AllCredentialsDisabled {
+            available: 0,
+            total: 2,
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_retry_after_value(&r), Some(60));
+        assert_eq!(response_error_type(r).await, "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_quota_exhausted_gives_429() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::AllCredentialsQuotaExhausted {
+            detail: "monthly limit".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_retry_after_value(&r), Some(60));
+        assert_eq!(response_error_type(r).await, "rate_limit_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_token_acquisition_failed_gives_503() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::TokenAcquisitionFailed {
+            available: 0,
+            total: 1,
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_retry_after_value(&r), Some(30));
+        assert_eq!(response_error_type(r).await, "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_upstream_client_error_generic_gives_502() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamClientError {
+            status: 401,
+            body: "Unauthorized".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "api_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_upstream_client_error_content_length_gives_400() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamClientError {
+            status: 400,
+            body: "CONTENT_LENGTH_EXCEEDS_THRESHOLD".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_upstream_client_error_input_too_long_gives_400() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamClientError {
+            status: 400,
+            body: "Input is too long for this model".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_transient_exhausted_429_gives_429() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamTransientExhausted {
+            last_status: 429,
+            body: "rate limited".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response_retry_after_value(&r), Some(30));
+        assert_eq!(response_error_type(r).await, "rate_limit_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_transient_exhausted_503_gives_503() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamTransientExhausted {
+            last_status: 503,
+            body: "service unavailable".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_retry_after_value(&r), Some(30));
+        assert_eq!(response_error_type(r).await, "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_connection_failed_gives_503() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::ConnectionFailed {
+            detail: "connection refused".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_retry_after_value(&r), Some(15));
+        assert_eq!(response_error_type(r).await, "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_internal_config_gives_500() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::InternalConfig {
+            detail: "unknown endpoint: foo".to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "internal_error");
+    }
+
+    #[tokio::test]
+    async fn test_map_plain_anyhow_fallback_gives_502() {
+        let err: anyhow::Error = anyhow::anyhow!("some generic error without ProviderError");
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "api_error");
     }
 }
