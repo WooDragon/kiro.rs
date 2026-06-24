@@ -158,7 +158,7 @@ fn map_provider_error(err: Error) -> Response {
         {
             response
                 .headers_mut()
-                .insert(header::HeaderName::from_static("retry-after"), val);
+                .insert(header::RETRY_AFTER, val);
         }
 
         response
