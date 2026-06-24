@@ -153,12 +153,12 @@ fn map_provider_error(err: Error) -> Response {
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
-        if let Some(seconds) = retry_after {
-            if let Ok(val) = header::HeaderValue::from_str(&seconds.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(header::HeaderName::from_static("retry-after"), val);
-            }
+        if let Some(seconds) = retry_after
+            && let Ok(val) = header::HeaderValue::from_str(&seconds.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("retry-after"), val);
         }
 
         response
