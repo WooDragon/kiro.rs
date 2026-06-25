@@ -871,7 +871,7 @@ async fn handle_non_stream_request(
             stop_reason = "max_tokens".to_string();
         }
         tracing::warn!(
-            marker = ?marker,
+            leak_marker = ?marker,
             model = model,
             text_len = text_content.len(),
             stop_reason = %stop_reason,
