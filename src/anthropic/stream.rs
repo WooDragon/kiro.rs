@@ -41,7 +41,7 @@ pub(crate) fn detect_text_tool_call_leak(text: &str) -> Option<&'static str> {
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
 /// 这个函数从目标位置向前搜索，找到最近的有效字符边界。
-fn find_char_boundary(s: &str, target: usize) -> usize {
+pub(crate) fn find_char_boundary(s: &str, target: usize) -> usize {
     if target >= s.len() {
         return s.len();
     }
@@ -418,7 +418,10 @@ impl SseStateManager {
         // 检查块是否已存在
         if let Some(block) = self.active_blocks.get_mut(&index) {
             if block.started {
-                tracing::debug!("块 {} 已启动，跳过重复的 content_block_start", index);
+                tracing::debug!(
+                    block_index = index,
+                    "块已启动，跳过重复的 content_block_start"
+                );
                 return events;
             }
             block.started = true;
@@ -442,16 +445,16 @@ impl SseStateManager {
         if let Some(block) = self.active_blocks.get(&index) {
             if !block.started || block.stopped {
                 tracing::warn!(
-                    "块 {} 状态异常: started={}, stopped={}",
-                    index,
-                    block.started,
-                    block.stopped
+                    block_index = index,
+                    started = block.started,
+                    stopped = block.stopped,
+                    "块状态异常"
                 );
                 return None;
             }
         } else {
             // 块不存在，可能需要先创建
-            tracing::warn!("收到未知块 {} 的 delta 事件", index);
+            tracing::warn!(block_index = index, "收到未知块的 delta 事件");
             return None;
         }
 
@@ -462,7 +465,10 @@ impl SseStateManager {
     pub fn handle_content_block_stop(&mut self, index: i32) -> Option<SseEvent> {
         if let Some(block) = self.active_blocks.get_mut(&index) {
             if block.stopped {
-                tracing::debug!("块 {} 已停止，跳过重复的 content_block_stop", index);
+                tracing::debug!(
+                    block_index = index,
+                    "块已停止，跳过重复的 content_block_stop"
+                );
                 return None;
             }
             block.stopped = true;
@@ -722,9 +728,9 @@ impl StreamContext {
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                    context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    context_usage_pct = context_usage.context_usage_percentage,
+                    input_tokens = actual_input_tokens,
+                    "收到 contextUsageEvent，已计算 input_tokens"
                 );
                 Vec::new()
             }
@@ -758,7 +764,11 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                tracing::error!(
+                    event_type = %error_code,
+                    error = %error_message,
+                    "收到错误事件"
+                );
                 Vec::new()
             }
             Event::Exception {
@@ -769,7 +779,11 @@ impl StreamContext {
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                tracing::warn!(
+                    event_type = %exception_type,
+                    error = %message,
+                    "收到异常事件"
+                );
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1258,12 +1272,12 @@ impl StreamContext {
                 self.state_manager.set_stop_reason("max_tokens");
             }
             tracing::warn!(
-                "检测到工具调用明文泄漏(#43): marker={:?} model={} message_id={} output_tokens={} stop_reason={}",
-                marker,
-                self.model,
-                self.message_id,
-                final_output_tokens,
-                self.state_manager.get_stop_reason()
+                leak_marker = ?marker,
+                model = %self.model,
+                message_id = %self.message_id,
+                output_tokens = final_output_tokens,
+                stop_reason = %self.state_manager.get_stop_reason(),
+                "检测到工具调用明文泄漏(#43)"
             );
         }
 
