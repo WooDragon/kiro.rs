@@ -840,13 +840,13 @@ async fn handle_non_stream_request(
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             }
-                            tracing::warn!(event_type = %exception_type, message = %message, "收到异常事件");
+                            tracing::warn!(event_type = %exception_type, error = %message, "收到异常事件");
                         }
                         Event::Error {
                             error_code,
                             error_message,
                         } => {
-                            tracing::error!(error_code = %error_code, error_message = %error_message, "收到错误事件");
+                            tracing::error!(event_type = %error_code, error = %error_message, "收到错误事件");
                         }
                         _ => {}
                     }
