@@ -125,9 +125,11 @@ fn classify_permanent_refresh_failure(
     // 400 + invalid_grant + "Invalid refresh token provided" → refreshToken 永久失效
     //
     // 此处刻意保守：invalid_grant 在真实上游含瞬态情形（时钟偏移 / 并发刷新竞态），
-    // 不能仅凭 error=invalid_grant 就判永久失效，否则会错杀可恢复凭据。
-    // 描述串用 raw-body `contains` 而非 error_description 精确相等，是故意的宽松防御——
-    // 不假设上游严格把该措辞放在 OAuth 标准字段，只要响应任何位置出现该字面即认。
+    // 不能仅凭 error=invalid_grant 就判永久失效，否则会错杀可恢复凭据。故需双重条件：
+    // (1) JSON error 字段精确等于 invalid_grant；(2) body 含确切失效描述。
+    // 描述串用 raw-body `contains`（而非 error_description 字段精确相等）是故意的宽松——
+    // 不假设上游严格把该措辞放在 OAuth 标准字段，只要在已确认 error=invalid_grant 的
+    // 响应里任何位置出现该字面即认（仅放宽 (2)，不放宽 (1)）。
     // 放宽此边界须先黑盒实测背书（CLAUDE.md：判定边界改动禁推断）。
     if status == 400
         && error_code == "invalid_grant"
@@ -1908,11 +1910,11 @@ impl MultiTokenManager {
                             Ok(creds) => creds,
                             Err(e) => {
                                 // 余额查询路径原先静默吞错误（#52）。补日志保证可观测，
-                                // 并对永久失效凭据立即隔离——成功刷新已写回新 token，
-                                // 探测到永久死亡也应同步状态，避免下个业务请求白跑一轮发现。
+                                // 并对不可重试的永久性刷新失败立即隔离凭据——与 acquire
+                                // 主路径行为对齐，避免下个业务请求再撞上同一坏凭据白跑一轮。
                                 if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                                     tracing::warn!(
-                                        "凭据 #{} refreshToken 永久失效（余额查询）: {}",
+                                        "凭据 #{} Token 刷新永久失效（余额查询）: {}",
                                         id,
                                         e
                                     );
