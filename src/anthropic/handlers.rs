@@ -156,9 +156,7 @@ fn map_provider_error(err: Error) -> Response {
         if let Some(seconds) = retry_after
             && let Ok(val) = header::HeaderValue::from_str(&seconds.to_string())
         {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, val);
+            response.headers_mut().insert(header::RETRY_AFTER, val);
         }
 
         response

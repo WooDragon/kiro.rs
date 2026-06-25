@@ -88,7 +88,8 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 
 /// Refresh Token 永久失效错误
 ///
-/// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
+/// 当服务端返回永久性失败（如 400 `invalid_grant` 或 401 `invalid_client`）时，
+/// 表示凭据已不可恢复（refreshToken 被撤销/过期，或 clientId/clientSecret 无效），
 /// 不应重试，需立即禁用对应凭据。
 #[derive(Debug)]
 pub(crate) struct RefreshTokenInvalidError {
@@ -102,6 +103,53 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+/// 分类 token 刷新失败：返回 `Some` 表示凭据永久失效（不可重试，应立即禁用），
+/// `None` 表示瞬态失败（交由 acquire 循环累计重试判定）。
+///
+/// "瞬态 vs 永久"的边界集中于此——新增永久失效场景只改这一处，IdC / Social 两条
+/// 刷新路径同时生效。`source` 仅用于错误消息文案（`"IdC"` / `"Social"`）。
+fn classify_permanent_refresh_failure(
+    status: u16,
+    body: &str,
+    source: &str,
+) -> Option<RefreshTokenInvalidError> {
+    // 精确解析 OAuth `error` 字段，避免 error_description 偶含关键字时误杀可恢复凭据
+    let json = serde_json::from_str::<serde_json::Value>(body).ok();
+    let error_code = json
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("");
+
+    // 400 + invalid_grant + "Invalid refresh token provided" → refreshToken 永久失效
+    //
+    // 此处刻意保守：invalid_grant 在真实上游含瞬态情形（时钟偏移 / 并发刷新竞态），
+    // 不能仅凭 error=invalid_grant 就判永久失效，否则会错杀可恢复凭据。故需双重条件：
+    // (1) JSON error 字段精确等于 invalid_grant；(2) body 含确切失效描述。
+    // 描述串用 raw-body `contains`（而非 error_description 字段精确相等）是故意的宽松——
+    // 不假设上游严格把该措辞放在 OAuth 标准字段，只要在已确认 error=invalid_grant 的
+    // 响应里任何位置出现该字面即认（仅放宽 (2)，不放宽 (1)）。
+    // 放宽此边界须先黑盒实测背书（CLAUDE.md：判定边界改动禁推断）。
+    if status == 400
+        && error_code == "invalid_grant"
+        && body.contains("Invalid refresh token provided")
+    {
+        return Some(RefreshTokenInvalidError {
+            message: format!("{} refreshToken 已失效 (invalid_grant): {}", source, body),
+        });
+    }
+
+    // 401 + invalid_client → clientId/clientSecret 无效，永久失效。
+    // Social 路径不发 client 凭证，对其为死分支但无害（更鲁棒）。
+    if status == 401 && error_code == "invalid_client" {
+        return Some(RefreshTokenInvalidError {
+            message: format!("{} 客户端凭证无效 (invalid_client): {}", source, body),
+        });
+    }
+
+    None
+}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -179,15 +227,8 @@ async fn refresh_social_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
-            return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
-            }
-            .into());
+        if let Some(e) = classify_permanent_refresh_failure(status.as_u16(), &body_text, "Social") {
+            return Err(e.into());
         }
 
         let error_msg = match status.as_u16() {
@@ -276,15 +317,8 @@ async fn refresh_idc_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
-            return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
-            }
-            .into());
+        if let Some(e) = classify_permanent_refresh_failure(status.as_u16(), &body_text, "IdC") {
+            return Err(e.into());
         }
 
         let error_msg = match status.as_u16() {
@@ -1870,8 +1904,32 @@ impl MultiTokenManager {
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                        match refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await
+                        {
+                            Ok(creds) => creds,
+                            Err(e) => {
+                                // 余额查询路径原先静默吞错误（#52）。补日志保证可观测，
+                                // 并对不可重试的永久性刷新失败立即隔离凭据——与 acquire
+                                // 主路径行为对齐，避免下个业务请求再撞上同一坏凭据白跑一轮。
+                                if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                                    tracing::warn!(
+                                        "凭据 #{} Token 刷新永久失效（余额查询）: {}",
+                                        id,
+                                        e
+                                    );
+                                    self.report_refresh_token_invalid(id);
+                                } else {
+                                    // 瞬态失败仅记日志，禁用交由 acquire 循环累计判定
+                                    tracing::warn!(
+                                        "凭据 #{} Token 刷新失败（余额查询）: {}",
+                                        id,
+                                        e
+                                    );
+                                }
+                                return Err(e);
+                            }
+                        };
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -3100,6 +3158,81 @@ mod tests {
         assert!(first.disabled);
         assert_eq!(first.refresh_failure_count, MAX_FAILURES_PER_CREDENTIAL);
         assert_eq!(snapshot.current_id, 2);
+    }
+
+    // ===== #52: token 刷新永久失效分类器 =====
+
+    #[test]
+    fn test_classify_invalid_client_permanent() {
+        let body = r#"{"error":"invalid_client","error_description":"Client not found"}"#;
+        let r = classify_permanent_refresh_failure(401, body, "IdC");
+        assert!(r.is_some(), "401 + invalid_client 应判永久失效");
+        assert!(r.unwrap().message.contains("invalid_client"));
+    }
+
+    #[test]
+    fn test_classify_invalid_grant_permanent() {
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#;
+        let r = classify_permanent_refresh_failure(400, body, "Social");
+        assert!(r.is_some(), "400 + invalid_grant + 描述匹配 应判永久失效");
+        assert!(r.unwrap().message.contains("invalid_grant"));
+    }
+
+    #[test]
+    fn test_classify_transient_returns_none() {
+        assert!(
+            classify_permanent_refresh_failure(500, "Internal Server Error", "IdC").is_none(),
+            "5xx 是瞬态"
+        );
+        assert!(
+            classify_permanent_refresh_failure(429, "Too Many Requests", "IdC").is_none(),
+            "429 限流是瞬态"
+        );
+        assert!(
+            classify_permanent_refresh_failure(401, r#"{"error":"server_error"}"#, "IdC").is_none(),
+            "401 但 error 非 invalid_client 是瞬态"
+        );
+    }
+
+    #[test]
+    fn test_classify_no_false_kill() {
+        // error_description 偶含 "invalid_client" 字样，但 error 字段非之 → 精确解析不误杀
+        let body = r#"{"error":"server_error","error_description":"upstream said invalid_client"}"#;
+        assert!(
+            classify_permanent_refresh_failure(401, body, "IdC").is_none(),
+            "error_description 含关键字不应误杀"
+        );
+        // invalid_grant 但缺 "Invalid refresh token provided" 描述 → 保守判瞬态（不放宽边界）
+        let body = r#"{"error":"invalid_grant","error_description":"clock skew detected"}"#;
+        assert!(
+            classify_permanent_refresh_failure(400, body, "IdC").is_none(),
+            "invalid_grant 无确切失效描述时保守判瞬态"
+        );
+    }
+
+    #[test]
+    fn test_report_refresh_token_invalid_disables_immediately() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+        // 永久失效一次即禁用（区别于 report_refresh_failure 的累计阈值）
+        let has_available = manager.report_refresh_token_invalid(1);
+        assert!(has_available, "禁用 #1 后仍有 #2 可用");
+        assert_eq!(manager.available_count(), 1);
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled, "永久失效凭据应立即禁用");
+        assert_eq!(snapshot.current_id, 2, "应已切换到存活凭据");
     }
 
     #[tokio::test]
