@@ -39,6 +39,23 @@ use crate::kiro::model::requests::kiro::InferenceConfig;
 use crate::model::config::{CcStreamingMode, PromptCacheMode};
 use std::sync::Arc;
 
+/// 日志 payload 截断上限：8 KB
+const LOG_PAYLOAD_LIMIT: usize = 8 * 1024;
+
+/// 日志用：超过 `limit` 字节则在 UTF-8 安全边界截断并标注省略字节数。
+fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= limit {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        let end = crate::anthropic::stream::find_char_boundary(s, limit);
+        std::borrow::Cow::Owned(format!(
+            "{}...<truncated {} bytes>",
+            &s[..end],
+            s.len() - end
+        ))
+    }
+}
+
 /// 构建并序列化 KiroRequest。
 ///
 /// # 参数
@@ -147,8 +164,8 @@ fn map_provider_error(err: Error) -> Response {
 
         match status {
             StatusCode::BAD_REQUEST => tracing::warn!(error = %err, "上游拒绝请求（不应重试）"),
-            StatusCode::INTERNAL_SERVER_ERROR => tracing::error!("内部配置错误: {}", err),
-            _ => tracing::error!("Kiro API 调用失败: {}", err),
+            StatusCode::INTERNAL_SERVER_ERROR => tracing::error!(error = %err, "内部配置错误"),
+            _ => tracing::error!(error = %err, "Kiro API 调用失败"),
         }
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
@@ -161,7 +178,7 @@ fn map_provider_error(err: Error) -> Response {
 
         response
     } else {
-        tracing::error!("Kiro API 调用失败（未分类错误）: {}", err);
+        tracing::error!(error = %err, "Kiro API 调用失败（未分类错误）");
         (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -392,7 +409,7 @@ pub async fn post_messages(
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
             };
-            tracing::warn!("请求转换失败: {}", e);
+            tracing::warn!(error = %e, "请求转换失败");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -405,6 +422,10 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let stable_conversation_id = conversion_result.stable_conversation_id;
 
+    if let Some(ref cid) = stable_conversation_id {
+        tracing::Span::current().record("conversation_id", tracing::field::display(cid));
+    }
+
     // 构建 Kiro 请求体（profile_arn 由 provider 层注入）
     let request_body = match finalize_request_body(
         conversion_result.conversation_state,
@@ -412,7 +433,7 @@ pub async fn post_messages(
     ) {
         Ok(body) => body,
         Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+            tracing::error!(error = %e, "序列化请求失败");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -424,7 +445,7 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -599,7 +620,7 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::warn!(error = %e, "缓冲区溢出");
                             }
 
                             let mut events = Vec::new();
@@ -612,7 +633,7 @@ fn create_sse_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        tracing::warn!(error = %e, "解码事件失败");
                                     }
                                 }
                             }
@@ -626,7 +647,7 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", crate::http_client::describe_reqwest_error(&e));
+                        tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -697,8 +718,8 @@ async fn handle_non_stream_request(
         Err(e) => {
             // 服务端日志打结构化诊断串，便于区分 idle 超时 / 上游 reset / 真截断
             tracing::error!(
-                "读取响应体失败: {}",
-                crate::http_client::describe_reqwest_error(&e)
+                error = %crate::http_client::describe_reqwest_error(&e),
+                "读取响应体失败"
             );
             return (
                 StatusCode::BAD_GATEWAY,
@@ -715,7 +736,7 @@ async fn handle_non_stream_request(
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
+        tracing::warn!(error = %e, "缓冲区溢出");
     }
 
     let mut text_content = String::new();
@@ -756,9 +777,9 @@ async fn handle_non_stream_request(
                                 } else {
                                     serde_json::from_str(buffer).unwrap_or_else(|e| {
                                         tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
+                                            error = %e,
+                                            tool_use_id = %tool_use.tool_use_id,
+                                            "工具输入 JSON 解析失败"
                                         );
                                         serde_json::json!({})
                                     })
@@ -789,9 +810,9 @@ async fn handle_non_stream_request(
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                context_usage_pct = context_usage.context_usage_percentage,
+                                input_tokens = actual_input_tokens,
+                                "收到 contextUsageEvent"
                             );
                         }
                         Event::Metering(payload) => {
@@ -819,20 +840,20 @@ async fn handle_non_stream_request(
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             }
-                            tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                            tracing::warn!(event_type = %exception_type, message = %message, "收到异常事件");
                         }
                         Event::Error {
                             error_code,
                             error_message,
                         } => {
-                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                            tracing::error!(error_code = %error_code, error_message = %error_message, "收到错误事件");
                         }
                         _ => {}
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
+                tracing::warn!(error = %e, "解码事件失败");
             }
         }
     }
@@ -850,11 +871,11 @@ async fn handle_non_stream_request(
             stop_reason = "max_tokens".to_string();
         }
         tracing::warn!(
-            "检测到工具调用明文泄漏(#43,非流式): marker={:?} model={} text_len={} stop_reason={}",
-            marker,
-            model,
-            text_content.len(),
-            stop_reason
+            marker = ?marker,
+            model = model,
+            text_len = text_content.len(),
+            stop_reason = %stop_reason,
+            "检测到工具调用明文泄漏(#43,非流式)"
         );
     }
 
@@ -1082,7 +1103,7 @@ pub async fn post_messages_cc(
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
             };
-            tracing::warn!("请求转换失败: {}", e);
+            tracing::warn!(error = %e, "请求转换失败");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -1095,6 +1116,10 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let stable_conversation_id = conversion_result.stable_conversation_id;
 
+    if let Some(ref cid) = stable_conversation_id {
+        tracing::Span::current().record("conversation_id", tracing::field::display(cid));
+    }
+
     // 构建 Kiro 请求体（profile_arn 由 provider 层注入）
     let request_body = match finalize_request_body(
         conversion_result.conversation_state,
@@ -1102,7 +1127,7 @@ pub async fn post_messages_cc(
     ) {
         Ok(body) => body,
         Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+            tracing::error!(error = %e, "序列化请求失败");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1114,7 +1139,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1294,7 +1319,7 @@ fn create_prefix_buffered_sse_stream(
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::warn!(error = %e, "缓冲区溢出");
                             }
 
                             let mut events = Vec::new();
@@ -1306,7 +1331,7 @@ fn create_prefix_buffered_sse_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        tracing::warn!(error = %e, "解码事件失败");
                                     }
                                 }
                             }
@@ -1319,7 +1344,7 @@ fn create_prefix_buffered_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", crate::http_client::describe_reqwest_error(&e));
+                            tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                             let final_events = ctx.finish();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -1433,7 +1458,7 @@ fn create_buffered_sse_stream(
                     Some(Ok(chunk)) => {
                         // 解码事件
                         if let Err(e) = decoder.feed(&chunk) {
-                            tracing::warn!("缓冲区溢出: {}", e);
+                            tracing::warn!(error = %e, "缓冲区溢出");
                         }
 
                         for result in decoder.decode_iter() {
@@ -1445,7 +1470,7 @@ fn create_buffered_sse_stream(
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("解码事件失败: {}", e);
+                                    tracing::warn!(error = %e, "解码事件失败");
                                 }
                             }
                         }
@@ -1453,8 +1478,8 @@ fn create_buffered_sse_stream(
                     }
                     Some(Err(e)) => {
                         tracing::error!(
-                            "读取响应流失败: {}",
-                            crate::http_client::describe_reqwest_error(&e)
+                            error = %crate::http_client::describe_reqwest_error(&e),
+                            "读取响应流失败"
                         );
                         // 发生错误，完成处理并返回所有事件
                         let all_events = ctx.finish_and_get_all_events();
@@ -1716,5 +1741,92 @@ mod tests {
         assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
         assert!(!response_has_retry_after(&r));
         assert_eq!(response_error_type(r).await, "api_error");
+    }
+
+    // --- truncate_for_log tests ---
+
+    #[test]
+    fn test_truncate_ascii_short_returns_borrowed() {
+        let s = "hello world";
+        let result = truncate_for_log(s, 100);
+        // Short string: must return Borrowed (no allocation)
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), s);
+    }
+
+    #[test]
+    fn test_truncate_ascii_exact_limit_returns_borrowed() {
+        let s = "hello";
+        let result = truncate_for_log(s, 5);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), s);
+    }
+
+    #[test]
+    fn test_truncate_ascii_exceeds_limit() {
+        let s = "hello world!";
+        let result = truncate_for_log(s, 5);
+        let r = result.as_ref();
+        assert!(r.starts_with("hello"));
+        assert!(r.contains("<truncated"));
+        // Result must be valid UTF-8 (conversion to String must not panic)
+        let _ = r.to_string();
+        // Truncated portion must have correct byte count annotated
+        assert!(r.contains(&format!("{} bytes>", s.len() - 5)));
+    }
+
+    #[test]
+    fn test_truncate_multibyte_no_panic_chinese() {
+        // "你好世界" = 4 Chinese chars × 3 bytes each = 12 bytes total
+        // limit=4 falls in the middle of the second char (bytes 3..6)
+        let s = "你好世界";
+        assert_eq!(s.len(), 12);
+        let result = truncate_for_log(s, 4);
+        // Must not panic, result must be valid UTF-8
+        let r = result.as_ref();
+        let _ = r.to_string();
+        // The kept prefix must be valid UTF-8 — boundary was rounded back to char boundary ≤4
+        // "你" = bytes 0..3, so boundary should snap back to 3
+        assert!(r.starts_with("你"));
+        assert!(r.contains("<truncated"));
+    }
+
+    #[test]
+    fn test_truncate_multibyte_no_panic_emoji() {
+        // "😀" = 4 bytes; limit=2 falls inside the emoji
+        let s = "😀 hi";
+        let result = truncate_for_log(s, 2);
+        let r = result.as_ref();
+        // Must not panic; result is valid UTF-8
+        let _ = r.to_string();
+        assert!(r.contains("<truncated"));
+    }
+
+    #[test]
+    fn test_truncate_limit_zero() {
+        let s = "hello";
+        let result = truncate_for_log(s, 0);
+        let r = result.as_ref();
+        let _ = r.to_string();
+        // Nothing kept before truncation marker
+        assert!(r.contains("<truncated"));
+    }
+
+    #[test]
+    fn test_truncate_limit_equals_len() {
+        let s = "hello";
+        let result = truncate_for_log(s, s.len());
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), s);
+    }
+
+    #[test]
+    fn test_truncate_limit_len_minus_one() {
+        let s = "hello";
+        let result = truncate_for_log(s, s.len() - 1);
+        let r = result.as_ref();
+        let _ = r.to_string();
+        assert!(r.contains("<truncated"));
+        assert!(r.contains("1 bytes>"));
     }
 }

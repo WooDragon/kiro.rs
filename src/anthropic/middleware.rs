@@ -9,6 +9,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::common::auth;
@@ -91,9 +92,18 @@ pub fn insert_request_id_header(headers: &mut HeaderMap, request_id: &str) {
 }
 
 pub async fn request_id_middleware(request: Request<Body>, next: Next) -> Response {
-    let request_id = create_anthropic_request_id();
-    let mut response = next.run(request).await;
-    insert_request_id_header(response.headers_mut(), &request_id);
+    let id = create_anthropic_request_id();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let span = tracing::info_span!(
+        "req",
+        request_id = %id,
+        method = %method,
+        path = %path,
+        conversation_id = tracing::field::Empty,
+    );
+    let mut response = next.run(request).instrument(span).await;
+    insert_request_id_header(response.headers_mut(), &id);
     response
 }
 
