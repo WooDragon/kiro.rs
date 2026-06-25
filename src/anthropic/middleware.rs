@@ -93,13 +93,13 @@ pub fn insert_request_id_header(headers: &mut HeaderMap, request_id: &str) {
 
 pub async fn request_id_middleware(request: Request<Body>, next: Next) -> Response {
     let id = create_anthropic_request_id();
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    // method/path 直接作为 span 字段记录：`%` 在 info_span! 展开期即时格式化，
+    // 借用仅存活到宏结束，之后 request 仍可 move 进 next.run，省去热路径两次堆分配。
     let span = tracing::info_span!(
         "req",
         request_id = %id,
-        method = %method,
-        path = %path,
+        method = %request.method(),
+        path = %request.uri().path(),
         conversation_id = tracing::field::Empty,
     );
     let mut response = next.run(request).instrument(span).await;
