@@ -381,7 +381,7 @@ impl SseStateManager {
     /// 处理 message_start 事件
     pub fn handle_message_start(&mut self, event: serde_json::Value) -> Option<SseEvent> {
         if self.message_started {
-            tracing::debug!("跳过重复的 message_start 事件");
+            tracing::trace!("跳过重复的 message_start 事件");
             return None;
         }
         self.message_started = true;
@@ -418,7 +418,7 @@ impl SseStateManager {
         // 检查块是否已存在
         if let Some(block) = self.active_blocks.get_mut(&index) {
             if block.started {
-                tracing::debug!(
+                tracing::trace!(
                     block_index = index,
                     "块已启动，跳过重复的 content_block_start"
                 );
@@ -465,7 +465,7 @@ impl SseStateManager {
     pub fn handle_content_block_stop(&mut self, index: i32) -> Option<SseEvent> {
         if let Some(block) = self.active_blocks.get_mut(&index) {
             if block.stopped {
-                tracing::debug!(
+                tracing::trace!(
                     block_index = index,
                     "块已停止，跳过重复的 content_block_stop"
                 );

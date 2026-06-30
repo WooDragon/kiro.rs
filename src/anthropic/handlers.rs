@@ -19,6 +19,7 @@ use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
@@ -555,8 +556,12 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    // 在 handler 仍处于 req span 上下文中时捕获当前 span，
+    // 传入 stream 闭包以便 hyper poll body 时仍能关联 request_id。
+    let span = tracing::Span::current();
+
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, span);
 
     // 返回 SSE 响应
     Response::builder()
@@ -584,10 +589,15 @@ fn create_ping_interval() -> tokio::time::Interval {
 }
 
 /// 创建 SSE 事件流
+///
+/// `span` 是 handler 执行期间捕获的 req span。stream::unfold 闭包返回的每个
+/// async 块都单独挂 `.instrument(span.clone())`，使 hyper 在 handler future 完成
+/// 后 poll body stream 时，内部 tracing 事件仍能关联到原始 request_id。
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -607,73 +617,78 @@ fn create_sse_stream(
             false,
             create_ping_interval(),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
+        // move 捕获 span；每次 poll 对 async block 单独 instrument，
+        // 使 tracing::Instrument 的 Future impl 生效（Stream 上无此 impl）。
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| {
+            async move {
+                if finished {
+                    return None;
+                }
 
-            // 使用 select! 同时等待数据和 ping 定时器
-            tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!(error = %e, "缓冲区溢出");
-                            }
+                // 使用 select! 同时等待数据和 ping 定时器
+                tokio::select! {
+                    // 处理数据流
+                    chunk_result = body_stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                // 解码事件
+                                if let Err(e) = decoder.feed(&chunk) {
+                                    tracing::warn!(error = %e, "缓冲区溢出");
+                                }
 
-                            let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                let mut events = Vec::new();
+                                for result in decoder.decode_iter() {
+                                    match result {
+                                        Ok(frame) => {
+                                            if let Ok(event) = Event::from_frame(frame) {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "解码事件失败");
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "解码事件失败");
-                                    }
                                 }
+
+                                // 转换为 SSE 字节流
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                             }
-
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
-                        }
-                        Some(Err(e)) => {
-                        tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
-                        }
-                        None => {
-                            // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some(Err(e)) => {
+                                tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
+                                // 发送最终事件并结束
+                                let final_events = ctx.generate_final_events();
+                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            }
+                            None => {
+                                // 流结束，发送最终事件
+                                let final_events = ctx.generate_final_events();
+                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            }
                         }
                     }
-                }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    // 发送 ping 保活
+                    _ = ping_interval.tick() => {
+                        tracing::trace!("发送 ping 保活事件");
+                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                        Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    }
                 }
             }
+            .instrument(span.clone())
         },
     )
     .flatten();
@@ -1266,7 +1281,10 @@ async fn handle_stream_request_prefix_buffered(
         fallback_cache_usage,
     );
 
-    let stream = create_prefix_buffered_sse_stream(response, ctx);
+    // 在 handler 仍处于 req span 上下文中时捕获当前 span。
+    let span = tracing::Span::current();
+
+    let stream = create_prefix_buffered_sse_stream(response, ctx, span);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1282,6 +1300,7 @@ const PREFIX_BUFFER_TIMEOUT_SECS: u64 = 2;
 fn create_prefix_buffered_sse_stream(
     response: reqwest::Response,
     ctx: PrefixBufferedStreamContext,
+    span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1294,80 +1313,83 @@ fn create_prefix_buffered_sse_stream(
             create_ping_interval(),
             Box::pin(tokio::time::sleep(Duration::from_secs(PREFIX_BUFFER_TIMEOUT_SECS))),
         ),
-        |(
+        move |(
             mut body_stream,
             mut ctx,
             mut decoder,
             finished,
             mut ping_interval,
             mut prefix_timeout,
-        )| async move {
-            if finished {
-                return None;
-            }
-
-            tokio::select! {
-                _ = &mut prefix_timeout, if !ctx.is_released() => {
-                    let events = ctx.release_due_to_timeout();
-                    let bytes: Vec<Result<Bytes, Infallible>> = events
-                        .into_iter()
-                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                        .collect();
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
+        )| {
+            async move {
+                if finished {
+                    return None;
                 }
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!(error = %e, "缓冲区溢出");
-                            }
 
-                            let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            events.extend(ctx.process_event(&event));
+                tokio::select! {
+                    _ = &mut prefix_timeout, if !ctx.is_released() => {
+                        let events = ctx.release_due_to_timeout();
+                        let bytes: Vec<Result<Bytes, Infallible>> = events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+                        Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
+                    }
+                    chunk_result = body_stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                if let Err(e) = decoder.feed(&chunk) {
+                                    tracing::warn!(error = %e, "缓冲区溢出");
+                                }
+
+                                let mut events = Vec::new();
+                                for result in decoder.decode_iter() {
+                                    match result {
+                                        Ok(frame) => {
+                                            if let Ok(event) = Event::from_frame(frame) {
+                                                events.extend(ctx.process_event(&event));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "解码事件失败");
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "解码事件失败");
-                                    }
                                 }
+
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
                             }
-
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
-                            let final_events = ctx.finish();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
-                        }
-                        None => {
-                            let final_events = ctx.finish();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
+                            Some(Err(e)) => {
+                                tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
+                                let final_events = ctx.finish();
+                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
+                            }
+                            None => {
+                                let final_events = ctx.finish();
+                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
+                            }
                         }
                     }
-                }
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件（前缀缓冲模式）");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
+                    _ = ping_interval.tick() => {
+                        tracing::trace!("发送 ping 保活事件（前缀缓冲模式）");
+                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                        Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
+                    }
                 }
             }
+            .instrument(span.clone())
         },
     )
     .flatten()
@@ -1420,8 +1442,11 @@ async fn handle_stream_request_buffered(
         fallback_cache_usage,
     );
 
+    // 在 handler 仍处于 req span 上下文中时捕获当前 span。
+    let span = tracing::Span::current();
+
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, span);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1443,63 +1468,67 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
     stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false),
-        |(mut body_stream, mut ctx, mut decoder, finished)| async move {
-            if finished {
-                return None;
-            }
+        move |(mut body_stream, mut ctx, mut decoder, finished)| {
+            async move {
+                if finished {
+                    return None;
+                }
 
-            loop {
-                match body_stream.next().await {
-                    Some(Ok(chunk)) => {
-                        // 解码事件
-                        if let Err(e) = decoder.feed(&chunk) {
-                            tracing::warn!(error = %e, "缓冲区溢出");
-                        }
+                loop {
+                    match body_stream.next().await {
+                        Some(Ok(chunk)) => {
+                            // 解码事件
+                            if let Err(e) = decoder.feed(&chunk) {
+                                tracing::warn!(error = %e, "缓冲区溢出");
+                            }
 
-                        for result in decoder.decode_iter() {
-                            match result {
-                                Ok(frame) => {
-                                    if let Ok(event) = Event::from_frame(frame) {
-                                        // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                        ctx.process_and_buffer(&event);
+                            for result in decoder.decode_iter() {
+                                match result {
+                                    Ok(frame) => {
+                                        if let Ok(event) = Event::from_frame(frame) {
+                                            // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                            ctx.process_and_buffer(&event);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "解码事件失败");
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "解码事件失败");
-                                }
                             }
+                            // 继续读取下一个 chunk，不发送任何数据
                         }
-                        // 继续读取下一个 chunk，不发送任何数据
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!(
-                            error = %crate::http_client::describe_reqwest_error(&e),
-                            "读取响应流失败"
-                        );
-                        // 发生错误，完成处理并返回所有事件
-                        let all_events = ctx.finish_and_get_all_events();
-                        let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                            .into_iter()
-                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                            .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
-                    }
-                    None => {
-                        // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                        let all_events = ctx.finish_and_get_all_events();
-                        let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                            .into_iter()
-                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                            .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
+                        Some(Err(e)) => {
+                            tracing::error!(
+                                error = %crate::http_client::describe_reqwest_error(&e),
+                                "读取响应流失败"
+                            );
+                            // 发生错误，完成处理并返回所有事件
+                            let all_events = ctx.finish_and_get_all_events();
+                            let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
+                        }
+                        None => {
+                            // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                            let all_events = ctx.finish_and_get_all_events();
+                            let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
+                        }
                     }
                 }
             }
+            .instrument(span.clone())
         },
     )
     .flatten()
@@ -1828,5 +1857,145 @@ mod tests {
         let _ = r.to_string();
         assert!(r.contains("<truncated"));
         assert!(r.contains("1 bytes>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 — BDD: stream 内 event 能关联到 req span 的 request_id 字段
+    //
+    // FALLBACK 说明：首选端到端形态需要构造 reqwest::Response，但 reqwest 0.12
+    // 的 Response 类型无公开构造器（不暴露 From<http::Response<...>>），
+    // 无法在测试中伪造上游 HTTP 响应而不引入新依赖。
+    // 因此退为 fallback：用 stream::unfold + .instrument(span.clone()) 直接
+    // 验证"对 unfold 闭包返回的 async block 挂 instrument 后，跨 poll 仍保留
+    // span 字段"这一被依赖前提——此模式与 handlers.rs Task 1 fix 完全一致。
+    // 端到端接线由 Task 1 代码 + 编译类型保证。
+    // -----------------------------------------------------------------------
+
+    /// 自定义 Layer：将每个新 span 的 request_id 存入 extensions，
+    /// 每条 event 发出时向上遍历 scope 取出 request_id 记录到共享 Vec。
+    mod span_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::registry::LookupSpan;
+
+        /// 类型化包装，存入 span extensions TypeMap
+        pub struct RequestIdExt(pub String);
+
+        /// Visitor：从 span Attributes 里提取 request_id 字段值
+        pub struct RequestIdVisitor(pub Option<String>);
+
+        impl tracing::field::Visit for RequestIdVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "request_id" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "request_id" {
+                    self.0 = Some(format!("{:?}", value));
+                }
+            }
+        }
+
+        /// 共享捕获容器（None 代表该 event 没有携带 request_id）
+        #[derive(Default, Clone)]
+        pub struct CapturedIds(pub Arc<Mutex<Vec<Option<String>>>>);
+
+        /// 自定义 Layer 实现
+        pub struct CapturingLayer(pub CapturedIds);
+
+        impl<S> Layer<S> for CapturingLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            /// 新 span 创建时，把 request_id 字段值写进 extensions
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if let Some(span) = ctx.span(id) {
+                    let mut visitor = RequestIdVisitor(None);
+                    attrs.record(&mut visitor);
+                    if let Some(rid) = visitor.0 {
+                        span.extensions_mut().insert(RequestIdExt(rid));
+                    }
+                }
+            }
+
+            /// event 发出时，沿 scope 向上找最近含 RequestIdExt 的 span
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                let request_id = ctx.event_scope(event).and_then(|mut scope| {
+                    scope.find_map(|span_ref| {
+                        span_ref
+                            .extensions()
+                            .get::<RequestIdExt>()
+                            .map(|r| r.0.clone())
+                    })
+                });
+                self.0.0.lock().unwrap().push(request_id);
+            }
+        }
+    }
+
+    /// BDD: 对 stream::unfold 闭包返回的 async block 挂 .instrument(span) 后，
+    /// 即使 stream 在 span 上下文之外被 poll，内部 tracing event 仍携带 request_id。
+    ///
+    /// 验证修复前语义：若不挂 .instrument()，ids 全为 None，断言失败。
+    /// 修复后：ids 全为 Some("test_req_abc")，断言通过。
+    #[test]
+    fn test_stream_events_carry_req_span_request_id() {
+        use self::span_capture::{CapturedIds, CapturingLayer};
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedIds::default();
+        let layer = CapturingLayer(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // 模拟 handler 内部：建立 req span 并捕获它，此时仍处于 req span 上下文。
+            let span = tracing::info_span!("req", request_id = "test_req_abc");
+            // 捕获 span 用于传入 stream（与 handlers.rs 中 Span::current() 等价）
+            let captured_span = span.clone();
+
+            // 构造 stream::unfold，每个 async block 单独 instrument——
+            // 与 Task 1 修复后 create_*_sse_stream 内的模式完全相同。
+            let test_stream = futures::stream::unfold(0u32, move |count| {
+                let s = captured_span.clone();
+                async move {
+                    if count >= 3 {
+                        return None;
+                    }
+                    // 这条 event 必须携带 request_id，断言依赖此行为
+                    tracing::debug!(iteration = count, "stream poll event");
+                    Some((count, count + 1))
+                }
+                .instrument(s)
+            });
+
+            // 在 span 之外 poll stream，模拟 hyper poll body 时 req span 已 drop 的场景。
+            // futures::executor::block_on 在当前线程同步执行，保持 with_default subscriber。
+            futures::executor::block_on(async move {
+                use futures::StreamExt;
+                let mut s = Box::pin(test_stream);
+                while s.next().await.is_some() {}
+            });
+        });
+
+        let ids = captured.0.lock().unwrap();
+        assert!(
+            !ids.is_empty(),
+            "stream 未发出任何 tracing event，检查 unfold 闭包是否执行"
+        );
+        // 核心断言：每条 event 都必须携带正确的 request_id
+        // 若 .instrument() 未挂（修复前），ids 全为 None，此断言失败
+        assert!(
+            ids.iter().all(|id| id.as_deref() == Some("test_req_abc")),
+            "部分 stream event 未携带 request_id — .instrument(span) 未生效: {:?}",
+            &*ids
+        );
     }
 }
