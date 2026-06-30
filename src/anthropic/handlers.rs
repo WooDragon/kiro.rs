@@ -1956,10 +1956,15 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
-            // 模拟 handler 内部：建立 req span 并捕获它，此时仍处于 req span 上下文。
+            // 模拟 handler 内部：建立 req span 并 enter，在 span 上下文里用
+            // Span::current() 捕获——与 create_*_sse_stream 调用点完全同构。
             let span = tracing::info_span!("req", request_id = "test_req_abc");
-            // 捕获 span 用于传入 stream（与 handlers.rs 中 Span::current() 等价）
-            let captured_span = span.clone();
+            let captured_span = {
+                let _guard = span.enter();
+                // 在 enter 的 span 内取 current()，复刻生产代码 let span = Span::current();
+                tracing::Span::current()
+            };
+            // 此处 _guard 已 drop，span 不再 active——模拟 handler 返回后 req span 退出。
 
             // 构造 stream::unfold，每个 async block 单独 instrument——
             // 与 Task 1 修复后 create_*_sse_stream 内的模式完全相同。
