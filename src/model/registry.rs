@@ -94,7 +94,8 @@ impl ModelRegistry {
     }
 
     pub fn resolve(&self, anthropic_model: &str) -> Option<&ModelEntry> {
-        let model_lower = anthropic_model.to_lowercase().replace("-thinking", "");
+        let lowered = anthropic_model.to_lowercase();
+        let model_lower = lowered.strip_suffix("-thinking").unwrap_or(&lowered);
         self.entries.iter().find(|entry| {
             if !model_lower.contains(&entry.match_family) {
                 return false;
