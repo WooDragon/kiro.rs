@@ -11,4 +11,8 @@ pub struct Args {
     /// 凭证文件路径
     #[arg(long)]
     pub credentials: Option<String>,
+
+    /// 模型配置文件路径
+    #[arg(long)]
+    pub models: Option<String>,
 }
