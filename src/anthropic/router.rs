@@ -1,5 +1,7 @@
 //! Anthropic API 路由配置
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -9,6 +11,7 @@ use axum::{
 
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CcStreamingMode, PromptCacheMode};
+use crate::model::registry::ModelRegistry;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -41,12 +44,14 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     prompt_cache_mode: PromptCacheMode,
     cc_streaming_mode: CcStreamingMode,
+    model_registry: Arc<ModelRegistry>,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
         extract_thinking,
         prompt_cache_mode,
         cc_streaming_mode,
+        model_registry,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

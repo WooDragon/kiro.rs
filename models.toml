@@ -1,0 +1,142 @@
+# Anthropic-compatible model definitions
+# This file is compiled into the binary as defaults and can be customized by users.
+#
+# Matching algorithm:
+# 1. Entries are partitioned: versioned (match_version non-empty) first, then fallbacks (empty).
+#    Within each partition, original TOML order is preserved (stable sort).
+# 2. Incoming model string is lowercased, then matched against entries in order.
+# 3. An entry matches if match_family is found AND any match_version substring is found
+#    (or match_version is empty = family-level fallback).
+# 4. First match wins.
+#
+# Consequence: within a family, put more specific versions before general ones.
+# Fallback entries (match_version = []) always come after all versioned entries regardless of TOML position.
+
+[defaults]
+context_window = 200_000
+min_cacheable_tokens = 1024
+max_tokens = 64000
+
+# ============================================================================
+# Opus Family (pro tier)
+# ============================================================================
+
+[[models]]
+id = "claude-opus-4-8"
+kiro_id = "claude-opus-4.8"
+family = "opus"
+display_name = "Claude Opus 4.8"
+match_family = "opus"
+match_version = ["4-8", "4.8"]
+context_window = 1_000_000
+max_tokens = 64000
+created = 1779753600
+tier = "pro"
+min_cacheable_tokens = 4096
+thinking_type = "adaptive"
+thinking_budget_tokens = 20000
+thinking_effort = "high"
+expose_thinking_variant = true
+
+[[models]]
+id = "claude-opus-4-7"
+kiro_id = "claude-opus-4.7"
+family = "opus"
+display_name = "Claude Opus 4.7"
+match_family = "opus"
+match_version = ["4-7", "4.7"]
+context_window = 1_000_000
+max_tokens = 64000
+created = 1773446400
+tier = "pro"
+min_cacheable_tokens = 4096
+thinking_type = "adaptive"
+thinking_budget_tokens = 20000
+thinking_effort = "high"
+expose_thinking_variant = true
+
+[[models]]
+id = "claude-opus-4-6"
+kiro_id = "claude-opus-4.6"
+family = "opus"
+display_name = "Claude Opus 4.6"
+match_family = "opus"
+match_version = []
+context_window = 1_000_000
+max_tokens = 64000
+created = 1770163200
+tier = "pro"
+min_cacheable_tokens = 4096
+thinking_type = "adaptive"
+thinking_budget_tokens = 20000
+thinking_effort = "high"
+expose_thinking_variant = true
+
+[[models]]
+id = "claude-opus-4-5-20251101"
+kiro_id = "claude-opus-4.5"
+family = "opus"
+display_name = "Claude Opus 4.5"
+match_family = "opus"
+match_version = ["4-5", "4.5"]
+context_window = 200_000
+max_tokens = 64000
+created = 1763942400
+tier = "pro"
+min_cacheable_tokens = 4096
+thinking_type = "enabled"
+thinking_budget_tokens = 20000
+expose_thinking_variant = true
+
+# ============================================================================
+# Sonnet Family (free tier)
+# ============================================================================
+
+[[models]]
+id = "claude-sonnet-4-6"
+kiro_id = "claude-sonnet-4.6"
+family = "sonnet"
+display_name = "Claude Sonnet 4.6"
+match_family = "sonnet"
+match_version = ["4-6", "4.6"]
+context_window = 1_000_000
+max_tokens = 64000
+created = 1771286400
+tier = "free"
+thinking_type = "enabled"
+thinking_budget_tokens = 20000
+expose_thinking_variant = true
+
+[[models]]
+id = "claude-sonnet-4-5-20250929"
+kiro_id = "claude-sonnet-4.5"
+family = "sonnet"
+display_name = "Claude Sonnet 4.5"
+match_family = "sonnet"
+match_version = []
+context_window = 200_000
+max_tokens = 64000
+created = 1759104000
+tier = "free"
+thinking_type = "enabled"
+thinking_budget_tokens = 20000
+expose_thinking_variant = true
+
+# ============================================================================
+# Haiku Family (free tier)
+# ============================================================================
+
+[[models]]
+id = "claude-haiku-4-5-20251001"
+kiro_id = "claude-haiku-4.5"
+family = "haiku"
+display_name = "Claude Haiku 4.5"
+match_family = "haiku"
+match_version = []
+context_window = 200_000
+max_tokens = 64000
+created = 1760486400
+tier = "free"
+thinking_type = "enabled"
+thinking_budget_tokens = 20000
+expose_thinking_variant = true

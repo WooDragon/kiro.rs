@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -24,6 +25,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::model::registry::ModelRegistry;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -573,6 +575,8 @@ pub struct MultiTokenManager {
     sticky_sessions: Mutex<HashMap<String, StickySessionEntry>>,
     /// 最近一次会话粘性全量清理时间
     last_sticky_prune_at: Mutex<Option<Instant>>,
+    /// 模型注册表
+    model_registry: Arc<ModelRegistry>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -609,12 +613,14 @@ impl MultiTokenManager {
     /// * `proxy` - 可选的代理配置
     /// * `credentials_path` - 凭据文件路径（用于回写）
     /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `model_registry` - 模型注册表
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
+        model_registry: Arc<ModelRegistry>,
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
@@ -712,6 +718,7 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             sticky_sessions: Mutex::new(HashMap::new()),
             last_sticky_prune_at: Mutex::new(None),
+            model_registry,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -744,28 +751,27 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    fn is_opus_model(model: Option<&str>) -> bool {
-        model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false)
-    }
-
-    fn is_entry_available_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+    fn is_entry_available_for_model(&self, entry: &CredentialEntry, model: Option<&str>) -> bool {
         if entry.disabled {
             return false;
         }
-        if Self::is_opus_model(model) && !entry.credentials.supports_opus() {
+        if model
+            .map(|m| self.model_registry.is_premium_tier(m))
+            .unwrap_or(false)
+            && !entry.credentials.supports_opus()
+        {
             return false;
         }
         true
     }
 
     fn is_entry_available_for_model_excluding(
+        &self,
         entry: &CredentialEntry,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> bool {
-        !excluded_ids.contains(&entry.id) && Self::is_entry_available_for_model(entry, model)
+        !excluded_ids.contains(&entry.id) && self.is_entry_available_for_model(entry, model)
     }
 
     fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
@@ -876,7 +882,7 @@ impl MultiTokenManager {
             entries
                 .iter()
                 .find(|e| e.id == credential_id)
-                .filter(|e| Self::is_entry_available_for_model(e, model))
+                .filter(|e| self.is_entry_available_for_model(e, model))
                 .map(|e| (e.id, e.credentials.clone()))
         };
 
@@ -915,7 +921,7 @@ impl MultiTokenManager {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                Self::is_entry_available_for_model_excluding(entry, model, excluded_ids)
+                self.is_entry_available_for_model_excluding(entry, model, excluded_ids)
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -965,7 +971,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
-            .find(|e| e.id == id && Self::is_entry_available_for_model(e, model))?;
+            .find(|e| e.id == id && self.is_entry_available_for_model(e, model))?;
         Some(Self::reserve_credential(entry, Utc::now()))
     }
 
@@ -2315,6 +2321,10 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
 
+    fn test_registry() -> Arc<ModelRegistry> {
+        Arc::new(ModelRegistry::from_toml(include_str!("../../models.toml")).unwrap())
+    }
+
     #[test]
     fn test_is_token_expired_with_expired_token() {
         let credentials = KiroCredentials {
@@ -2425,7 +2435,9 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![existing], None, None, false, test_registry())
+                .unwrap();
 
         let duplicate = KiroCredentials {
             refresh_token: Some("a".repeat(150)),
@@ -2440,7 +2452,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_success() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false, test_registry()).unwrap();
 
         let api_key_cred = KiroCredentials {
             kiro_api_key: Some("ksk_test_key_123".to_string()),
@@ -2466,7 +2479,9 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![existing], None, None, false, test_registry())
+                .unwrap();
 
         let duplicate = KiroCredentials {
             kiro_api_key: Some("ksk_existing_key".to_string()),
@@ -2488,7 +2503,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_empty_rejected() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false, test_registry()).unwrap();
 
         let cred = KiroCredentials {
             kiro_api_key: Some(String::new()),
@@ -2510,7 +2526,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_api_key_missing_key_rejected() {
         let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false, test_registry()).unwrap();
 
         let cred = KiroCredentials {
             auth_method: Some("api_key".to_string()),
@@ -2538,7 +2555,9 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![oauth_cred], None, None, false, test_registry())
+                .unwrap();
 
         let api_key_cred = KiroCredentials {
             kiro_api_key: Some("ksk_new_key".to_string()),
@@ -2566,8 +2585,15 @@ mod tests {
             ..Default::default()
         };
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
     }
@@ -2575,7 +2601,7 @@ mod tests {
     #[test]
     fn test_multi_token_manager_empty_credentials() {
         let config = Config::default();
-        let result = MultiTokenManager::new(config, vec![], None, None, false);
+        let result = MultiTokenManager::new(config, vec![], None, None, false, test_registry());
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
         let manager = result.unwrap();
@@ -2595,7 +2621,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
+        let result = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        );
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(
@@ -2621,8 +2654,15 @@ mod tests {
             ..Default::default()
         };
 
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![bad_cred, good_cred],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
@@ -2638,7 +2678,8 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![cred], None, None, false, test_registry()).unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
     }
@@ -2649,8 +2690,15 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         // 前两次失败不会禁用（使用 ID 1）
@@ -2674,7 +2722,8 @@ mod tests {
         let config = Config::default();
         let cred = KiroCredentials::default();
 
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![cred], None, None, false, test_registry()).unwrap();
 
         // 失败两次（使用 ID 1）
         manager.report_failure(1);
@@ -2701,8 +2750,15 @@ mod tests {
             ..Default::default()
         };
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         let initial_id = manager.snapshot().current_id;
 
@@ -2718,9 +2774,15 @@ mod tests {
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2747,8 +2809,15 @@ mod tests {
             ..Default::default()
         };
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -2785,8 +2854,15 @@ mod tests {
             ..Default::default()
         };
 
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![bad_cred, good_cred],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
@@ -2814,6 +2890,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -2844,6 +2921,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -2872,6 +2950,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -2926,6 +3005,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -2959,6 +3039,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3002,6 +3083,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3032,6 +3114,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3081,6 +3164,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3110,6 +3194,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3133,8 +3218,15 @@ mod tests {
         let mut pro_cred = valid_access_credential("pro-token", 1);
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
 
-        let manager =
-            MultiTokenManager::new(config, vec![free_cred, pro_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
         manager.bind_sticky_session("session-1", 1);
 
         let ctx = manager
@@ -3151,8 +3243,15 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         assert_eq!(manager.available_count(), 2);
         for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
@@ -3230,6 +3329,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3251,8 +3351,15 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
             manager.report_refresh_failure(1);
@@ -3279,8 +3386,15 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         assert_eq!(manager.available_count(), 2);
@@ -3298,8 +3412,15 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred1, cred2],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         manager.report_quota_exhausted(1);
         manager.report_quota_exhausted(2);
@@ -3515,6 +3636,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3565,6 +3687,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 
@@ -3622,6 +3745,7 @@ mod tests {
             None,
             None,
             false,
+            test_registry(),
         )
         .unwrap();
 

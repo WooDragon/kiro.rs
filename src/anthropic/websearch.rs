@@ -21,6 +21,7 @@ use super::prompt_cache::{
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 use crate::model::config::PromptCacheMode;
+use crate::model::registry::ModelRegistry;
 use std::sync::Arc;
 
 /// MCP 请求
@@ -491,6 +492,7 @@ pub async fn handle_websearch_request(
     prompt_cache_mode: PromptCacheMode,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    model_registry: &Arc<ModelRegistry>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -524,11 +526,16 @@ pub async fn handle_websearch_request(
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
     let account_key = "websearch";
+    let min_cacheable_tokens = model_registry.min_cacheable_tokens(&model);
     let prompt_cache_usage = if matches!(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        prompt_cache.compute(account_key, prompt_cache_profile.as_ref())
+        prompt_cache.compute(
+            account_key,
+            prompt_cache_profile.as_ref(),
+            min_cacheable_tokens,
+        )
     } else {
         PromptCacheUsage::default()
     };
@@ -541,7 +548,11 @@ pub async fn handle_websearch_request(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        prompt_cache.update(account_key, prompt_cache_profile.as_ref());
+        prompt_cache.update(
+            account_key,
+            prompt_cache_profile.as_ref(),
+            min_cacheable_tokens,
+        );
     }
     let stream = create_websearch_sse_stream(
         model,
