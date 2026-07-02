@@ -17,6 +17,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use model::registry::ModelRegistry;
 
 #[tokio::main]
 async fn main() {
@@ -74,6 +75,33 @@ async fn main() {
     }
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
+
+    // Load model registry
+    let models_path = args
+        .models
+        .unwrap_or_else(|| "models.toml".to_string());
+    let model_registry = match std::fs::read_to_string(&models_path) {
+        Ok(content) => match ModelRegistry::from_toml(&content) {
+            Ok(registry) => {
+                tracing::info!("已加载模型配置: {}", models_path);
+                Arc::new(registry)
+            }
+            Err(e) => {
+                tracing::error!("模型配置解析失败 ({}): {}", models_path, e);
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {
+            tracing::warn!(
+                "模型配置文件不存在: {}，使用内置默认配置",
+                models_path
+            );
+            Arc::new(
+                ModelRegistry::from_toml(include_str!("../models.toml"))
+                    .expect("内置模型配置解析失败"),
+            )
+        }
+    };
 
     // 获取第一个凭据用于日志显示
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
@@ -163,6 +191,7 @@ async fn main() {
         config.extract_thinking,
         config.anthropic_prompt_cache_mode,
         config.cc_streaming_mode,
+        model_registry.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
