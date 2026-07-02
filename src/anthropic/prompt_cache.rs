@@ -21,9 +21,6 @@ use crate::model::config::PromptCacheMode;
 use super::types::{CacheControl, MessagesRequest, is_claude_code_filtered_prompt_text};
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
-const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
-const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PromptCacheUsage {
@@ -172,6 +169,7 @@ impl PromptCacheTracker {
         &self,
         account_key: &str,
         profile: Option<&PromptCacheProfile>,
+        min_cacheable_tokens: i32,
     ) -> PromptCacheUsage {
         let Some(profile) = profile else {
             return PromptCacheUsage::default();
@@ -180,7 +178,7 @@ impl PromptCacheTracker {
             return PromptCacheUsage::default();
         }
 
-        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let min_tokens = min_cacheable_tokens;
         let mut last_tokens = profile
             .breakpoints
             .last()
@@ -242,7 +240,12 @@ impl PromptCacheTracker {
         }
     }
 
-    pub fn update(&self, account_key: &str, profile: Option<&PromptCacheProfile>) {
+    pub fn update(
+        &self,
+        account_key: &str,
+        profile: Option<&PromptCacheProfile>,
+        min_cacheable_tokens: i32,
+    ) {
         let Some(profile) = profile else {
             return;
         };
@@ -250,7 +253,7 @@ impl PromptCacheTracker {
             return;
         }
 
-        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let min_tokens = min_cacheable_tokens;
         let now = Instant::now();
         let mut entries_by_account = self
             .entries_by_account
@@ -708,17 +711,6 @@ fn maybe_prune_expired(
     }
 }
 
-fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model = model.to_ascii_lowercase().replace(['_', ' '], "-");
-    if model.contains("opus") {
-        OPUS_MIN_CACHEABLE_TOKENS
-    } else if model.contains("haiku-3") {
-        HAIKU_3_MIN_CACHEABLE_TOKENS
-    } else {
-        DEFAULT_MIN_CACHEABLE_TOKENS
-    }
-}
-
 fn estimate_tokens(text: &str) -> i32 {
     ((text.chars().count() as i32 + 3) / 4).max(1)
 }
@@ -861,6 +853,8 @@ mod tests {
     use super::*;
     use crate::anthropic::types::{Message, SystemMessage};
 
+    const TEST_MIN_CACHEABLE: i32 = 1024;
+
     fn long_text() -> String {
         "abcd ".repeat(1200)
     }
@@ -962,11 +956,11 @@ mod tests {
             metadata: None,
         };
         let profile = tracker.build_profile(&req, 3000).unwrap();
-        let first = tracker.compute("account", Some(&profile));
+        let first = tracker.compute("account", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(first.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
-        tracker.update("account", Some(&profile));
-        let second = tracker.compute("account", Some(&profile));
+        tracker.update("account", Some(&profile), TEST_MIN_CACHEABLE);
+        let second = tracker.compute("account", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(second.cache_read_input_tokens > 0);
     }
 
@@ -999,7 +993,7 @@ mod tests {
         let profile = tracker.build_profile(&req, 3000).unwrap();
         let fingerprint = profile.breakpoints.last().unwrap().fingerprint;
 
-        tracker.update("account", Some(&profile));
+        tracker.update("account", Some(&profile), TEST_MIN_CACHEABLE);
         let before = {
             let entries_by_account = tracker.entries_by_account.lock().unwrap();
             entries_by_account
@@ -1009,7 +1003,7 @@ mod tests {
                 .unwrap()
         };
 
-        let usage = tracker.compute("account", Some(&profile));
+        let usage = tracker.compute("account", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(usage.cache_read_input_tokens > 0);
 
         let after = {
@@ -1021,26 +1015,6 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(after, before);
-    }
-
-    #[test]
-    fn min_cacheable_tokens_follow_anthropic_model_thresholds() {
-        assert_eq!(
-            min_cacheable_tokens_for_model("claude-opus-4-7"),
-            OPUS_MIN_CACHEABLE_TOKENS
-        );
-        assert_eq!(
-            min_cacheable_tokens_for_model("claude-haiku-3-5-20241022"),
-            HAIKU_3_MIN_CACHEABLE_TOKENS
-        );
-        assert_eq!(
-            min_cacheable_tokens_for_model("claude-haiku-4-5-20251001"),
-            DEFAULT_MIN_CACHEABLE_TOKENS
-        );
-        assert_eq!(
-            min_cacheable_tokens_for_model("claude-sonnet-4-5"),
-            DEFAULT_MIN_CACHEABLE_TOKENS
-        );
     }
 
     /// 构造含 cache_control 标记的最小请求，确保 build_profile 能拿到 breakpoints。
@@ -1083,10 +1057,10 @@ mod tests {
         let profile = tracker.build_profile(&req, 3000).unwrap();
 
         // 模拟凭据 A 写入缓存，account_key 是会话维度的 "conv:S"。
-        tracker.update("conv:S", Some(&profile));
+        tracker.update("conv:S", Some(&profile), TEST_MIN_CACHEABLE);
 
         // 模拟 fallback 到凭据 B，但 account_key 仍是同一会话 "conv:S" ——应命中。
-        let hit = tracker.compute("conv:S", Some(&profile));
+        let hit = tracker.compute("conv:S", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(
             hit.cache_read_input_tokens > 0,
             "同会话 key 换凭据后应仍命中，cache_read={}",
@@ -1094,7 +1068,7 @@ mod tests {
         );
 
         // 对比：若 key 按凭据分桶（旧行为），凭据 A 写的缓存，凭据 B 读时 key 不同 → miss。
-        let miss = tracker.compute("cred:B", Some(&profile));
+        let miss = tracker.compute("cred:B", Some(&profile), TEST_MIN_CACHEABLE);
         assert_eq!(
             miss.cache_read_input_tokens, 0,
             "不同 key 不应命中（旧凭据桶与新凭据桶独立）"
@@ -1111,14 +1085,14 @@ mod tests {
         let profile = tracker.build_profile(&req, 3000).unwrap();
 
         // S1 写入缓存。
-        tracker.update("conv:S1", Some(&profile));
+        tracker.update("conv:S1", Some(&profile), TEST_MIN_CACHEABLE);
 
         // S1 自读应命中。
-        let s1_hit = tracker.compute("conv:S1", Some(&profile));
+        let s1_hit = tracker.compute("conv:S1", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(s1_hit.cache_read_input_tokens > 0, "S1 自读应命中");
 
         // S2 读 S1 写入的缓存：不同 key，应 miss。
-        let s2_miss = tracker.compute("conv:S2", Some(&profile));
+        let s2_miss = tracker.compute("conv:S2", Some(&profile), TEST_MIN_CACHEABLE);
         assert_eq!(
             s2_miss.cache_read_input_tokens, 0,
             "S2 不应读到 S1 的缓存，防串扰"
@@ -1138,8 +1112,8 @@ mod tests {
         let profile = tracker.build_profile(&req, 3000).unwrap();
 
         // 凭据 1 兜底桶写入后自读应命中。
-        tracker.update("cred:1", Some(&profile));
-        let hit = tracker.compute("cred:1", Some(&profile));
+        tracker.update("cred:1", Some(&profile), TEST_MIN_CACHEABLE);
+        let hit = tracker.compute("cred:1", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(
             hit.cache_read_input_tokens > 0,
             "兜底 cred 桶自读应命中，cache_read={}",
@@ -1147,7 +1121,7 @@ mod tests {
         );
 
         // 换到凭据 2 兜底桶：无会话 ID 时无法跨凭据共享，miss 属已知折中（等同旧行为）。
-        let miss = tracker.compute("cred:2", Some(&profile));
+        let miss = tracker.compute("cred:2", Some(&profile), TEST_MIN_CACHEABLE);
         assert_eq!(
             miss.cache_read_input_tokens, 0,
             "无会话 ID 兜底路径换凭据 miss，等同旧行为不退化"
@@ -1177,7 +1151,7 @@ mod tests {
 
         // 第 1 次请求：凭据 A，首次建缓存
         // handler: account_key = format!("conv:{}", session_id) — credential_id 不参与
-        let usage = tracker.compute(session_id, Some(&profile));
+        let usage = tracker.compute(session_id, Some(&profile), TEST_MIN_CACHEABLE);
         assert_eq!(
             usage.cache_read_input_tokens, 0,
             "首次请求应 miss（尚无缓存）"
@@ -1187,13 +1161,13 @@ mod tests {
             "首次请求应报 creation"
         );
         // 上游成功后 update
-        tracker.update(session_id, Some(&profile));
+        tracker.update(session_id, Some(&profile), TEST_MIN_CACHEABLE);
 
         // 第 2~10 次请求：凭据在 A/B 间交替轮转，模拟 balanced round-robin
         for i in 2..=10 {
             let _credential = credentials[i % 2]; // 凭据轮转，但 handler 不用它构造 key
 
-            let usage = tracker.compute(session_id, Some(&profile));
+            let usage = tracker.compute(session_id, Some(&profile), TEST_MIN_CACHEABLE);
             assert!(
                 usage.cache_read_input_tokens > 0,
                 "第 {} 次请求（凭据={}）应命中缓存，实际 cache_read={}",
@@ -1207,7 +1181,7 @@ mod tests {
                 i
             );
             // 每次成功后 update 续期
-            tracker.update(session_id, Some(&profile));
+            tracker.update(session_id, Some(&profile), TEST_MIN_CACHEABLE);
         }
     }
 
@@ -1223,26 +1197,26 @@ mod tests {
 
         // 模拟旧行为：account_key = format!("cred:{}", credential_id)
         // 凭据 A 写入
-        tracker.update("cred:A", Some(&profile));
+        tracker.update("cred:A", Some(&profile), TEST_MIN_CACHEABLE);
 
         // 凭据 A 自读：命中
-        let hit = tracker.compute("cred:A", Some(&profile));
+        let hit = tracker.compute("cred:A", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(hit.cache_read_input_tokens > 0, "凭据 A 自读应命中");
 
         // balanced 切到凭据 B：miss（旧行为的 bug）
-        let miss = tracker.compute("cred:B", Some(&profile));
+        let miss = tracker.compute("cred:B", Some(&profile), TEST_MIN_CACHEABLE);
         assert_eq!(
             miss.cache_read_input_tokens, 0,
             "旧行为：凭据 B 读凭据 A 的缓存必然 miss"
         );
 
         // 凭据 B 写入自己的桶
-        tracker.update("cred:B", Some(&profile));
+        tracker.update("cred:B", Some(&profile), TEST_MIN_CACHEABLE);
 
         // 再切回凭据 A：又 miss（凭据 A 的缓存虽在但凭据 B 的 update 不影响凭据 A 桶的 TTL）
         // 实际上凭据 A 桶仍有缓存（还没过期），所以这里会命中——
         // 但关键是凭据 B 的那次请求是 miss 的，整体命中率 = 50%（交替 miss/hit）
-        let hit_again = tracker.compute("cred:A", Some(&profile));
+        let hit_again = tracker.compute("cred:A", Some(&profile), TEST_MIN_CACHEABLE);
         assert!(
             hit_again.cache_read_input_tokens > 0,
             "凭据 A 桶缓存未过期仍在"

@@ -89,6 +89,10 @@ impl ModelRegistry {
         Self { entries, defaults }
     }
 
+    pub fn builtin() -> Self {
+        Self::from_toml(include_str!("../../models.toml")).expect("built-in models.toml is invalid")
+    }
+
     pub fn resolve(&self, anthropic_model: &str) -> Option<&ModelEntry> {
         let model_lower = anthropic_model.to_lowercase().replace("-thinking", "");
         self.entries.iter().find(|entry| {
@@ -123,11 +127,14 @@ impl ModelRegistry {
             return None;
         }
         let entry = self.resolve(model)?;
-        entry.thinking_type.as_ref().map(|thinking_type| ThinkingOverride {
-            thinking_type: thinking_type.clone(),
-            budget_tokens: entry.thinking_budget_tokens,
-            effort: entry.thinking_effort.clone(),
-        })
+        entry
+            .thinking_type
+            .as_ref()
+            .map(|thinking_type| ThinkingOverride {
+                thinking_type: thinking_type.clone(),
+                budget_tokens: entry.thinking_budget_tokens,
+                effort: entry.thinking_effort.clone(),
+            })
     }
 
     pub fn available_models(&self) -> Vec<AvailableModel> {
@@ -160,6 +167,12 @@ impl ModelRegistry {
 
 fn default_context_window() -> i32 {
     200_000
+}
+
+impl Default for ModelRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
 }
 
 fn default_min_cacheable_tokens() -> i32 {
@@ -268,8 +281,14 @@ tier = "pro"
     #[test]
     fn test_map_model_returns_kiro_id() {
         let registry = test_config();
-        assert_eq!(registry.map_model("claude-opus-4-8"), Some("claude-opus-4.8".to_string()));
-        assert_eq!(registry.map_model("claude-haiku-4-5"), Some("claude-haiku-4.5".to_string()));
+        assert_eq!(
+            registry.map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            registry.map_model("claude-haiku-4-5"),
+            Some("claude-haiku-4.5".to_string())
+        );
     }
 
     #[test]

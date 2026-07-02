@@ -38,6 +38,7 @@ use super::websearch;
 use crate::kiro::model::requests::conversation::ConversationState;
 use crate::kiro::model::requests::kiro::InferenceConfig;
 use crate::model::config::{CcStreamingMode, PromptCacheMode};
+use crate::model::registry::ModelRegistry;
 use std::sync::Arc;
 
 /// 日志 payload 截断上限：8 KB
@@ -194,143 +195,27 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-fn available_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "claude-opus-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779753600, // May 26, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779753600, // May 26, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1773446400, // Mar 14, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1773446400, // Mar 14, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ]
-}
-
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
+
+    let models = state
+        .model_registry
+        .available_models()
+        .into_iter()
+        .map(|m| Model {
+            id: m.id,
+            object: "model".to_string(),
+            created: m.created,
+            owned_by: "anthropic".to_string(),
+            display_name: m.display_name,
+            model_type: "chat".to_string(),
+            max_tokens: m.max_tokens,
+        })
+        .collect();
 
     Json(ModelsResponse {
         object: "list".to_string(),
-        data: available_models(),
+        data: models,
     })
 }
 
@@ -365,7 +250,7 @@ pub async fn post_messages(
     };
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload, &state.model_registry);
     let stripped_headers = payload.strip_anthropic_billing_headers();
     if stripped_headers > 0 {
         tracing::debug!(
@@ -394,12 +279,13 @@ pub async fn post_messages(
             state.prompt_cache_mode,
             state.prompt_cache.clone(),
             cache_profile,
+            &state.model_registry,
         )
         .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, &state.model_registry) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -477,6 +363,7 @@ pub async fn post_messages(
             state.prompt_cache.clone(),
             cache_profile,
             stable_conversation_id,
+            &state.model_registry,
         )
         .await
     } else {
@@ -493,6 +380,7 @@ pub async fn post_messages(
             state.prompt_cache.clone(),
             cache_profile,
             stable_conversation_id,
+            &state.model_registry,
         )
         .await
     }
@@ -526,6 +414,7 @@ async fn handle_stream_request(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     stable_conversation_id: Option<String>,
+    model_registry: &Arc<ModelRegistry>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_stream_with_context(request_body).await {
@@ -540,18 +429,30 @@ async fn handle_stream_request(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
-    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
+    let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
+    let fallback_cache_usage = prompt_cache.compute(
+        &account_key,
+        prompt_cache_profile.as_ref(),
+        min_cacheable_tokens,
+    );
+    let context_window = model_registry.context_window(model);
 
     // 创建流处理上下文
-    let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
-            .with_prompt_cache(
-                prompt_cache_mode,
-                Some(prompt_cache),
-                Some(account_key),
-                prompt_cache_profile,
-                fallback_cache_usage,
-            );
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        context_window,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        min_cacheable_tokens,
+    )
+    .with_prompt_cache(
+        prompt_cache_mode,
+        Some(prompt_cache),
+        Some(account_key),
+        prompt_cache_profile,
+        fallback_cache_usage,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -696,8 +597,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 #[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
@@ -711,6 +610,7 @@ async fn handle_non_stream_request(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     stable_conversation_id: Option<String>,
+    model_registry: &Arc<ModelRegistry>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_with_context(request_body).await {
@@ -725,7 +625,12 @@ async fn handle_non_stream_request(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
-    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
+    let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
+    let fallback_cache_usage = prompt_cache.compute(
+        &account_key,
+        prompt_cache_profile.as_ref(),
+        min_cacheable_tokens,
+    );
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -815,7 +720,7 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            let window_size = model_registry.context_window(model);
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
@@ -942,7 +847,11 @@ async fn handle_non_stream_request(
         prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        prompt_cache.update(&account_key, prompt_cache_profile.as_ref());
+        prompt_cache.update(
+            &account_key,
+            prompt_cache_profile.as_ref(),
+            min_cacheable_tokens,
+        );
     }
 
     // 构建 Anthropic 响应
@@ -970,41 +879,31 @@ async fn handle_non_stream_request(
 /// - Opus 4.6/4.7/4.8：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+fn override_thinking_from_model_name(
+    payload: &mut MessagesRequest,
+    registry: &crate::model::registry::ModelRegistry,
+) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
     }
 
-    let is_adaptive_opus = model_lower.contains("opus")
-        && (model_lower.contains("4-6")
-            || model_lower.contains("4.6")
-            || model_lower.contains("4-7")
-            || model_lower.contains("4.7")
-            || model_lower.contains("4-8")
-            || model_lower.contains("4.8"));
+    // 使用 registry 的 thinking_override 方法
+    if let Some(thinking) = registry.thinking_override(&payload.model) {
+        tracing::info!(
+            model = %payload.model,
+            thinking_type = %thinking.thinking_type,
+            "模型名包含 thinking 后缀，覆写 thinking 配置"
+        );
 
-    let thinking_type = if is_adaptive_opus {
-        "adaptive"
-    } else {
-        "enabled"
-    };
-
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
-
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-    });
-
-    if is_adaptive_opus {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
+        payload.thinking = Some(Thinking {
+            thinking_type: thinking.thinking_type,
+            budget_tokens: thinking.budget_tokens,
         });
+
+        if let Some(effort_str) = thinking.effort {
+            payload.output_config = Some(OutputConfig { effort: effort_str });
+        }
     }
 }
 
@@ -1073,7 +972,7 @@ pub async fn post_messages_cc(
     };
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload, &state.model_registry);
     let stripped_headers = payload.strip_anthropic_billing_headers();
     if stripped_headers > 0 {
         tracing::debug!(
@@ -1102,12 +1001,13 @@ pub async fn post_messages_cc(
             state.prompt_cache_mode,
             state.prompt_cache.clone(),
             cache_profile,
+            &state.model_registry,
         )
         .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, &state.model_registry) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1186,6 +1086,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache.clone(),
                     cache_profile,
                     stable_conversation_id,
+                    &state.model_registry,
                 )
                 .await
             }
@@ -1201,6 +1102,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache.clone(),
                     cache_profile,
                     stable_conversation_id,
+                    &state.model_registry,
                 )
                 .await
             }
@@ -1216,6 +1118,7 @@ pub async fn post_messages_cc(
                     state.prompt_cache.clone(),
                     cache_profile,
                     stable_conversation_id,
+                    &state.model_registry,
                 )
                 .await
             }
@@ -1234,6 +1137,7 @@ pub async fn post_messages_cc(
             state.prompt_cache.clone(),
             cache_profile,
             stable_conversation_id,
+            &state.model_registry,
         )
         .await
     }
@@ -1252,6 +1156,7 @@ async fn handle_stream_request_prefix_buffered(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     stable_conversation_id: Option<String>,
+    model_registry: &Arc<ModelRegistry>,
 ) -> Response {
     let api_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
@@ -1265,13 +1170,21 @@ async fn handle_stream_request_prefix_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
-    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
+    let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
+    let context_window = model_registry.context_window(model);
+    let fallback_cache_usage = prompt_cache.compute(
+        &account_key,
+        prompt_cache_profile.as_ref(),
+        min_cacheable_tokens,
+    );
 
     let ctx = PrefixBufferedStreamContext::new(
         model,
+        context_window,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
+        min_cacheable_tokens,
     )
     .with_prompt_cache(
         prompt_cache_mode,
@@ -1411,6 +1324,7 @@ async fn handle_stream_request_buffered(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     stable_conversation_id: Option<String>,
+    model_registry: &Arc<ModelRegistry>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_stream_with_context(request_body).await {
@@ -1425,14 +1339,22 @@ async fn handle_stream_request_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
-    let fallback_cache_usage = prompt_cache.compute(&account_key, prompt_cache_profile.as_ref());
+    let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
+    let context_window = model_registry.context_window(model);
+    let fallback_cache_usage = prompt_cache.compute(
+        &account_key,
+        prompt_cache_profile.as_ref(),
+        min_cacheable_tokens,
+    );
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(
         model,
+        context_window,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
+        min_cacheable_tokens,
     )
     .with_prompt_cache(
         prompt_cache_mode,
@@ -1560,14 +1482,16 @@ mod tests {
 
     #[test]
     fn test_available_models_includes_opus_4_7() {
-        let models = available_models();
+        let registry = crate::model::registry::ModelRegistry::default();
+        let models = registry.available_models();
         assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
         assert!(models.iter().any(|m| m.id == "claude-opus-4-7-thinking"));
     }
 
     #[test]
     fn test_available_models_includes_opus_4_8() {
-        let models = available_models();
+        let registry = crate::model::registry::ModelRegistry::default();
+        let models = registry.available_models();
         assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
         assert!(models.iter().any(|m| m.id == "claude-opus-4-8-thinking"));
     }
@@ -1576,7 +1500,10 @@ mod tests {
     fn test_override_thinking_opus_4_8_uses_adaptive() {
         let mut payload = request_for_model("claude-opus-4-8-thinking");
 
-        override_thinking_from_model_name(&mut payload);
+        override_thinking_from_model_name(
+            &mut payload,
+            &crate::model::registry::ModelRegistry::default(),
+        );
 
         let thinking = payload.thinking.unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
@@ -1591,7 +1518,10 @@ mod tests {
     fn test_override_thinking_opus_4_7_uses_adaptive() {
         let mut payload = request_for_model("claude-opus-4-7-thinking");
 
-        override_thinking_from_model_name(&mut payload);
+        override_thinking_from_model_name(
+            &mut payload,
+            &crate::model::registry::ModelRegistry::default(),
+        );
 
         let thinking = payload.thinking.unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");

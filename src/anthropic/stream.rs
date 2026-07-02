@@ -541,14 +541,14 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
     pub state_manager: SseStateManager,
     /// 请求的模型名称
     pub model: String,
+    /// 上下文窗口大小（预解析）
+    pub context_window: i32,
     /// 消息 ID
     pub message_id: String,
     /// 输入 tokens（估算值）
@@ -561,6 +561,7 @@ pub struct StreamContext {
     pub prompt_cache: Option<Arc<PromptCacheTracker>>,
     pub prompt_cache_account: Option<String>,
     pub prompt_cache_profile: Option<PromptCacheProfile>,
+    pub min_cacheable_tokens: i32,
     pub prompt_cache_usage: PromptCacheUsage,
     pub include_prompt_cache_fields: bool,
     pub upstream_prompt_cache_usage: Option<PromptCacheUsage>,
@@ -597,13 +598,16 @@ impl StreamContext {
     /// 创建启用thinking的StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
+        context_window: i32,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        min_cacheable_tokens: i32,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
+            context_window,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
@@ -612,6 +616,7 @@ impl StreamContext {
             prompt_cache: None,
             prompt_cache_account: None,
             prompt_cache_profile: None,
+            min_cacheable_tokens,
             prompt_cache_usage: PromptCacheUsage::default(),
             include_prompt_cache_fields: false,
             upstream_prompt_cache_usage: None,
@@ -718,7 +723,7 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                let window_size = self.context_window;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -1328,7 +1333,7 @@ impl StreamContext {
         ) else {
             return;
         };
-        tracker.update(account, Some(profile));
+        tracker.update(account, Some(profile), self.min_cacheable_tokens);
     }
 }
 
@@ -1355,15 +1360,19 @@ impl BufferedStreamContext {
     /// 创建缓冲流上下文
     pub fn new(
         model: impl Into<String>,
+        context_window: i32,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        min_cacheable_tokens: i32,
     ) -> Self {
         let inner = StreamContext::new_with_thinking(
             model,
+            context_window,
             estimated_input_tokens,
             thinking_enabled,
             tool_name_map,
+            min_cacheable_tokens,
         );
         Self {
             inner,
@@ -1458,16 +1467,20 @@ pub struct PrefixBufferedStreamContext {
 impl PrefixBufferedStreamContext {
     pub fn new(
         model: impl Into<String>,
+        context_window: i32,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        min_cacheable_tokens: i32,
     ) -> Self {
         Self {
             inner: StreamContext::new_with_thinking(
                 model,
+                context_window,
                 estimated_input_tokens,
                 thinking_enabled,
                 tool_name_map,
+                min_cacheable_tokens,
             ),
             event_buffer: Vec::new(),
             initial_events_generated: false,
@@ -1649,7 +1662,7 @@ mod tests {
             "mcp__very_long_original_tool_name".to_string(),
         );
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 200000, 100, false, map, 1024);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1677,9 +1690,11 @@ mod tests {
     fn stream_final_usage_prefers_upstream_metering_tokens() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-sonnet-4-5-20250929",
+            200_000,
             10,
             false,
             HashMap::new(),
+            1024,
         );
         let _ = ctx.generate_initial_events();
 
@@ -1704,9 +1719,11 @@ mod tests {
     fn stream_final_usage_derives_input_from_total_and_output_tokens() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-sonnet-4-5-20250929",
+            200_000,
             10,
             false,
             HashMap::new(),
+            1024,
         );
         let _ = ctx.generate_initial_events();
 
@@ -1730,9 +1747,11 @@ mod tests {
     fn prefix_buffer_releases_message_start_when_usage_arrives() {
         let mut ctx = PrefixBufferedStreamContext::new(
             "claude-sonnet-4-5-20250929",
+            200_000,
             10,
             false,
             HashMap::new(),
+            1024,
         );
 
         let events = ctx.process_event(&Event::Metering(json!({
@@ -1754,9 +1773,11 @@ mod tests {
     fn prefix_buffer_timeout_releases_with_estimated_usage() {
         let mut ctx = PrefixBufferedStreamContext::new(
             "claude-sonnet-4-5-20250929",
+            200_000,
             10,
             false,
             HashMap::new(),
+            1024,
         );
 
         let buffered = ctx.process_event(&Event::AssistantResponse(
@@ -1783,9 +1804,11 @@ mod tests {
     fn prefix_buffer_timeout_before_first_upstream_event_emits_message_start() {
         let mut ctx = PrefixBufferedStreamContext::new(
             "claude-sonnet-4-5-20250929",
+            200_000,
             10,
             false,
             HashMap::new(),
+            1024,
         );
 
         let events = ctx.release_due_to_timeout();
@@ -1816,8 +1839,14 @@ mod tests {
 
     #[test]
     fn buffered_stream_rewrites_message_start_with_upstream_metering_tokens() {
-        let mut ctx =
-            BufferedStreamContext::new("claude-sonnet-4-5-20250929", 10, false, HashMap::new());
+        let mut ctx = BufferedStreamContext::new(
+            "claude-sonnet-4-5-20250929",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
 
         ctx.process_and_buffer(&Event::Metering(json!({
             "usage": {
@@ -1843,7 +1872,8 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1904,7 +1934,8 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -2111,7 +2142,8 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2163,7 +2195,8 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2183,7 +2216,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -2212,7 +2246,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -2244,7 +2279,8 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -2273,7 +2309,8 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -2321,7 +2358,8 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2344,7 +2382,8 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2366,7 +2405,8 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2390,7 +2430,8 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2423,7 +2464,8 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2478,7 +2520,8 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2499,7 +2542,8 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, true, HashMap::new(), 1024);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2556,7 +2600,8 @@ mod tests {
     #[test]
     fn test_leak_sliding_window_cross_chunk() {
         // 标记 `<invoke name="` 跨 chunk 边界切断，滑动窗口拼接后仍应命中
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         ctx.process_assistant_response("一些前置正常文本，长到足以触发窗口截断的内容……<inv");
         assert!(ctx.tool_call_leak_marker.is_none(), "半截标记不应误命中");
         ctx.process_assistant_response("oke name=\"Bash\">");
@@ -2570,7 +2615,8 @@ mod tests {
     #[test]
     fn test_leak_window_is_bounded() {
         // 滑动窗口内存 O(1)：喂入大量无标记文本后，tail 长度不超过窗口上限
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         for _ in 0..1000 {
             ctx.process_assistant_response("这是一段没有任何工具调用标记的普通长文本内容。");
         }
@@ -2586,7 +2632,8 @@ mod tests {
     #[test]
     fn test_leak_short_circuit_after_hit() {
         // 命中后短路：marker 已置位则后续 chunk 不再拼接（tail 保持清空）
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         ctx.process_assistant_response("<invoke name=\"Bash\">");
         assert_eq!(ctx.tool_call_leak_marker, Some("<invoke name=\""));
         assert!(ctx.tool_call_leak_tail.is_empty());
@@ -2600,7 +2647,8 @@ mod tests {
     #[test]
     fn test_leak_overrides_stop_reason_to_max_tokens() {
         // 集成：文本含 invoke 标签 + 无结构化 tool_use → 命中告警条件
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         ctx.process_assistant_response("分析完成。\n\ncall\n<invoke name=\"Bash\">\ncmd</invoke>");
         ctx.generate_final_events();
         assert!(
@@ -2617,7 +2665,8 @@ mod tests {
     #[test]
     fn test_leak_no_warn_when_real_tool_use() {
         // 回归：真结构化 tool_use 在场时，即便文本恰含 invoke 标签也不告警（不误报）
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         ctx.process_assistant_response("文本里讨论了 <invoke name=\"X\"> 的语法");
         ctx.state_manager.set_has_tool_use(true);
         ctx.generate_final_events();
@@ -2635,7 +2684,8 @@ mod tests {
     #[test]
     fn test_leak_does_not_override_explicit_stop_reason() {
         // 当已有显式 stop_reason（如 context exceeded）时，泄漏检测不覆盖
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
         ctx.state_manager
             .set_stop_reason("model_context_window_exceeded");
         ctx.process_assistant_response("触发泄漏\n<invoke name=\"Bash\">\n参数</invoke>");

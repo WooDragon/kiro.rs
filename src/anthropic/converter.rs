@@ -14,6 +14,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::registry::ModelRegistry;
 
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -140,60 +141,6 @@ Complete all chunked operations without commentary.";
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &str =
     "[Tool returned an image; the image is attached to this message.]";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-///
-/// 按照用户要求：
-/// - sonnet 4.6/4-6 → claude-sonnet-4.6
-/// - 其他 sonnet → claude-sonnet-4.5
-/// - opus 4.5/4-5 → claude-opus-4.5
-/// - opus 4.7/4-7 → claude-opus-4.7
-/// - opus 4.8/4-8 → claude-opus-4.8
-/// - 其他 opus → claude-opus-4.6
-/// - 所有 haiku → claude-haiku-4.5
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else {
-            Some("claude-sonnet-4.5".to_string())
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else {
-            Some("claude-opus-4.6".to_string())
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
-    }
-}
-
-/// 根据模型名称返回对应的上下文窗口大小
-///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
-    }
-}
-
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -300,9 +247,13 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    registry: &ModelRegistry,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
-    let model_id = map_model(&req.model)
+    let model_id = registry
+        .map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     // 2. 检查消息列表
@@ -1065,16 +1016,24 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::registry::ModelRegistry;
+
+    fn test_registry() -> ModelRegistry {
+        ModelRegistry::from_toml(include_str!("../../models.toml")).unwrap()
+    }
 
     #[test]
     fn test_map_model_sonnet() {
+        let registry = test_registry();
         assert!(
-            map_model("claude-sonnet-4-20250514")
+            registry
+                .map_model("claude-sonnet-4-20250514")
                 .unwrap()
                 .contains("sonnet")
         );
         assert!(
-            map_model("claude-3-5-sonnet-20241022")
+            registry
+                .map_model("claude-3-5-sonnet-20241022")
                 .unwrap()
                 .contains("sonnet")
         );
@@ -1082,8 +1041,10 @@ mod tests {
 
     #[test]
     fn test_map_model_opus() {
+        let registry = test_registry();
         assert!(
-            map_model("claude-opus-4-20250514")
+            registry
+                .map_model("claude-opus-4-20250514")
                 .unwrap()
                 .contains("opus")
         );
@@ -1091,8 +1052,10 @@ mod tests {
 
     #[test]
     fn test_map_model_haiku() {
+        let registry = test_registry();
         assert!(
-            map_model("claude-haiku-4-20250514")
+            registry
+                .map_model("claude-haiku-4-20250514")
                 .unwrap()
                 .contains("haiku")
         );
@@ -1100,68 +1063,78 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        let registry = test_registry();
+        assert!(registry.map_model("gpt-4").is_none());
     }
 
     #[test]
     fn test_map_model_thinking_suffix_sonnet() {
+        let registry = test_registry();
         // thinking 后缀不应影响 sonnet 模型映射
-        let result = map_model("claude-sonnet-4-5-20250929-thinking");
+        let result = registry.map_model("claude-sonnet-4-5-20250929-thinking");
         assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_5() {
+        let registry = test_registry();
         // thinking 后缀不应影响 opus 4.5 模型映射
-        let result = map_model("claude-opus-4-5-20251101-thinking");
+        let result = registry.map_model("claude-opus-4-5-20251101-thinking");
         assert_eq!(result, Some("claude-opus-4.5".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_6() {
+        let registry = test_registry();
         // thinking 后缀不应影响 opus 4.6 模型映射
-        let result = map_model("claude-opus-4-6-thinking");
+        let result = registry.map_model("claude-opus-4-6-thinking");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
     }
 
     #[test]
     fn test_map_model_opus_4_7() {
-        let result = map_model("claude-opus-4-7-thinking");
+        let registry = test_registry();
+        let result = registry.map_model("claude-opus-4-7-thinking");
         assert_eq!(result, Some("claude-opus-4.7".to_string()));
 
-        let dotted = map_model("claude-opus-4.7");
+        let dotted = registry.map_model("claude-opus-4.7");
         assert_eq!(dotted, Some("claude-opus-4.7".to_string()));
     }
 
     #[test]
     fn test_map_model_opus_4_8() {
-        let result = map_model("claude-opus-4-8-thinking");
+        let registry = test_registry();
+        let result = registry.map_model("claude-opus-4-8-thinking");
         assert_eq!(result, Some("claude-opus-4.8".to_string()));
 
-        let dotted = map_model("claude-opus-4.8");
+        let dotted = registry.map_model("claude-opus-4.8");
         assert_eq!(dotted, Some("claude-opus-4.8".to_string()));
     }
 
     #[test]
     fn test_map_model_other_opus_defaults_to_4_6() {
-        let result = map_model("claude-opus-4-20250514");
+        let registry = test_registry();
+        let result = registry.map_model("claude-opus-4-20250514");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
     }
 
     #[test]
     fn test_context_window_opus_4_7() {
-        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        let registry = test_registry();
+        assert_eq!(registry.context_window("claude-opus-4-7"), 1_000_000);
     }
 
     #[test]
     fn test_context_window_opus_4_8() {
-        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        let registry = test_registry();
+        assert_eq!(registry.context_window("claude-opus-4-8"), 1_000_000);
     }
 
     #[test]
     fn test_map_model_thinking_suffix_haiku() {
+        let registry = test_registry();
         // thinking 后缀不应影响 haiku 模型映射
-        let result = map_model("claude-haiku-4-5-20251001-thinking");
+        let result = registry.map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
     }
 
@@ -1216,7 +1189,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("request should convert");
+        let result = convert_request(&req, &test_registry()).expect("request should convert");
         let system_history = match &result.conversation_state.history[0] {
             Message::User(msg) => &msg.user_input_message.content,
             _ => panic!("expected system prompt to be converted as user history"),
@@ -1347,7 +1320,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -1408,7 +1381,7 @@ mod tests {
                 metadata: None,
             };
 
-            let result = convert_request(&req).unwrap();
+            let result = convert_request(&req, &test_registry()).unwrap();
             let tools = &result
                 .conversation_state
                 .current_message
@@ -1464,7 +1437,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
         let tools = &result
             .conversation_state
             .current_message
@@ -1512,7 +1485,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
         let tools = &result
             .conversation_state
             .current_message
@@ -1676,7 +1649,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("opus 4.8 request should convert");
+        let result =
+            convert_request(&req, &test_registry()).expect("opus 4.8 request should convert");
         let user_input = &result.conversation_state.current_message.user_input_message;
         assert_eq!(user_input.model_id, "claude-opus-4.8");
 
@@ -1765,7 +1739,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -1824,7 +1798,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1936,7 +1910,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("multi-turn agent loop should convert");
+        let result =
+            convert_request(&req, &test_registry()).expect("multi-turn agent loop should convert");
         let history = &result.conversation_state.history;
 
         // 不变量 1（无空壳轮）：history 里绝不出现单空格 " " 空壳 assistant 轮（#26 死循环根因），
@@ -2167,7 +2142,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("multi-turn tool request should convert");
+        let result = convert_request(&req, &test_registry())
+            .expect("multi-turn tool request should convert");
 
         // 会引起模型模仿的危险模式
         let dangerous_patterns = [
@@ -2292,7 +2268,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -2322,7 +2298,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &test_registry()).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -2760,7 +2736,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req);
+        let result = convert_request(&req, &test_registry());
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",
@@ -2835,7 +2811,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("should convert");
+        let result = convert_request(&req, &test_registry()).expect("should convert");
         let tool_results = &result
             .conversation_state
             .current_message
@@ -2901,7 +2877,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("should convert");
+        let result = convert_request(&req, &test_registry()).expect("should convert");
         let tool_results = &result
             .conversation_state
             .current_message
@@ -2972,7 +2948,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("should convert");
+        let result = convert_request(&req, &test_registry()).expect("should convert");
 
         // 危险模式不应出现在 assistant content 里
         let dangerous_patterns = [
@@ -3075,7 +3051,7 @@ mod tests {
             }
         }]);
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
 
         let user_input = &result.conversation_state.current_message.user_input_message;
 
@@ -3101,7 +3077,7 @@ mod tests {
             }
         }]);
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
 
         let tool_results = &result
             .conversation_state
@@ -3137,7 +3113,7 @@ mod tests {
             }
         ]);
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
 
         let user_input = &result.conversation_state.current_message.user_input_message;
 
@@ -3168,7 +3144,7 @@ mod tests {
             }
         ]);
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
 
         let images = &result
             .conversation_state
@@ -3194,7 +3170,8 @@ mod tests {
         }]);
         let req = make_req_with_tool_result_image(content);
         // 不应 panic
-        let result = convert_request(&req).expect("应成功转换，不支持的格式静默跳过");
+        let result =
+            convert_request(&req, &test_registry()).expect("应成功转换，不支持的格式静默跳过");
 
         let images = &result
             .conversation_state
@@ -3209,7 +3186,7 @@ mod tests {
     fn test_issue35_regression_empty_tool_result_still_uses_empty_placeholder() {
         let content = serde_json::json!("");
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
 
         let tool_results = &result
             .conversation_state
@@ -3238,7 +3215,7 @@ mod tests {
             }
         }]);
         let req = make_req_with_tool_result_image(content);
-        let result = convert_request(&req).expect("端到端转换应成功");
+        let result = convert_request(&req, &test_registry()).expect("端到端转换应成功");
 
         let user_input = &result.conversation_state.current_message.user_input_message;
 
@@ -3322,7 +3299,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("应成功转换");
+        let result = convert_request(&req, &test_registry()).expect("应成功转换");
         let user_input = &result.conversation_state.current_message.user_input_message;
 
         // (a) 图片仍 hoist 到 images
@@ -3390,7 +3367,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("request should convert");
+        let result = convert_request(&req, &test_registry()).expect("request should convert");
         let system_content = match &result.conversation_state.history[0] {
             Message::User(msg) => &msg.user_input_message.content,
             _ => panic!("history[0] should be User (system pair)"),
@@ -3446,7 +3423,8 @@ mod tests {
             metadata: None,
         };
 
-        let result_2a = convert_request(&req_2a).expect("2a: request should convert");
+        let result_2a =
+            convert_request(&req_2a, &test_registry()).expect("2a: request should convert");
         let current_content = &result_2a
             .conversation_state
             .current_message
@@ -3496,7 +3474,8 @@ mod tests {
             metadata: None,
         };
 
-        let result_2b = convert_request(&req_2b).expect("2b: request should convert");
+        let result_2b =
+            convert_request(&req_2b, &test_registry()).expect("2b: request should convert");
         // msg[2] 经 build_history 的 trailing user_buffer 走 merge_user_messages 处理。
         // history 可能 merge 成 [user(start+reminder), assistant(OK)]，
         // 也可能是 [user(start), assistant(OK), user(reminder)]。
@@ -3564,7 +3543,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("request should convert");
+        let result = convert_request(&req, &test_registry()).expect("request should convert");
 
         // 名称在 63 字符以内，不触发缩短
         assert!(

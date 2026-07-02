@@ -77,9 +77,7 @@ async fn main() {
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // Load model registry
-    let models_path = args
-        .models
-        .unwrap_or_else(|| "models.toml".to_string());
+    let models_path = args.models.unwrap_or_else(|| "models.toml".to_string());
     let model_registry = match std::fs::read_to_string(&models_path) {
         Ok(content) => match ModelRegistry::from_toml(&content) {
             Ok(registry) => {
@@ -92,10 +90,7 @@ async fn main() {
             }
         },
         Err(_) => {
-            tracing::warn!(
-                "模型配置文件不存在: {}，使用内置默认配置",
-                models_path
-            );
+            tracing::warn!("模型配置文件不存在: {}，使用内置默认配置", models_path);
             Arc::new(
                 ModelRegistry::from_toml(include_str!("../models.toml"))
                     .expect("内置模型配置解析失败"),
@@ -162,6 +157,7 @@ async fn main() {
         proxy_config.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
+        model_registry.clone(),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
