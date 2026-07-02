@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CcStreamingMode, PromptCacheMode};
+use crate::model::registry::ModelRegistry;
 
 use super::prompt_cache::PromptCacheTracker;
 use super::types::ErrorResponse;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub prompt_cache_mode: PromptCacheMode,
     pub cc_streaming_mode: CcStreamingMode,
     pub prompt_cache: Arc<PromptCacheTracker>,
+    pub model_registry: Arc<ModelRegistry>,
 }
 
 impl AppState {
@@ -41,6 +43,7 @@ impl AppState {
         extract_thinking: bool,
         prompt_cache_mode: PromptCacheMode,
         cc_streaming_mode: CcStreamingMode,
+        model_registry: Arc<ModelRegistry>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -49,6 +52,7 @@ impl AppState {
             prompt_cache_mode,
             cc_streaming_mode,
             prompt_cache: Arc::new(PromptCacheTracker::default()),
+            model_registry,
         }
     }
 
