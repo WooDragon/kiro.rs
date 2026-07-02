@@ -123,7 +123,7 @@ impl ModelRegistry {
     }
 
     pub fn thinking_override(&self, model: &str) -> Option<ThinkingOverride> {
-        if !model.ends_with("-thinking") {
+        if !model.to_lowercase().ends_with("-thinking") {
             return None;
         }
         let entry = self.resolve(model)?;

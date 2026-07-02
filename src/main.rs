@@ -89,12 +89,16 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!("模型配置文件不存在: {}，使用内置默认配置", models_path);
             Arc::new(
                 ModelRegistry::from_toml(include_str!("../models.toml"))
                     .expect("内置模型配置解析失败"),
             )
+        }
+        Err(e) => {
+            tracing::error!("读取模型配置失败 ({}): {}", models_path, e);
+            std::process::exit(1);
         }
     };
 

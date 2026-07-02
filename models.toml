@@ -2,12 +2,15 @@
 # This file is compiled into the binary as defaults and can be customized by users.
 #
 # Matching algorithm:
-# 1. Extract family from incoming model string (opus/sonnet/haiku)
-# 2. Iterate models in TOML order
-# 3. Match family AND (empty match_version OR any match_version substring found)
-# 4. Return first match
+# 1. Entries are partitioned: versioned (match_version non-empty) first, then fallbacks (empty).
+#    Within each partition, original TOML order is preserved (stable sort).
+# 2. Incoming model string is lowercased, then matched against entries in order.
+# 3. An entry matches if match_family is found AND any match_version substring is found
+#    (or match_version is empty = family-level fallback).
+# 4. First match wins.
 #
-# Therefore: versioned entries MUST precede fallback entries within same family
+# Consequence: within a family, put more specific versions before general ones.
+# Fallback entries (match_version = []) always come after all versioned entries regardless of TOML position.
 
 [defaults]
 context_window = 200_000
