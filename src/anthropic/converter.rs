@@ -758,9 +758,8 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
 
 fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
     let t = req.thinking.as_ref()?;
-    match t.thinking_type.as_str() {
-        "enabled" | "adaptive" => {}
-        _ => return None,
+    if t.thinking_type != "adaptive" {
+        return None;
     }
     let effort = req
         .output_config
@@ -3619,7 +3618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_additional_model_request_fields_enabled_defaults_effort() {
+    fn test_build_additional_model_request_fields_none_for_enabled() {
         let req = MessagesRequest {
             model: "claude-opus-4-5".to_string(),
             max_tokens: 1024,
@@ -3638,9 +3637,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = build_additional_model_request_fields(&req).unwrap();
-        assert_eq!(result["thinking"]["type"], "adaptive");
-        assert_eq!(result["output_config"]["effort"], "high");
+        assert!(build_additional_model_request_fields(&req).is_none());
     }
 
     #[test]
