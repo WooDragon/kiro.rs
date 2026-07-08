@@ -303,7 +303,7 @@ pub fn convert_request(
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(req, messages, &model_id, registry, &mut tool_name_map)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -385,7 +385,7 @@ pub fn convert_request(
         tool_name_map,
         inference_config,
         stable_conversation_id,
-        additional_model_request_fields: build_additional_model_request_fields(req),
+        additional_model_request_fields: build_additional_model_request_fields(req, registry),
     })
 }
 
@@ -734,38 +734,74 @@ fn convert_tools(
 }
 
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
-        }
-    }
-    None
-}
-
-fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
+///
+/// 判据改为「模型配置 thinking_type」而非「请求 thinking.type」（#63 遗留问题修正）：
+/// Claude Code 实际只发标准 `thinking:{type:"enabled", budget_tokens:N}`，从不发
+/// `adaptive`；但 models.toml 里普通模型（如 claude-sonnet-5）早已配置 thinking_type
+/// = adaptive。旧逻辑读请求 type 判断，导致这类模型永远走不到结构化 effort 透传路径。
+///
+/// 两个分支对「请求无 thinking 字段」的处理刻意不对称：
+/// - 配置 enabled：无 thinking 字段 → 不注入前缀，保持老模型常规请求纯净
+///   （Never break userspace，不能因为改判据就污染所有普通请求）；
+/// - 配置 adaptive：无 thinking 字段也照常产出结构化字段（见 `build_additional_model_request_fields`），
+///   因为 Sonnet-5 官方客户端常省略 thinking 字段。
+fn generate_thinking_prefix(req: &MessagesRequest, registry: &ModelRegistry) -> Option<String> {
+    // disabled 优先级最高：客户端主动关闭 thinking，任何配置下都不产前缀。
     let t = req.thinking.as_ref()?;
-    if t.thinking_type != "adaptive" {
+    if t.thinking_type == "disabled" {
         return None;
     }
+
+    // 配置为 adaptive 时不吐文本前缀，交给结构化字段透传。
+    let config = registry.thinking_config(&req.model);
+    if config.thinking_type != "enabled" {
+        return None;
+    }
+
+    Some(format!(
+        "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+        t.budget_tokens
+    ))
+}
+
+/// 构建结构化 `additionalModelRequestFields`（thinking + effort 透传）
+///
+/// 判据同样改为模型配置 thinking_type。上游对 adaptive + budget_tokens 宽容无视
+/// （黑盒探针 C 实测四臂全 200），故构造 payload 时不引用 budget_tokens；
+/// 若客户端原始请求带了 thinking 字段（非 disabled），打 WARN 提示 budget_tokens
+/// 被忽略，不静默吞（分支 a）。
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    registry: &ModelRegistry,
+) -> Option<serde_json::Value> {
+    // disabled 优先级最高：客户端主动关闭 thinking，任何配置下都不产结构化字段。
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.thinking_type == "disabled")
+    {
+        return None;
+    }
+
+    let config = registry.thinking_config(&req.model);
+    if config.thinking_type != "adaptive" {
+        return None;
+    }
+
+    if let Some(t) = &req.thinking {
+        tracing::warn!(
+            model = %req.model,
+            budget_tokens = t.budget_tokens,
+            "adaptive 模式下 budget_tokens 被忽略，成本由 effort 控制"
+        );
+    }
+
     let effort = req
         .output_config
         .as_ref()
-        .map(|c| c.effort.as_str())
-        .unwrap_or("high");
+        .map(|c| c.effort.clone())
+        .or_else(|| config.effort.clone())
+        .unwrap_or_else(|| "high".to_string());
 
     Some(serde_json::json!({
         "thinking": { "type": "adaptive" },
@@ -786,6 +822,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
+/// * `registry` - 模型注册表，用于按 `req.model` resolve 出配置驱动的 thinking_type
 ///
 /// # Returns
 /// 构建好的历史消息列表。
@@ -793,12 +830,13 @@ fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
     model_id: &str,
+    registry: &ModelRegistry,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
+    let thinking_prefix = generate_thinking_prefix(req, registry);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -3590,121 +3628,196 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_additional_model_request_fields_adaptive() {
-        let req = MessagesRequest {
-            model: "claude-opus-4-8".to_string(),
+    // === thinking/effort 透传：配置驱动判据矩阵测试 ===
+    //
+    // 判据从「请求 thinking.type」改为「模型配置 thinking_type」（registry.thinking_config）。
+    // claude-sonnet-5 在 models.toml 中配置 thinking_type = adaptive；
+    // claude-opus-4-5-20251101 配置 thinking_type = enabled——用这两个真实模型名
+    // 覆盖矩阵中「配置 adaptive」与「配置 enabled」两条分支及其非对称的空 thinking 处理。
+
+    fn thinking_req(
+        model: &str,
+        thinking: Option<super::super::types::Thinking>,
+        output_config: Option<super::super::types::OutputConfig>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
             system: None,
             tools: None,
             tool_choice: None,
-            thinking: Some(super::super::types::Thinking {
-                thinking_type: "adaptive".to_string(),
-                budget_tokens: 20000,
-            }),
-            output_config: Some(super::super::types::OutputConfig {
-                effort: "max".to_string(),
-            }),
+            thinking,
+            output_config,
             temperature: None,
             top_p: None,
             metadata: None,
-        };
-
-        let result = build_additional_model_request_fields(&req).unwrap();
-        assert_eq!(result["thinking"]["type"], "adaptive");
-        assert_eq!(result["output_config"]["effort"], "max");
+        }
     }
-
     #[test]
-    fn test_build_additional_model_request_fields_adaptive_defaults_effort() {
-        let req = MessagesRequest {
-            model: "claude-opus-4-8".to_string(),
-            max_tokens: 1024,
-            messages: vec![],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: Some(super::super::types::Thinking {
-                thinking_type: "adaptive".to_string(),
-                budget_tokens: 20000,
-            }),
-            output_config: None,
-            temperature: None,
-            top_p: None,
-            metadata: None,
-        };
-
-        let result = build_additional_model_request_fields(&req).unwrap();
-        assert_eq!(result["thinking"]["type"], "adaptive");
-        assert_eq!(result["output_config"]["effort"], "high");
-    }
-
-    #[test]
-    fn test_build_additional_model_request_fields_none_for_enabled() {
-        let req = MessagesRequest {
-            model: "claude-opus-4-5".to_string(),
-            max_tokens: 1024,
-            messages: vec![],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: Some(super::super::types::Thinking {
+    fn test_thinking_matrix_enabled_request_adaptive_config_produces_structured() {
+        // 1. 请求 enabled × claude-sonnet-5（配置 adaptive）→ 结构化 adaptive+effort，无文本前缀
+        let req = thinking_req(
+            "claude-sonnet-5",
+            Some(super::super::types::Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 20000,
             }),
-            output_config: None,
-            temperature: None,
-            top_p: None,
-            metadata: None,
-        };
+            None,
+        );
+        let registry = test_registry();
 
-        assert!(build_additional_model_request_fields(&req).is_none());
+        let structured = build_additional_model_request_fields(&req, &registry).unwrap();
+        assert_eq!(structured["thinking"]["type"], "adaptive");
+        assert_eq!(structured["output_config"]["effort"], "high");
+        assert!(generate_thinking_prefix(&req, &registry).is_none());
     }
 
     #[test]
-    fn test_build_additional_model_request_fields_none_without_thinking() {
-        let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
-            max_tokens: 1024,
-            messages: vec![],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            temperature: None,
-            top_p: None,
-            metadata: None,
-        };
-
-        assert!(build_additional_model_request_fields(&req).is_none());
-    }
-
-    #[test]
-    fn test_build_additional_model_request_fields_none_for_disabled() {
-        let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
-            max_tokens: 1024,
-            messages: vec![],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: Some(super::super::types::Thinking {
-                thinking_type: "disabled".to_string(),
-                budget_tokens: 0,
+    fn test_thinking_matrix_adaptive_request_adaptive_config_produces_structured() {
+        // 2. 请求 adaptive × claude-sonnet-5（配置 adaptive）→ 结构化 adaptive+effort
+        let req = thinking_req(
+            "claude-sonnet-5",
+            Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
             }),
-            output_config: None,
-            temperature: None,
-            top_p: None,
-            metadata: None,
-        };
+            None,
+        );
+        let registry = test_registry();
 
-        assert!(build_additional_model_request_fields(&req).is_none());
+        let structured = build_additional_model_request_fields(&req, &registry).unwrap();
+        assert_eq!(structured["thinking"]["type"], "adaptive");
+        assert_eq!(structured["output_config"]["effort"], "high");
+        assert!(generate_thinking_prefix(&req, &registry).is_none());
+    }
+
+    #[test]
+    fn test_thinking_matrix_no_thinking_adaptive_config_still_produces_structured() {
+        // 3. 无 thinking × claude-sonnet-5（配置 adaptive）→ 结构化 adaptive+effort
+        // Sonnet-5 官方客户端常省略 thinking 字段，adaptive 配置下仍应开启结构化透传。
+        let req = thinking_req("claude-sonnet-5", None, None);
+        let registry = test_registry();
+
+        let structured = build_additional_model_request_fields(&req, &registry).unwrap();
+        assert_eq!(structured["thinking"]["type"], "adaptive");
+        assert_eq!(structured["output_config"]["effort"], "high");
+        assert!(generate_thinking_prefix(&req, &registry).is_none());
+    }
+
+    #[test]
+    fn test_thinking_matrix_no_thinking_enabled_config_stays_pure() {
+        // 4. 无 thinking × claude-opus-4-5-20251101（配置 enabled）→ 无结构化、无文本前缀
+        // 防污染断言：老模型的常规请求不应因为判据改动而被意外注入任何 thinking 相关内容。
+        let req = thinking_req("claude-opus-4-5-20251101", None, None);
+        let registry = test_registry();
+
+        assert!(build_additional_model_request_fields(&req, &registry).is_none());
+        assert!(generate_thinking_prefix(&req, &registry).is_none());
+    }
+
+    #[test]
+    fn test_thinking_matrix_enabled_request_enabled_config_produces_prefix() {
+        // 5. 请求 enabled × claude-opus-4-5-20251101（配置 enabled）→ 文本前缀，
+        //    max_thinking_length 用请求 budget，无结构化
+        let req = thinking_req(
+            "claude-opus-4-5-20251101",
+            Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 12345,
+            }),
+            None,
+        );
+        let registry = test_registry();
+
+        assert!(build_additional_model_request_fields(&req, &registry).is_none());
+        let prefix = generate_thinking_prefix(&req, &registry).unwrap();
+        assert!(prefix.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(prefix.contains("<max_thinking_length>12345</max_thinking_length>"));
+    }
+
+    #[test]
+    fn test_thinking_matrix_adaptive_request_enabled_config_degrades_to_prefix() {
+        // 6. 请求 adaptive × claude-opus-4-5-20251101（配置 enabled，交叉降级）
+        //    → 走 enabled 文本前缀，budget 用配置默认 20000（客户端未显式指定时的默认值，
+        //    与 models.toml 中该模型的 thinking_budget_tokens 默认一致）
+        let req = thinking_req(
+            "claude-opus-4-5-20251101",
+            Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            None,
+        );
+        let registry = test_registry();
+
+        assert!(build_additional_model_request_fields(&req, &registry).is_none());
+        let prefix = generate_thinking_prefix(&req, &registry).unwrap();
+        assert!(prefix.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(prefix.contains("<max_thinking_length>20000</max_thinking_length>"));
+    }
+
+    #[test]
+    fn test_thinking_matrix_client_effort_overrides_config_default() {
+        // 7. 客户端 output_config.effort=medium × claude-sonnet-5 → 结构化 effort=medium
+        //    （覆盖配置默认 high）
+        let req = thinking_req(
+            "claude-sonnet-5",
+            None,
+            Some(super::super::types::OutputConfig {
+                effort: "medium".to_string(),
+            }),
+        );
+        let registry = test_registry();
+
+        let structured = build_additional_model_request_fields(&req, &registry).unwrap();
+        assert_eq!(structured["thinking"]["type"], "adaptive");
+        assert_eq!(structured["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_thinking_matrix_disabled_wins_over_any_config() {
+        // 8. 请求 disabled × 任意配置 → 两者都不产（客户端主动关闭优先级最高）
+        let registry = test_registry();
+
+        for model in ["claude-sonnet-5", "claude-opus-4-5-20251101"] {
+            let req = thinking_req(
+                model,
+                Some(super::super::types::Thinking {
+                    thinking_type: "disabled".to_string(),
+                    budget_tokens: 0,
+                }),
+                None,
+            );
+            assert!(
+                build_additional_model_request_fields(&req, &registry).is_none(),
+                "model {model} 应无结构化字段"
+            );
+            assert!(
+                generate_thinking_prefix(&req, &registry).is_none(),
+                "model {model} 应无文本前缀"
+            );
+        }
+    }
+
+    #[test]
+    fn test_thinking_matrix_budget_tokens_present_triggers_warn_in_adaptive_branch() {
+        // 分支 (a) 背书：adaptive 配置下客户端仍带 budget_tokens 时不静默吞，
+        // 结构化 payload 本身不引用 budget_tokens（上游宽容无视），仅打 WARN。
+        let req = thinking_req(
+            "claude-sonnet-5",
+            Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 9999,
+            }),
+            None,
+        );
+        let registry = test_registry();
+
+        let structured = build_additional_model_request_fields(&req, &registry).unwrap();
+        // 结构化 payload 不应包含 budget_tokens 字段。
+        assert!(structured.get("budget_tokens").is_none());
+        assert!(structured["thinking"].get("budget_tokens").is_none());
     }
 }

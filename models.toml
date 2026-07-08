@@ -93,6 +93,22 @@ expose_thinking_variant = true
 # ============================================================================
 
 [[models]]
+id = "claude-sonnet-5"
+kiro_id = "claude-sonnet-5"
+family = "sonnet"
+display_name = "Claude Sonnet 5"
+match_family = "sonnet"
+match_version = ["sonnet-5"]
+context_window = 1_000_000
+max_tokens = 64000
+created = 1782432000
+tier = "free"
+thinking_type = "adaptive"
+thinking_budget_tokens = 20000
+thinking_effort = "high"
+expose_thinking_variant = true
+
+[[models]]
 id = "claude-sonnet-4-6"
 kiro_id = "claude-sonnet-4.6"
 family = "sonnet"

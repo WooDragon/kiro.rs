@@ -138,6 +138,29 @@ impl ModelRegistry {
             })
     }
 
+    /// 模型配置驱动的 thinking 配置，对任意模型名生效（不限 `-thinking` 后缀）。
+    ///
+    /// 与 `thinking_override`（只服务 `-thinking` 虚拟模型的后缀覆写场景）不同，
+    /// 本方法是 converter 层判断 effort/thinking 透传分支的通用判据来源：
+    /// PR #63 引入的结构化 effort 透传曾以「请求 thinking.type」为判据，但 Claude Code
+    /// 实际只发标准 `enabled`，从不发 `adaptive`，导致普通模型（如 claude-sonnet-5，配置
+    /// 早已是 adaptive）永远走不到结构化路径。修正为「模型配置 thinking_type」判据。
+    ///
+    /// 未显式配置 `thinking_type` 的模型按 "enabled" 兜底，与老行为保持一致
+    /// （Never break userspace：不会有模型因为配置缺省而突然被判进 adaptive 分支）。
+    pub fn thinking_config(&self, model: &str) -> ThinkingOverride {
+        let entry = self.resolve(model);
+        ThinkingOverride {
+            thinking_type: entry
+                .and_then(|e| e.thinking_type.clone())
+                .unwrap_or_else(|| "enabled".to_string()),
+            budget_tokens: entry
+                .map(|e| e.thinking_budget_tokens)
+                .unwrap_or_else(default_thinking_budget),
+            effort: entry.and_then(|e| e.thinking_effort.clone()),
+        }
+    }
+
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
         for entry in &self.entries {
@@ -314,6 +337,36 @@ tier = "pro"
     fn test_thinking_override_without_suffix() {
         let registry = test_config();
         assert!(registry.thinking_override("claude-opus-4-8").is_none());
+    }
+
+    #[test]
+    fn test_thinking_config_resolves_without_suffix() {
+        let registry = test_config();
+        // 无 -thinking 后缀也能拿到配置驱动的 thinking_type，这是本方法与
+        // thinking_override 的核心差异（后者只服务 -thinking 虚拟模型）。
+        let config = registry.thinking_config("claude-opus-4-8");
+        assert_eq!(config.thinking_type, "adaptive");
+        assert_eq!(config.budget_tokens, 20000);
+        assert_eq!(config.effort, Some("high".to_string()));
+    }
+
+    #[test]
+    fn test_thinking_config_defaults_to_enabled_when_unset() {
+        let registry = test_config();
+        // claude-haiku-4-5 配置未写 thinking_type，应兜底 enabled，避免老模型
+        // 因配置缺省被误判进 adaptive 分支。
+        let config = registry.thinking_config("claude-haiku-4-5");
+        assert_eq!(config.thinking_type, "enabled");
+        assert_eq!(config.effort, None);
+    }
+
+    #[test]
+    fn test_thinking_config_unknown_model_defaults_to_enabled() {
+        let registry = test_config();
+        let config = registry.thinking_config("claude-totally-unknown");
+        assert_eq!(config.thinking_type, "enabled");
+        assert_eq!(config.budget_tokens, 20000);
+        assert_eq!(config.effort, None);
     }
 
     #[test]
