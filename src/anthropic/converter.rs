@@ -788,8 +788,11 @@ fn build_additional_model_request_fields(
         return None;
     }
 
+    // budget_tokens 在 adaptive 下被上游忽略（成本由 effort 控制）是设计预期的正常行为，
+    // 非异常——CC 每个标准 enabled 请求都带 budget_tokens，故此处必须 debug 而非 warn，
+    // 否则每个真实请求刷一条 warn（与 #56/#58 治日志刷屏取向冲突）。排障时可开 debug 观测。
     if let Some(t) = &req.thinking {
-        tracing::warn!(
+        tracing::debug!(
             model = %req.model,
             budget_tokens = t.budget_tokens,
             "adaptive 模式下 budget_tokens 被忽略，成本由 effort 控制"
@@ -3802,9 +3805,10 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_matrix_budget_tokens_present_triggers_warn_in_adaptive_branch() {
-        // 分支 (a) 背书：adaptive 配置下客户端仍带 budget_tokens 时不静默吞，
-        // 结构化 payload 本身不引用 budget_tokens（上游宽容无视），仅打 WARN。
+    fn test_thinking_matrix_budget_tokens_not_referenced_in_adaptive_payload() {
+        // 分支 (a) 背书：adaptive 配置下客户端仍带 budget_tokens 时，
+        // 结构化 payload 本身不引用 budget_tokens（上游宽容无视）。
+        // 注：忽略事件走 debug 日志（非 warn，避免每请求刷屏），此处只断言 payload 形态。
         let req = thinking_req(
             "claude-sonnet-5",
             Some(super::super::types::Thinking {
