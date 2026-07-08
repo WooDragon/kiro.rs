@@ -63,14 +63,17 @@ fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
 /// # 参数
 /// * `conversation_state` - 已经过 validate_tool_pairing / remove_orphaned_tool_uses 配对校验的对话状态
 /// * `inference_config` - 推理配置（max_tokens / temperature / top_p）
+/// * `additional_model_request_fields` - 模型专属请求参数（thinking / output_config）
 fn finalize_request_body(
     conversation_state: ConversationState,
     inference_config: Option<InferenceConfig>,
+    additional_model_request_fields: Option<serde_json::Value>,
 ) -> Result<String, serde_json::Error> {
     let kiro_request = KiroRequest {
         conversation_state,
         inference_config,
         profile_arn: None,
+        additional_model_request_fields,
     };
 
     serde_json::to_string(&kiro_request)
@@ -317,6 +320,7 @@ pub async fn post_messages(
     let request_body = match finalize_request_body(
         conversion_result.conversation_state,
         conversion_result.inference_config,
+        conversion_result.additional_model_request_fields,
     ) {
         Ok(body) => body,
         Err(e) => {
@@ -1039,6 +1043,7 @@ pub async fn post_messages_cc(
     let request_body = match finalize_request_body(
         conversion_result.conversation_state,
         conversion_result.inference_config,
+        conversion_result.additional_model_request_fields,
     ) {
         Ok(body) => body,
         Err(e) => {
