@@ -38,6 +38,9 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 模型专属请求参数（thinking、output_config）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

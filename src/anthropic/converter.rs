@@ -155,6 +155,8 @@ pub struct ConversionResult {
     /// None = 无稳定 ID（随机兜底路径），此时缓存应退回 credential_id 分桶。
     /// ⚠️ 绝不能把随机 Uuid::new_v4() 当作此字段的值——每次请求新 UUID 等于每次新桶，永远 miss。
     pub stable_conversation_id: Option<String>,
+    /// 模型专属请求参数（thinking、output_config）
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -383,6 +385,7 @@ pub fn convert_request(
         tool_name_map,
         inference_config,
         stable_conversation_id,
+        additional_model_request_fields: build_additional_model_request_fields(req),
     })
 }
 
@@ -751,6 +754,23 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
         }
     }
     None
+}
+
+fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
+    let t = req.thinking.as_ref()?;
+    if t.thinking_type != "adaptive" {
+        return None;
+    }
+    let effort = req
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.as_str())
+        .unwrap_or("high");
+
+    Some(serde_json::json!({
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": effort }
+    }))
 }
 
 /// 检查内容是否已包含thinking标签
@@ -3568,5 +3588,123 @@ mod tests {
             tools[1].tool_specification.name, "EnterPlanMode",
             "second tool name should be EnterPlanMode unchanged"
         );
+    }
+
+    #[test]
+    fn test_build_additional_model_request_fields_adaptive() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "max".to_string(),
+            }),
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(result["thinking"]["type"], "adaptive");
+        assert_eq!(result["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn test_build_additional_model_request_fields_adaptive_defaults_effort() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(result["thinking"]["type"], "adaptive");
+        assert_eq!(result["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_build_additional_model_request_fields_none_for_enabled() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        assert!(build_additional_model_request_fields(&req).is_none());
+    }
+
+    #[test]
+    fn test_build_additional_model_request_fields_none_without_thinking() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        assert!(build_additional_model_request_fields(&req).is_none());
+    }
+
+    #[test]
+    fn test_build_additional_model_request_fields_none_for_disabled() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        assert!(build_additional_model_request_fields(&req).is_none());
     }
 }
