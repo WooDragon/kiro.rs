@@ -3618,6 +3618,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_additional_model_request_fields_adaptive_defaults_effort() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(result["thinking"]["type"], "adaptive");
+        assert_eq!(result["output_config"]["effort"], "high");
+    }
+
+    #[test]
     fn test_build_additional_model_request_fields_none_for_enabled() {
         let req = MessagesRequest {
             model: "claude-opus-4-5".to_string(),
