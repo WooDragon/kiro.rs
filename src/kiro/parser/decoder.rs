@@ -300,11 +300,12 @@ impl<'a> Iterator for DecodeIter<'a> {
     type Item = ParseResult<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 如果处于 Stopped 或 Recovering 状态，停止迭代
-        match self.decoder.state {
-            DecoderState::Stopped => return None,
-            DecoderState::Recovering => return None,
-            _ => {}
+        // 只在 Stopped（错误过多终止态）时停止迭代。
+        // Recovering 不再提前返回 None：try_recover 已经把坏字节 advance 过去，
+        // 应在同一 chunk 内立即重试解析后续帧，否则坏帧之后的有效帧
+        // 会被推迟到下个 chunk；若当前是最后一个 chunk，该帧将永久丢失。
+        if self.decoder.state == DecoderState::Stopped {
+            return None;
         }
 
         match self.decoder.decode() {
@@ -332,5 +333,41 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// 构造最小的合法 AWS Event Stream 帧（16 字节，无 header，无 payload）
+    fn minimal_valid_frame() -> Vec<u8> {
+        let mut buf = vec![0u8; 16];
+        buf[0..4].copy_from_slice(&16u32.to_be_bytes()); // total_length
+        buf[4..8].copy_from_slice(&0u32.to_be_bytes()); // header_length
+        let prelude_crc = super::super::crc::crc32(&buf[0..8]);
+        buf[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
+        let message_crc = super::super::crc::crc32(&buf[0..12]);
+        buf[12..16].copy_from_slice(&message_crc.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_decode_iter_continues_after_recovery() {
+        // 1 个坏字节 + 紧跟一个合法帧：坏字节触发 recovery 跳过 1 字节后，
+        // 剩余 buffer 恰好是合法帧，必须在同一次 decode_iter 迭代中被解析出来，
+        // 不能被 Recovering 状态提前截停到下一个 feed()。
+        let mut decoder = EventStreamDecoder::new();
+        let mut data = vec![0xFFu8];
+        data.extend(minimal_valid_frame());
+        decoder.feed(&data).unwrap();
+
+        let mut frames = 0;
+        let mut errors = 0;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(_) => frames += 1,
+                Err(_) => errors += 1,
+            }
+        }
+
+        assert_eq!(frames, 1);
+        assert!(errors >= 1);
+        assert_eq!(decoder.frames_decoded, 1);
     }
 }
