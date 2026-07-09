@@ -21,17 +21,96 @@ use super::types::{ContentBlock, MessagesRequest};
 /// JSON Schema composition/reference keys that are valid without object-only fields.
 const COMPOSITION_SCHEMA_KEYS: &[&str] = &["anyOf", "oneOf", "allOf", "$ref"];
 
+/// $ref 展开的最大递归深度，防止自引用/循环引用导致无限递归。
+const MAX_REF_DEPTH: usize = 16;
+
+/// 提取 schema 顶层 `$defs` / `definitions` 中的定义，合并为一张解析表。
+///
+/// 只读，不修改输入 schema；`$defs` 与 `definitions` 是同一概念的两种命名习惯
+/// (JSON Schema 2019-09+ 用 `$defs`，Draft-07 及更早用 `definitions`)，两者都要认。
+fn extract_schema_defs(schema: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut defs = serde_json::Map::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(entries)) = schema.get(key) {
+            for (name, value) in entries {
+                defs.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    defs
+}
+
+/// 深度优先展开 `$ref`，Kiro 不理解 `$ref`，未展开的引用会导致该属性退化为无约束。
+///
+/// 命中 `$defs`/`definitions` 中的定义则递归展开合并；命中不了（OpenAPI 风格的
+/// `#/components/...`、外部引用、缺失的定义名）则退化为 `{"type": "object"}`，
+/// 好过什么都不做——至少还是个 object 而不是被上游直接判定 400。
+fn resolve_schema_refs(
+    value: serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> serde_json::Value {
+    if depth > MAX_REF_DEPTH {
+        return serde_json::json!({"type": "object", "additionalProperties": true});
+    }
+
+    match value {
+        serde_json::Value::Object(mut obj) => {
+            if let Some(serde_json::Value::String(ref_str)) = obj.remove("$ref") {
+                let name = ref_str
+                    .strip_prefix("#/$defs/")
+                    .or_else(|| ref_str.strip_prefix("#/definitions/"));
+
+                let resolved = name.and_then(|n| defs.get(n)).cloned();
+                match resolved {
+                    Some(target) => {
+                        let resolved_target = resolve_schema_refs(target, defs, depth + 1);
+                        if let serde_json::Value::Object(target_obj) = resolved_target {
+                            for (k, v) in target_obj {
+                                obj.entry(k).or_insert(v);
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::debug!(schema_ref = %ref_str, "无法解析的 $ref，退化为 object 类型");
+                        obj.entry("type".to_string())
+                            .or_insert(serde_json::Value::String("object".to_string()));
+                    }
+                }
+            }
+
+            let mut resolved_obj = serde_json::Map::with_capacity(obj.len());
+            for (k, v) in obj {
+                resolved_obj.insert(k, resolve_schema_refs(v, defs, depth + 1));
+            }
+            serde_json::Value::Object(resolved_obj)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| resolve_schema_refs(item, defs, depth + 1))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
 /// 导致上游返回 400 "Improperly formed request"。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    let defs = extract_schema_defs(&schema);
+    let schema = resolve_schema_refs(schema, &defs, 0);
+
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
             "type": "object",
             "properties": {}
         });
     };
+    obj.remove("$defs");
+    obj.remove("definitions");
 
     // type：只在缺失或无效且不是组合/$ref schema 时补 object，避免改变有效 schema 语义。
     let has_composition = COMPOSITION_SCHEMA_KEYS
@@ -1626,6 +1705,83 @@ mod tests {
 
         let normalized = normalize_json_schema(schema.clone());
         assert_eq!(normalized, schema);
+    }
+
+    #[test]
+    fn test_normalize_resolves_ref_from_defs() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {"$ref": "#/$defs/Filter"}
+            },
+            "required": ["filter"],
+            "$defs": {
+                "Filter": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "limit": {"type": "integer"}
+                    },
+                    "required": ["name"]
+                }
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["properties"]["filter"]["type"], "object");
+        assert_eq!(
+            normalized["properties"]["filter"]["properties"]["name"]["type"],
+            "string"
+        );
+        assert_eq!(
+            normalized["properties"]["filter"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            normalized["properties"]["filter"]["required"],
+            serde_json::json!(["name"])
+        );
+        assert!(normalized.get("$defs").is_none());
+        assert!(normalized["properties"]["filter"].get("$ref").is_none());
+    }
+
+    #[test]
+    fn test_normalize_ref_cycle_does_not_panic() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "node": {"$ref": "#/$defs/Node"}
+            },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "child": {"$ref": "#/$defs/Node"}
+                    }
+                }
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["properties"]["node"]["type"], "object");
+        assert!(normalized.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_normalize_unresolvable_ref_degrades_to_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/components/schemas/Foo"},
+                "b": {"$ref": "#/$defs/Missing"}
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["properties"]["a"]["type"], "object");
+        assert_eq!(normalized["properties"]["b"]["type"], "object");
+        assert!(normalized["properties"]["a"].get("$ref").is_none());
+        assert!(normalized["properties"]["b"].get("$ref").is_none());
     }
 
     #[test]
