@@ -192,6 +192,32 @@ pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
     format!("kind={}; display={}; source_chain={}", kind, err, chain_str)
 }
 
+/// 判定 reqwest 错误是否为瞬态（可重试）。
+///
+/// #64：上游 HTTP/2 层瞬态中断（RST_STREAM / `unexpected internal error`）或 body
+/// 中途断连时，reqwest 在 `.bytes()`/`.bytes_stream()` 路径下统一 `map_err(decode)`，
+/// 故 `is_decode()==true` 而 `is_body()==false`（Step 0 docker 实测坐实）。这类失败
+/// 应被判为瞬态，让客户端感知失败并重试，而非被伪装成正常完成。
+///
+/// 判定顺序：先 `is_timeout()`（其内部已 walk source chain，覆盖被包进 decode 的
+/// 超时，reqwest issue #2839），再 connect，最后传输层中断（decode/body）。
+///
+/// ⚠️ 仅用于原始字节读取分支（`.bytes()`/`.bytes_stream()`）——`is_decode()` 也覆盖
+/// JSON 反序列化失败，禁止挪用到 `.json()` 失败分支（否则会把上游返回的格式错误
+/// JSON 误判为瞬态而错误地诱导客户端无限重试）。
+pub fn is_transient(err: &reqwest::Error) -> bool {
+    if err.is_timeout() {
+        return true; // 已 walk source chain，覆盖被包进 decode 的超时
+    }
+    if err.is_connect() {
+        return true;
+    }
+    if err.is_decode() || err.is_body() {
+        return true; // 非超时传输层中断（RST/FIN/reset）
+    }
+    false // is_request()/其他 = 构造/配置错误，非瞬态
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +497,223 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // [#64 诊断专用] Step 0 黑盒实验：H2 RST / body 中途断连 与
+    // 「read timeout 被包成 decode」的错误分类坐实。
+    //
+    // 目的：#64 生产报错 source_chain 含
+    // "stream error received: unexpected internal error encountered"
+    // （H2 INTERNAL_ERROR / RST_STREAM），reqwest 无差别包装，真因藏在
+    // source chain。本组测试用 mock 上游在 HTTP/1.1 层近似「响应头已发、
+    // body 中途异常终止」与「body 中途挂起触发 read timeout」两种场景，
+    // 实测 is_*() 与 describe_reqwest_error 的真实分类落点，为
+    // is_transient 判定逻辑提供实测依据（而非凭 reqwest 文档推断）。
+    // 诊断价值持续，保留为常备诊断测试（同 blackbox_* 系列先例）。
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 启动一个「响应头已发、body 中途异常终止连接」的 mock 上游。
+    ///
+    /// 行为：accept 连接 → 丢弃请求头 → 发 200 响应头（chunked）
+    /// → 发一个**不完整**的 chunked 帧（chunk-size 声明 100 字节，
+    /// 实际只发 10 字节 payload，不发完整 payload、不发终止帧 `0\r\n\r\n`）
+    /// → `force_rst=true` 时对 socket 设置 `SO_LINGER(0)` 后 drop，
+    /// 触发 TCP RST（近似 H2 RST_STREAM / INTERNAL_ERROR 对连接的冲断效果）；
+    /// `force_rst=false` 时直接 drop，触发正常 FIN（body 读到一半遇 EOF，
+    /// 无完整 chunk 边界，触发 h1 framing 错误）。
+    ///
+    /// 两种断连方式都是「header 已到、body 中途断」的近似，用于对照
+    /// RST 和 FIN 两种传输层终止方式是否在 reqwest 分类上有差异。
+    async fn spawn_mid_body_reset_upstream(force_rst: bool) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+
+            // 读掉客户端请求头
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            // 发 200 响应头（chunked，非 SSE，纯粹测试 body 读取本身）
+            let headers =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+
+            // chunk-size 声明 0x64=100 字节，但只发 10 字节 payload——
+            // 声明值与实际值不符，body 读到一半必炸（不完整 chunk 帧）
+            stream
+                .write_all(b"64\r\n")
+                .await
+                .expect("写 chunk header 失败");
+            stream
+                .write_all(b"partial...")
+                .await
+                .expect("写不完整 payload 失败");
+
+            if force_rst {
+                // SO_LINGER(0)：drop 时 OS 发 RST 而非优雅 FIN，
+                // 近似 H2 层 RST_STREAM / INTERNAL_ERROR 的冲断效果
+                let _ = stream.set_linger(Some(std::time::Duration::ZERO));
+            }
+            // 不发终止帧、不发完整 payload，直接 drop 连接
+            drop(stream);
+        });
+
+        addr
+    }
+
+    /// [#64 诊断] 任务1：H2 RST / body 中途断连的错误分类落点。
+    ///
+    /// 对 `force_rst=false`（FIN）与 `force_rst=true`（RST）两种断连方式，
+    /// 用 `.bytes()`（对齐 `handle_non_stream_request` 的实际读取方式）
+    /// 触发失败，打印 is_*() 真值表与完整 `describe_reqwest_error` 输出。
+    #[ignore]
+    #[tokio::test]
+    async fn diag_issue64_mid_body_abrupt_close_classification() {
+        for force_rst in [false, true] {
+            let addr = spawn_mid_body_reset_upstream(force_rst).await;
+            let client = build_idle_client(None, 30, TlsBackend::Rustls).expect("构建 client 失败");
+
+            let resp = client
+                .get(format!("http://{addr}"))
+                .send()
+                .await
+                .expect("send 失败（预期在读 body 阶段失败，而非 send 阶段）");
+
+            let result = resp.bytes().await;
+            let err = result.expect_err(&format!(
+                "force_rst={force_rst}：预期 body 读取失败（中途断连），但读取成功"
+            ));
+            let desc = describe_reqwest_error(&err);
+
+            println!(
+                "[T1 force_rst={force_rst}] is_timeout={} is_connect={} is_body={} is_decode={} is_request={} | {desc}",
+                err.is_timeout(),
+                err.is_connect(),
+                err.is_body(),
+                err.is_decode(),
+                err.is_request(),
+            );
+        }
+    }
+
+    /// 启动一个「200 但立即空 body」的 mock 上游（用于 #64 任务3 S4 旁证）。
+    ///
+    /// 行为：accept 连接 → 丢弃请求头 → 发 200 响应头（chunked）
+    /// → 立即发终止帧 `0\r\n\r\n`（不发任何 payload chunk）→ 正常结束连接。
+    /// 用于验证「上游 200 + 空 body」在 reqwest 层是否表现为 Ok(空字节)
+    /// 而非 Err——即这类情况不会被 describe_reqwest_error 分类捕获，
+    /// 而是会正常进入业务层 EventStreamDecoder。
+    async fn spawn_empty_body_200_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            let headers =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+            // 立即发终止帧，不发任何 payload——空 body 但连接正常结束
+            stream.write_all(b"0\r\n\r\n").await.expect("写终止帧失败");
+        });
+
+        addr
+    }
+
+    /// [#64 诊断] 任务3旁证：上游「200 但空 body」在 reqwest 层的表现。
+    ///
+    /// 核心问题：这类响应是 `Err`（会被 describe_reqwest_error 分类）还是
+    /// `Ok(空字节)`（会静默流入业务层 EventStreamDecoder，decode_iter 空
+    /// 迭代，最终产出 content=[] 的「正常」200 响应，无任何错误日志）？
+    #[ignore]
+    #[tokio::test]
+    async fn diag_issue64_empty_body_200_is_ok_not_err() {
+        let addr = spawn_empty_body_200_upstream().await;
+        let client = build_idle_client(None, 30, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+        let status = resp.status();
+        let result = resp.bytes().await;
+
+        match &result {
+            Ok(bytes) => println!(
+                "[T3] status={status} .bytes() 返回 Ok，长度={}（预期 0，即空 body 不是 Err）",
+                bytes.len()
+            ),
+            Err(e) => println!(
+                "[T3] status={status} .bytes() 返回 Err：{}",
+                describe_reqwest_error(e)
+            ),
+        }
+
+        // 核心断言：空 body 是 Ok(空字节)，不是 Err——不会被 describe_reqwest_error 捕获
+        let bytes = result.expect("预期空 body 是 Ok(空字节) 而非 Err");
+        assert_eq!(bytes.len(), 0, "预期空 body 长度为 0");
+    }
+
+    /// [#64 诊断] 任务2：验证「read timeout 被包成 decode」陷阱。
+    ///
+    /// 复用 `spawn_hanging_upstream`（发 1 chunk 后挂起 30s），client
+    /// 设短 `read_timeout=1s`。用 `.bytes()`（对齐生产非流式读取路径）
+    /// 触发超时，核心验证：`is_decode()==true` 且 `is_timeout()` 是否
+    /// 仍能通过 walk source chain 正确识别为 true（而非被 decode 掩盖）。
+    #[ignore]
+    #[tokio::test]
+    async fn diag_issue64_read_timeout_hides_in_decode() {
+        let addr = spawn_hanging_upstream().await;
+        let client = build_idle_client(None, 1, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+
+        let start = std::time::Instant::now();
+        let result = resp.bytes().await;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        let err = result.expect_err("read_timeout=1s 应触发 body 读取失败，但读取成功");
+        let desc = describe_reqwest_error(&err);
+
+        println!(
+            "[T2] 耗时{elapsed_ms}ms is_timeout={} is_connect={} is_body={} is_decode={} is_request={} | {desc}",
+            err.is_timeout(),
+            err.is_connect(),
+            err.is_body(),
+            err.is_decode(),
+            err.is_request(),
+        );
+
+        // 核心断言：验证「陷阱」确实存在——is_decode 为 true 的同时，
+        // is_timeout 必须仍能通过 walk source chain 识别为 true
+        assert!(
+            err.is_decode(),
+            "预期 is_decode()==true（.bytes() 外层恒包 Decode），实际 desc={desc}"
+        );
+        assert!(
+            err.is_timeout(),
+            "陷阱验证失败：is_timeout() 应为 true（walk source chain 找到 TimedOut），实际 desc={desc}"
+        );
+    }
+
     #[test]
     fn test_proxy_config_new() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
@@ -545,6 +788,145 @@ mod tests {
         assert!(
             desc.contains("source_chain="),
             "诊断串缺少 source_chain= 字段：{desc}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #64 BDD S3 — is_transient 真值表单元测试
+    //
+    // 复用本文件已有的 mock 上游 helper（均无 sleep，快速确定性）与
+    // test_describe_reqwest_error_connect_kind 的 bind-then-drop 模式，
+    // 拿到真实 reqwest::Error 实例后断言 is_transient 分类结果。
+    // 这些测试常规运行（不带 #[ignore]），区别于上方仅供人工诊断的
+    // diag_issue64_* / blackbox_* 系列。
+    // ─────────────────────────────────────────────────────────────────
+
+    /// is_transient 对 connect 类错误（ECONNREFUSED）应判定为 true。
+    #[tokio::test]
+    async fn test_is_transient_true_for_connect_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口失败");
+        let addr = listener.local_addr().expect("获取本地地址失败");
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("构建测试 client 失败");
+        let err = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect_err("预期连接被拒绝，但请求意外成功");
+
+        assert!(err.is_connect(), "前提：应先证实是 connect 类错误");
+        assert!(is_transient(&err), "connect 类错误应判定为瞬态（可重试）");
+    }
+
+    /// is_transient 对 body 中途以 FIN 断连（无完整 chunk 边界）应判定为 true。
+    ///
+    /// 复用 #64 诊断用 spawn_mid_body_reset_upstream(false)：声明 100 字节
+    /// chunk 实际只发 10 字节后直接 drop（正常 FIN，非 RST）。
+    #[tokio::test]
+    async fn test_is_transient_true_for_mid_body_reset_fin() {
+        let addr = spawn_mid_body_reset_upstream(false).await;
+        let client = build_idle_client(None, 30, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败，而非 send 阶段）");
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("预期 body 读取失败（中途断连），但读取成功");
+
+        assert!(
+            is_transient(&err),
+            "body 中途 FIN 断连应判定为瞬态；desc={}",
+            describe_reqwest_error(&err)
+        );
+    }
+
+    /// is_transient 对 body 中途以 TCP RST 断连应判定为 true。
+    ///
+    /// 复用 spawn_mid_body_reset_upstream(true)：SO_LINGER(0) 后 drop，
+    /// 近似 H2 RST_STREAM/INTERNAL_ERROR 对连接的冲断效果。
+    #[tokio::test]
+    async fn test_is_transient_true_for_mid_body_reset_rst() {
+        let addr = spawn_mid_body_reset_upstream(true).await;
+        let client = build_idle_client(None, 30, TlsBackend::Rustls).expect("构建 client 失败");
+
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败，而非 send 阶段）");
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("预期 body 读取失败（中途断连），但读取成功");
+
+        assert!(
+            is_transient(&err),
+            "body 中途 RST 断连应判定为瞬态；desc={}",
+            describe_reqwest_error(&err)
+        );
+    }
+
+    /// is_transient 对 read timeout（#2839 陷阱：外层包成 Decode）仍应判定为 true。
+    ///
+    /// 复用 spawn_hanging_upstream（发 1 chunk 后挂起 30s），client 侧设短
+    /// read_timeout（500ms）主动触发超时——不等待 mock 上游的 30s，测试本身
+    /// 在 ~500ms 内完成，快速确定性。核心验证 is_timeout() 通过 walk source
+    /// chain 正确识别，不被 is_decode()==true 掩盖（判定顺序已在 is_transient
+    /// 内先判 is_timeout）。
+    #[tokio::test]
+    async fn test_is_transient_true_for_read_timeout() {
+        let addr = spawn_hanging_upstream().await;
+        // build_idle_client 不暴露自定义短超时的入口，直接用 ClientBuilder
+        // 构造一个等价配置但 read_timeout 短至 500ms 的 client，避免测试等待 30s。
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(500))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("构建短超时测试 client 失败");
+
+        let resp = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("read_timeout=500ms 应触发 body 读取失败，但读取成功");
+
+        assert!(
+            is_transient(&err),
+            "read timeout 应判定为瞬态（即便被包成 decode）；desc={}",
+            describe_reqwest_error(&err)
+        );
+    }
+
+    /// is_transient 对 builder 类错误（非法 URL scheme，同步失败无网络 I/O）应判定为 false。
+    ///
+    /// 复用 reqwest 自身测试 `execute_request_rejects_invalid_urls` 的构造方式
+    /// （故意拼错的 "hxxps://" scheme）：`execute_request` 在发起任何网络 I/O 之前
+    /// 就同步校验 scheme，是 Kind::Builder 错误，非瞬态（构造/配置类问题，重试无意义）。
+    #[tokio::test]
+    async fn test_is_transient_false_for_builder_error() {
+        let client = reqwest::Client::new();
+        let err = client
+            .get("hxxps://example.invalid/")
+            .send()
+            .await
+            .expect_err("非法 scheme 应同步返回 builder 错误");
+
+        assert!(err.is_builder(), "前提：应先证实是 builder 类错误");
+        assert!(
+            !is_transient(&err),
+            "builder/配置类错误不应判定为瞬态（重试无意义）"
         );
     }
 }

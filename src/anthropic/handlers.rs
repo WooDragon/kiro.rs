@@ -566,17 +566,22 @@ fn create_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
-                                // 发送最终事件并结束
-                                let final_events = ctx.generate_final_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
+                                // 绝不走正常收尾（不补 message_delta/message_stop），避免把失败伪装成正常完成。
+                                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
+                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                             }
                             None => {
-                                // 流结束，发送最终事件
-                                let final_events = ctx.generate_final_events();
+                                // 流结束。#64：本轮零产出（上游 200 空响应）时发 error 帧诱导重试，
+                                // 否则正常收尾（有内容分支逐字保留原调用）。
+                                let final_events = if ctx.is_empty_response() {
+                                    tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    vec![super::stream::error_sse_event(true)]
+                                } else {
+                                    ctx.generate_final_events()
+                                };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -645,6 +650,17 @@ async fn handle_non_stream_request(
                 error = %crate::http_client::describe_reqwest_error(&e),
                 "读取响应体失败"
             );
+            // #64：body 中途断连（is_transient=true，如 HTTP/2 RST / 超时 / 连接失败）复用
+            // ProviderError 瞬态语义 → map_provider_error 映射 503 + Retry-After，让客户端重试；
+            // 非瞬态（构造/配置类）保留原 502 语义。此处是 .bytes() 原始字节读取分支，
+            // is_transient 使用合规（不涉及 .json() 反序列化）。
+            if crate::http_client::is_transient(&e) {
+                let provider_err: Error = crate::kiro::provider::ProviderError::ConnectionFailed {
+                    detail: format!("上游响应体读取中断: {}", e),
+                }
+                .into();
+                return map_provider_error(provider_err);
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -832,6 +848,41 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
+
+    // #64：上游 200 + 空 body（或解析后零内容）会走到这里且 content 为空——此前被组装成
+    // content=[] 的假 200，客户端误判任务成功。改为返回可重试错误（与流式 None 分支对称：
+    // 503 + overloaded_error），让客户端重试而非误判完成。content 仅由 thinking/text/tool_use
+    // 填充，故 content.is_empty() 精确等价于「无 text/thinking 且 !has_tool_use」，与流式
+    // is_empty_response（output_tokens==0 && !has_tool_use，thinking 计入 output_tokens）语义一致。
+    // 短路在 token 估算/缓存更新之前，避免为失败响应产生副作用（同流式异常分支跳过收尾）。
+    //
+    // 但（#64 自身引入的死循环修正，与流式 is_empty_response 对称）：上游发
+    // ContentLengthExceededException / contextUsage>=100% 后不吐内容就结束时，content 为空
+    // 但 stop_reason 已被显式置为 max_tokens / model_context_window_exceeded——这是**终止信号**
+    // 而非空响应。此时不返 503，走正常 200 透传该 stop_reason（content=[] 但 stop_reason 有意义，
+    // 客户端据此处理，如 max_tokens 触发续写），避免客户端永久重试必然触发上限的请求形成死循环。
+    // stop_reason 初值为 "end_turn"，仅在上述显式终止信号时被改写，故 `== "end_turn"` 精确表示
+    // 「无显式终止原因」。
+    //
+    // C4（credits 记账）：本项目无本地 credit/usage 台账——上游 meteringEvent 仅被读取用于
+    // ①填充响应体 usage 展示字段（503 无响应体，无意义）②驱动 prompt_cache 本地缓存模拟
+    // （非计费）。真实 credits 由 Kiro 上游侧计量，本地 503 短路不涉及任何 credits 状态丢失。
+    // 故此处 503 前无需补记账。（prompt_cache.update 亦无需在失败响应上执行：失败请求的前缀不应
+    // 被记为"已缓存"。）
+    if content.is_empty() && stop_reason == "end_turn" {
+        tracing::error!(
+            model = model,
+            "上游响应为空（无内容且无显式终止信号），返回可重试错误以触发客户端重试"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream returned an empty response. Please retry.",
+            )),
+        )
+            .into_response();
+    }
 
     // 估算输出 tokens
     let output_tokens =
@@ -1283,15 +1334,29 @@ fn create_prefix_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
-                                let final_events = ctx.finish();
-                                let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
+                                // 绝不走正常收尾（不调 ctx.finish()），避免把失败伪装成正常完成。
+                                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
+                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
                             }
                             None => {
-                                let final_events = ctx.finish();
+                                // #64：本轮零产出（上游 200 空响应）时发 error 帧诱导重试，
+                                // 否则正常收尾（有内容分支逐字保留 ctx.finish()）。
+                                // C3 修正（前缀缓冲 None 分支丢 buffer）：is_empty_response 已在
+                                // #64 修正中排除「有显式 stop_reason」——上游发 max_tokens /
+                                // model_context_window_exceeded 后无内容结束时不再误判空，走
+                                // ctx.finish() 正常 flush（释放缓冲的 message_start + 收尾帧透传该
+                                // stop_reason）。真空响应（无内容无 stop_reason）才走 error 帧：此时
+                                // 缓冲区未 released，除占位 message_start 外无内容，直接发 error 帧不会
+                                // 遗漏已产出内容（未 flush 的 message_start 随 ctx drop 丢弃，无残留）。
+                                let final_events = if ctx.is_empty_response() {
+                                    tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    vec![super::stream::error_sse_event(true)]
+                                } else {
+                                    ctx.finish()
+                                };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1435,17 +1500,31 @@ fn create_buffered_sse_stream(
                                 error = %crate::http_client::describe_reqwest_error(&e),
                                 "读取响应流失败"
                             );
-                            // 发生错误，完成处理并返回所有事件
-                            let all_events = ctx.finish_and_get_all_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
+                            // 绝不走正常收尾（不调 finish_and_get_all_events），避免把失败伪装成正常完成。
+                            // 缓冲模式本就未 flush 过任何事件（Some(Ok) 只往 buffer 追加不 emit），
+                            // 故断连时只发干净 error 帧、丢弃未 flush 的缓冲——是「要么全成功要么全失败」
+                            // 的自洽语义；若改成「先 flush 收尾（含 message_stop）再追加 error」，会发出
+                            // message_stop 后又 error 的自相矛盾序列（先告知成功再告知失败），反而更糟。
+                            let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
+                                super::stream::error_sse_event(crate::http_client::is_transient(
+                                    &e,
+                                ))
+                                .to_sse_string(),
+                            ))];
                             return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                         }
                         None => {
-                            // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                            let all_events = ctx.finish_and_get_all_events();
+                            // 流结束。#64：本轮零产出（上游 200 空响应）时发 error 帧诱导重试，
+                            // 否则正常收尾（有内容分支逐字保留 finish_and_get_all_events）。
+                            let all_events = if ctx.is_empty_response() {
+                                tracing::error!(
+                                    "上游响应为空（无内容），返回 error 事件以触发客户端重试"
+                                );
+                                vec![super::stream::error_sse_event(true)]
+                            } else {
+                                ctx.finish_and_get_all_events()
+                            };
                             let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1938,4 +2017,413 @@ mod tests {
             &*ids
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #64 BDD S1/S1b/S2 — create_sse_stream 端到端收尾语义
+    //
+    // 直接调用私有 fn create_sse_stream(response, ctx, initial_events, span)，
+    // response 用 http_client.rs 已有的裸 TCP mock 上游 + 一个不设超时的普通
+    // reqwest::Client 构造（无需 KiroProvider，create_sse_stream 只消费
+    // reqwest::Response 本身）。收集整条 stream 产出的字节，拼成完整 SSE 文本
+    // 后做字符串级断言——比逐事件解析更贴近"客户端最终看到什么"。
+    // -----------------------------------------------------------------------
+
+    /// 启动一个「响应头已发、body 中途异常终止连接」的 mock 上游。
+    ///
+    /// 与 http_client.rs 里同名 helper 的行为完全一致（该文件的 `mod tests`
+    /// 是私有模块，无法从这里 `crate::http_client::tests::` 访问，故复制一份
+    /// 而非放宽其可见性——避免为测试互访放大生产模块的公开面）。
+    ///
+    /// 行为：accept 连接 → 丢弃请求头 → 发 200 响应头（chunked）→ 发一个
+    /// **不完整**的 chunked 帧（chunk-size 声明 100 字节，实际只发 10 字节）
+    /// → `force_rst=true` 时 `SO_LINGER(0)` 后 drop（近似 TCP RST），
+    /// `force_rst=false` 时直接 drop（正常 FIN）。
+    async fn spawn_mid_body_reset_upstream(force_rst: bool) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            let headers =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+
+            stream
+                .write_all(b"64\r\n")
+                .await
+                .expect("写 chunk header 失败");
+            stream
+                .write_all(b"partial...")
+                .await
+                .expect("写不完整 payload 失败");
+
+            if force_rst {
+                let _ = stream.set_linger(Some(std::time::Duration::ZERO));
+            }
+            drop(stream);
+        });
+
+        addr
+    }
+
+    /// 启动一个「200 但立即空 body」的 mock 上游（S2 用）。
+    ///
+    /// 同上，复制自 http_client.rs 的同名私有 helper。
+    ///
+    /// 行为：accept 连接 → 丢弃请求头 → 发 200 响应头（chunked）
+    /// → 立即发终止帧 `0\r\n\r\n`（不发任何 payload chunk）→ 正常结束连接。
+    async fn spawn_empty_body_200_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            let headers =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+            stream.write_all(b"0\r\n\r\n").await.expect("写终止帧失败");
+        });
+
+        addr
+    }
+
+    /// 构造一个 fresh StreamContext + 对应 initial_events，供 S1/S1b/S2 复用。
+    fn fresh_ctx_with_initial_events() -> (StreamContext, Vec<SseEvent>) {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            std::collections::HashMap::new(),
+            1024,
+        );
+        let initial_events = ctx.generate_initial_events();
+        (ctx, initial_events)
+    }
+
+    /// 收集 create_sse_stream 产出的全部字节，拼成完整 SSE 文本。
+    async fn collect_sse_text(stream: impl Stream<Item = Result<Bytes, Infallible>>) -> String {
+        let chunks: Vec<Bytes> = stream
+            .map(|r| r.expect("Infallible 不会出错"))
+            .collect()
+            .await;
+        chunks
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// S1 — 流式请求中途上游断连（无先前内容）。
+    ///
+    /// 复用 http_client.rs 的 spawn_mid_body_reset_upstream(false)：响应头已发，
+    /// body 中途以 FIN 断连（无完整 chunk 边界）。断连字节喂给 EventStreamDecoder
+    /// 必然产生 decode 错误（非合法帧），但核心断言只关心 create_sse_stream 的
+    /// Some(Err(e)) 分支——发 error 帧、finished=true，绝不补 message_stop/
+    /// message_delta 伪装成正常完成。
+    #[tokio::test]
+    async fn test_s1_stream_upstream_interruption_no_prior_content_emits_error_not_stop() {
+        let addr = spawn_mid_body_reset_upstream(false).await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败，而非 send 阶段）");
+
+        let (ctx, initial_events) = fresh_ctx_with_initial_events();
+        let span = tracing::Span::none();
+        let stream = create_sse_stream(response, ctx, initial_events, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("event: error"),
+            "S1：上游中途断连必须发 error 帧，实际 SSE 文本：{text}"
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "S1：断连是瞬态失败，error 帧应为 overloaded_error，实际：{text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "S1：断连后绝不能补 message_stop 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+        assert!(
+            !text.contains("message_delta"),
+            "S1：断连后绝不能补 message_delta 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+    }
+
+    /// S1b — 流式请求中途上游断连，且断连前已有内容产出。
+    ///
+    /// 断连前的"已有内容"通过直接对 ctx 调用 process_kiro_event 预置
+    /// （而非手工构造合法 AWS event-stream 二进制帧）：create_sse_stream 的
+    /// Some(Err(e)) 分支只依赖 ctx 在中断发生时的状态（此处并不读取
+    /// ctx.is_empty_response()，只是无条件发 error 帧），不依赖内容如何写入 ——
+    /// 手搓字节级帧编码器对这条断言无额外背书价值，属于不必要的复杂度。
+    /// mock 上游侧仍是真实 TCP 中断，断连本身是端到端的。
+    #[tokio::test]
+    async fn test_s1b_stream_upstream_interruption_with_prior_content_emits_error_not_stop() {
+        let addr = spawn_mid_body_reset_upstream(true).await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败，而非 send 阶段）");
+
+        let (mut ctx, mut initial_events) = fresh_ctx_with_initial_events();
+        // 预置"断连前已产出内容"：直接喂一条非空 AssistantResponse 事件，
+        // 复刻 stream.rs 里 assistant_response_event() 的构造方式
+        // （extra 字段私有，跨模块 ..Default::default() 编译不过，故走
+        // Default::default() 再赋值公开字段）。
+        let mut prior = crate::kiro::model::events::AssistantResponseEvent::default();
+        prior.content = "some prior text before interruption".to_string();
+        let prior_events =
+            ctx.process_kiro_event(&crate::kiro::model::events::Event::AssistantResponse(prior));
+        assert!(
+            !prior_events.is_empty(),
+            "前提：预置内容应产生非空 SSE 事件（text_delta），否则下面的断言无意义"
+        );
+        initial_events.extend(prior_events);
+        assert!(
+            !ctx.is_empty_response(),
+            "前提：预置内容后 ctx 不应再是空响应状态"
+        );
+
+        let span = tracing::Span::none();
+        let stream = create_sse_stream(response, ctx, initial_events, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("some prior text before interruption"),
+            "S1b：断连前已产出的内容必须出现在 SSE 文本中，实际：{text}"
+        );
+        assert!(
+            text.contains("event: error"),
+            "S1b：即便已有内容，中途断连仍必须发 error 帧，实际 SSE 文本：{text}"
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "S1b：断连是瞬态失败，error 帧应为 overloaded_error，实际：{text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "S1b：已有内容也不能豁免——断连后绝不能补 message_stop 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+        assert!(
+            !text.contains("message_delta"),
+            "S1b：已有内容也不能豁免——断连后绝不能补 message_delta 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+    }
+
+    /// S2 — 流式请求上游 200 但空 body（正常 EOF，零产出）。
+    ///
+    /// 复用 http_client.rs 的 spawn_empty_body_200_upstream：连接正常结束
+    /// （非 Err），body_stream.next() 最终产出 None。create_sse_stream 的
+    /// None 分支里 ctx.is_empty_response()==true（从未收到任何内容），
+    /// 应发 error_sse_event(true) 而非 ctx.generate_final_events()
+    /// 的正常收尾（不应出现 end_turn stop_reason）。
+    #[tokio::test]
+    async fn test_s2_stream_empty_response_emits_error_not_end_turn() {
+        let addr = spawn_empty_body_200_upstream().await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+
+        let (ctx, initial_events) = fresh_ctx_with_initial_events();
+        let span = tracing::Span::none();
+        let stream = create_sse_stream(response, ctx, initial_events, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("event: error"),
+            "S2：上游 200 空 body 必须发 error 帧诱导重试，实际 SSE 文本：{text}"
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "S2：空响应应为 overloaded_error（可重试），实际：{text}"
+        );
+        assert!(
+            !text.contains("end_turn"),
+            "S2：零产出不能被伪装成正常 end_turn 完成，实际 SSE 文本：{text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "S2：零产出不能补 message_stop 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+    }
+
+    /// C2 — 全缓冲流断连即便已缓冲内容也只发干净 error 帧（不 flush、不补收尾）。
+    ///
+    /// 缓冲模式把事件攒在 event_buffer 直到 finish 才 flush，断连前从未 emit 过任何字节。
+    /// Some(Err) 时只发 error 帧、丢弃未 flush 的缓冲——「要么全成功要么全失败」的自洽语义。
+    /// 反例（曾评审误判为需修的 bug）：若「先 flush 收尾(含 message_stop)再追加 error」，会发出
+    /// message_stop 后又 error 的自相矛盾序列（先告知成功再告知失败），违背 #64「失败不能看起来
+    /// 像成功」，反而更糟。故此处即便预置了已缓冲内容，断连也只发 error 帧、不出现 message_stop。
+    ///
+    /// 构造：先对 BufferedStreamContext 处理一条非空 AssistantResponse 预置"已缓冲内容"，再用
+    /// spawn_mid_body_reset_upstream 提供真实 TCP 中断的 response 喂给 create_buffered_sse_stream。
+    #[tokio::test]
+    async fn test_c2_buffered_stream_interruption_emits_only_error_no_fake_stop() {
+        let addr = spawn_mid_body_reset_upstream(true).await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败）");
+
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            200_000,
+            10,
+            false,
+            std::collections::HashMap::new(),
+            1024,
+        );
+        // 预置"断连前已缓冲内容"：一条非空 AssistantResponse。
+        let mut prior = crate::kiro::model::events::AssistantResponseEvent::default();
+        prior.content = "buffered content before reset".to_string();
+        ctx.process_and_buffer(&crate::kiro::model::events::Event::AssistantResponse(prior));
+        assert!(
+            !ctx.is_empty_response(),
+            "前提：预置内容后缓冲上下文不应为空响应"
+        );
+
+        let span = tracing::Span::none();
+        let stream = create_buffered_sse_stream(response, ctx, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("event: error"),
+            "C2：断连必须发 error 帧告知流被中断，实际 SSE 文本：{text}"
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "C2：RST 断连是瞬态失败，error 帧应为 overloaded_error，实际：{text}"
+        );
+        // 核心：缓冲模式断连绝不发 message_stop/message_delta 伪装成正常完成——即便已缓冲内容。
+        assert!(
+            !text.contains("message_stop"),
+            "C2：断连绝不能补 message_stop 伪装成正常完成（message_stop 后又 error 是自相矛盾序列），实际：{text}"
+        );
+        assert!(
+            !text.contains("message_delta"),
+            "C2：断连绝不能补 message_delta，实际：{text}"
+        );
+    }
+
+    /// C2b — 全缓冲流零产出时断连只发 error 帧（不无中生有补 message_start/收尾帧）。
+    #[tokio::test]
+    async fn test_c2_buffered_stream_interruption_no_content_emits_only_error() {
+        let addr = spawn_mid_body_reset_upstream(true).await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败");
+
+        // 全新缓冲上下文，未预置任何内容 → is_empty_response()==true。
+        let ctx = BufferedStreamContext::new(
+            "test-model",
+            200_000,
+            10,
+            false,
+            std::collections::HashMap::new(),
+            1024,
+        );
+        assert!(ctx.is_empty_response(), "前提：未处理任何事件应为空响应");
+
+        let span = tracing::Span::none();
+        let stream = create_buffered_sse_stream(response, ctx, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("event: error"),
+            "C2b：零产出断连必须发 error 帧，实际：{text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "C2b：零产出不应补 message_stop 伪装完成，实际：{text}"
+        );
+        assert!(
+            !text.contains("message_delta"),
+            "C2b：零产出不应补 message_delta，实际：{text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #64 BDD S3/S4 — handle_non_stream_request 收尾语义为何未做独立 E2E
+    //
+    // S3（非流式中途断连 is_transient 分支）与 S4（非流式空 content→503）
+    // 的生产代码都挂在 handle_non_stream_request 上，该函数签名要求
+    // Arc<KiroProvider>：完整构造需要 MultiTokenManager + 凭据 + 自定义
+    // KiroEndpoint 实现（生产 IdeEndpoint 硬编码 AWS 域名，测试必须能把
+    // 请求指到本地 mock 端口）。provider.rs 当前零测试先例，为这两条分支
+    // 单独搭这套脚手架成本与收益不成比例——与本文件上方 Task 3
+    // "FALLBACK 说明"同样的取舍（reqwest::Response 无公开构造器时退化到
+    // 覆盖被依赖的前提，而非硬堆脚手架）。
+    //
+    // 实际覆盖拆成两层：
+    // 1. http_client.rs 的 test_is_transient_true_for_mid_body_reset_fin/rst
+    //    + test_is_transient_true_for_read_timeout/test_is_transient_false_for_builder_error
+    //    ——用真实 mock 上游坐实 is_transient 对各类断连的分类结果（S3 的
+    //    判定输入）。
+    // 2. 本文件 test_map_connection_failed_gives_503——坐实
+    //    ProviderError::ConnectionFailed 到 503 + Retry-After(15) +
+    //    overloaded_error 的映射（S3 的判定输出）。handle_non_stream_request
+    //    body-read-Err 分支里 `if is_transient(&e) { ... return
+    //    map_provider_error(ProviderError::ConnectionFailed{..}) }` 只是把
+    //    这两段已验证的逻辑串起来，胶水代码本身不含独立分支逻辑。
+    // S4（content.is_empty() → 503 overloaded_error）同理是纯胶水：
+    // 空 content 判断是一次直接的 String::is_empty() 调用，503 响应体走的
+    // 也是与 test_map_all_credentials_disabled_gives_503 等测试相同的
+    // ErrorResponse::new 构造路径，无需再搭一套 provider 才能验证格式正确性。
+    // -----------------------------------------------------------------------
 }
