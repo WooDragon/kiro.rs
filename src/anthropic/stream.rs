@@ -269,6 +269,44 @@ impl SseEvent {
     }
 }
 
+/// 构造 Anthropic SSE `error` 事件帧（#64）。
+///
+/// **全仓唯一 error 帧构造点**——三条流式路径的异常分支与「本轮零产出」分支统一经此
+/// 构造，禁止在各路径就地拼 error JSON。
+///
+/// - `transient==true` → `overloaded_error`，文案诱导 Claude Code 退避重试
+///   （对齐 `map_provider_error` 瞬态语义）；用于上游 HTTP/2 中断 / body 断连 /
+///   200 空响应等可重试失败。
+/// - `transient==false` → `api_error`，不可重试文案；用于非瞬态失败。
+///
+/// 语义要点：异常分支发此帧后即置 `finished=true`，绝不再走正常收尾
+/// （`message_delta`/`message_stop`），使失败对客户端可感知、不被伪装成正常完成。
+///
+/// C5（半开状态）：此 error 帧可能在 `message_start`（乃至已打开的 content_block）之后发出而不
+/// 补 `content_block_stop`/`message_stop`。这依赖 **Anthropic SSE 契约：`error` 事件作为流终止
+/// 信号，客户端（Claude Code）识别后即中止本轮**，故半开的 content_block 不会导致客户端挂起——
+/// 属可接受状态，无需强行补齐收尾帧。
+pub fn error_sse_event(transient: bool) -> SseEvent {
+    let (error_type, message) = if transient {
+        (
+            "overloaded_error",
+            "Upstream connection interrupted. Please retry.",
+        )
+    } else {
+        ("api_error", "Upstream response failed.")
+    };
+    SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message,
+            }
+        }),
+    )
+}
+
 /// 内容块状态
 #[derive(Debug, Clone)]
 struct BlockState {
@@ -376,6 +414,23 @@ impl SseStateManager {
         } else {
             "end_turn".to_string()
         }
+    }
+
+    /// 是否已被显式设置为终止性 stop_reason（#64）。
+    ///
+    /// `stop_reason` 字段默认 `None`（见 `SseStateManager::new`），仅在收到明确终止信号时
+    /// 经 `set_stop_reason` 置为 `Some(...)`：
+    /// - `max_tokens`（ContentLengthExceededException / thinking-only 耗尽预算）
+    /// - `model_context_window_exceeded`（contextUsage >= 100%）
+    ///
+    /// 这些是上游给出的**显式终止原因**——客户端据此终止本轮（如 max_tokens 触发续写），
+    /// 而非把它当作失败重试。因此「零产出 + 已有显式终止 stop_reason」不能判为空响应
+    /// （否则会误发 error 帧诱导无谓重试，形成死循环）。
+    ///
+    /// `Some("end_turn")` 理论上不会出现（`set_stop_reason` 从不传 end_turn），仍显式排除，
+    /// 确保「默认收尾」不被误判为显式终止。
+    pub fn has_explicit_stop_reason(&self) -> bool {
+        self.stop_reason.as_deref().is_some_and(|r| r != "end_turn")
     }
 
     /// 处理 message_start 事件
@@ -1315,6 +1370,26 @@ impl StreamContext {
         self.upstream_input_tokens.is_some() || self.context_input_tokens.is_some()
     }
 
+    /// 本轮是否零产出**且无显式终止信号**（#64）。
+    ///
+    /// 语义 = 无任何 text/thinking 输出（`output_tokens==0`）、无结构化 tool_use，
+    /// **且未收到显式终止 stop_reason**（max_tokens / model_context_window_exceeded）。
+    ///
+    /// `output_tokens` 在 `process_assistant_response` 出口对所有 assistantResponse
+    /// 内容（含 thinking，见 stream.rs 递增点）累加，故 `==0` 精确表示上游未吐任何内容。
+    ///
+    /// 关键修正（#64 自身引入的死循环）：上游发 `Exception(ContentLengthExceededException)`
+    /// 或 `contextUsage>=100%` 后**不吐 assistantResponse 就结束**，此时 `output_tokens==0`
+    /// 但 stop_reason 已被显式置为 max_tokens / model_context_window_exceeded——这是**终止
+    /// 信号而非空响应**。若仍判空并发 error 帧（overloaded_error），客户端会永久重试同一必然
+    /// 触发上限的请求，形成死循环。故此处排除「已有显式终止 stop_reason」的情况，让其走正常
+    /// 收尾透传该 stop_reason（客户端据此终止/续写，不重试）。
+    pub fn is_empty_response(&self) -> bool {
+        self.output_tokens == 0
+            && !self.state_manager.has_tool_use()
+            && !self.state_manager.has_explicit_stop_reason()
+    }
+
     fn update_prompt_cache(&mut self) {
         if self.prompt_cache_updated {
             return;
@@ -1411,6 +1486,12 @@ impl BufferedStreamContext {
         self.event_buffer.extend(events);
     }
 
+    /// 本轮是否零产出（#64）。委托内部 `StreamContext`，语义与其一致
+    /// （无 text/thinking 且无 tool_use）。
+    pub fn is_empty_response(&self) -> bool {
+        self.inner.is_empty_response()
+    }
+
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -1504,6 +1585,12 @@ impl PrefixBufferedStreamContext {
 
     pub fn is_released(&self) -> bool {
         self.released
+    }
+
+    /// 本轮是否零产出（#64）。委托内部 `StreamContext`，语义与其一致
+    /// （无 text/thinking 且无 tool_use）。
+    pub fn is_empty_response(&self) -> bool {
+        self.inner.is_empty_response()
     }
 
     pub fn process_event(&mut self, event: &Event) -> Vec<SseEvent> {
@@ -2726,5 +2813,327 @@ mod tests {
             stop_reason3 = "max_tokens".to_string();
         }
         assert_eq!(stop_reason3, "end_turn");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #64 — error_sse_event 与 is_empty_response 单元测试
+    //
+    // 覆盖 BDD S1/S1b/S2/S2b 的判定逻辑层：具体的流式收尾时序（含真实
+    // 上游中断/空 body）在 handlers.rs 用 mock 上游做端到端验证，此处
+    // 聚焦 error_sse_event 的 JSON 结构与 is_empty_response 在各输入
+    // 状态下的真值，为端到端测试的判定依据提供独立单元背书。
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 构造一个只关心 `content` 的 AssistantResponseEvent。
+    ///
+    /// `extra` 字段是私有的（跨模块 `..Default::default()` 编译不过），
+    /// 用 `Default::default()` 再赋值公开字段绕开可见性限制。
+    fn assistant_response_event(
+        content: &str,
+    ) -> crate::kiro::model::events::AssistantResponseEvent {
+        let mut event = crate::kiro::model::events::AssistantResponseEvent::default();
+        event.content = content.to_string();
+        event
+    }
+
+    #[test]
+    fn test_error_sse_event_transient_true_is_overloaded_error() {
+        let event = error_sse_event(true);
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data["type"], "error");
+        assert_eq!(event.data["error"]["type"], "overloaded_error");
+        assert_eq!(
+            event.data["error"]["message"],
+            "Upstream connection interrupted. Please retry."
+        );
+    }
+
+    #[test]
+    fn test_error_sse_event_transient_false_is_api_error() {
+        let event = error_sse_event(false);
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data["type"], "error");
+        assert_eq!(event.data["error"]["type"], "api_error");
+        assert_eq!(event.data["error"]["message"], "Upstream response failed.");
+    }
+
+    #[test]
+    fn test_error_sse_event_to_sse_string_has_error_event_line() {
+        // S1/S2 端到端断言都靠 to_sse_string() 里的 "event: error\n" 文本判定，
+        // 这里独立锚定该格式不被后续改动破坏。
+        let sse = error_sse_event(true).to_sse_string();
+        assert!(sse.starts_with("event: error\n"));
+        assert!(sse.contains("overloaded_error"));
+    }
+
+    #[test]
+    fn test_is_empty_response_true_for_fresh_context() {
+        // S2 前提：全新 ctx（未处理任何事件）应判定为空响应。
+        let ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        assert!(ctx.is_empty_response());
+    }
+
+    #[test]
+    fn test_is_empty_response_false_after_nonempty_assistant_response() {
+        // S2b 前提：收到非空文本内容后，output_tokens > 0，不应判定为空响应。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        let event = Event::AssistantResponse(assistant_response_event("hello world"));
+        ctx.process_kiro_event(&event);
+
+        assert!(!ctx.is_empty_response());
+    }
+
+    #[test]
+    fn test_is_empty_response_true_after_empty_content_assistant_response() {
+        // process_assistant_response 对空 content 短路返回，不累加 output_tokens——
+        // 即便收到过 assistantResponseEvent 帧，只要 content 都是空串，仍应判定为空响应。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        let event = Event::AssistantResponse(assistant_response_event(""));
+        ctx.process_kiro_event(&event);
+
+        assert!(
+            ctx.is_empty_response(),
+            "空 content 的 assistantResponseEvent 不应使 is_empty_response 翻转为 false"
+        );
+    }
+
+    #[test]
+    fn test_has_explicit_stop_reason_default_is_false() {
+        // 默认 stop_reason 为 None（未设置），不算显式终止。
+        let mgr = SseStateManager::new();
+        assert!(!mgr.has_explicit_stop_reason());
+    }
+
+    #[test]
+    fn test_has_explicit_stop_reason_true_for_max_tokens() {
+        let mut mgr = SseStateManager::new();
+        mgr.set_stop_reason("max_tokens");
+        assert!(mgr.has_explicit_stop_reason());
+    }
+
+    #[test]
+    fn test_has_explicit_stop_reason_true_for_context_window_exceeded() {
+        let mut mgr = SseStateManager::new();
+        mgr.set_stop_reason("model_context_window_exceeded");
+        assert!(mgr.has_explicit_stop_reason());
+    }
+
+    #[test]
+    fn test_has_explicit_stop_reason_false_for_end_turn() {
+        // end_turn 是默认收尾语义，即便被显式塞入也不算终止信号。
+        let mut mgr = SseStateManager::new();
+        mgr.set_stop_reason("end_turn");
+        assert!(!mgr.has_explicit_stop_reason());
+    }
+
+    #[test]
+    fn test_is_empty_response_false_when_context_window_exceeded_without_content() {
+        // C1 死循环修正核心：contextUsage>=100% 设置 model_context_window_exceeded 后
+        // 上游不吐任何 assistantResponse 就结束 —— output_tokens==0 且无 tool_use，但
+        // 有显式终止 stop_reason，不应判空（否则发 error 帧诱导客户端永久重试必然触发上限的请求）。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        // contextUsage 100% → 设置 model_context_window_exceeded，且返回空事件（不产出内容）
+        let events = ctx.process_kiro_event(&Event::ContextUsage(
+            serde_json::from_value(json!({"contextUsagePercentage": 100.0})).unwrap(),
+        ));
+        assert!(events.is_empty(), "contextUsage 事件本身不产出 SSE 内容");
+
+        assert!(
+            !ctx.is_empty_response(),
+            "有 model_context_window_exceeded 终止信号时零产出不应判空"
+        );
+    }
+
+    #[test]
+    fn test_is_empty_response_false_when_content_length_exceeded_without_content() {
+        // C1：ContentLengthExceededException 设置 max_tokens 后上游不吐内容就结束——
+        // 同样不应判空，走正常收尾透传 max_tokens（客户端据此续写而非重试）。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "content length exceeds threshold".to_string(),
+        });
+        assert!(events.is_empty(), "Exception 事件本身不产出 SSE 内容");
+
+        assert!(
+            !ctx.is_empty_response(),
+            "有 max_tokens 终止信号时零产出不应判空"
+        );
+    }
+
+    #[test]
+    fn test_empty_with_explicit_stop_reason_finish_emits_stop_reason_not_error() {
+        // C1 流式收尾正路：零产出 + 显式 stop_reason 走 generate_final_events（正常收尾），
+        // message_delta 携带 max_tokens，绝不发 error 帧。这是死循环修复后的期望收尾语义。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "content length exceeds threshold".to_string(),
+        });
+        assert!(!ctx.is_empty_response());
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("零产出+显式 stop_reason 应走正常收尾，含 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "max_tokens",
+            "应透传上游显式终止的 max_tokens"
+        );
+        assert!(
+            final_events.iter().any(|e| e.event == "message_stop"),
+            "正常收尾必须含 message_stop"
+        );
+    }
+
+    #[test]
+    fn test_is_empty_response_false_after_tool_use() {
+        // S2b 前提的另一分支：即便没有文本输出（output_tokens==0），只要有结构化
+        // tool_use，也不应被判定为空响应（has_tool_use 短路 is_empty_response）。
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        let event = Event::ToolUse(ToolUseEvent {
+            name: "Bash".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+            stop: true,
+        });
+        ctx.process_kiro_event(&event);
+
+        assert!(!ctx.is_empty_response());
+    }
+
+    #[test]
+    fn test_buffered_stream_context_is_empty_response_delegates_to_inner() {
+        let mut ctx =
+            BufferedStreamContext::new("test-model", 200_000, 10, false, HashMap::new(), 1024);
+        assert!(ctx.is_empty_response(), "未处理任何事件时应为空响应");
+
+        let event = Event::AssistantResponse(assistant_response_event("non-empty"));
+        ctx.process_and_buffer(&event);
+
+        assert!(
+            !ctx.is_empty_response(),
+            "BufferedStreamContext::is_empty_response 应与内部 StreamContext 状态一致"
+        );
+    }
+
+    #[test]
+    fn test_prefix_buffered_stream_context_is_empty_response_delegates_to_inner() {
+        let mut ctx = PrefixBufferedStreamContext::new(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        assert!(ctx.is_empty_response(), "未处理任何事件时应为空响应");
+
+        let event = Event::AssistantResponse(assistant_response_event("non-empty"));
+        ctx.process_event(&event);
+
+        assert!(
+            !ctx.is_empty_response(),
+            "PrefixBufferedStreamContext::is_empty_response 应与内部 StreamContext 状态一致"
+        );
+    }
+
+    #[test]
+    fn test_s2b_regression_normal_completion_with_content_emits_delta_and_stop() {
+        // S2b 回归锚点：有内容的正常收尾（EOF 前已有输出）行为不受 #64 影响——
+        // is_empty_response()==false，generate_final_events 仍产出 message_delta
+        // + message_stop，stop_reason 为正常值（非 error 分支的 overloaded_error）。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            200_000,
+            10,
+            false,
+            HashMap::new(),
+            1024,
+        );
+        let _ = ctx.generate_initial_events();
+
+        let event = Event::AssistantResponse(assistant_response_event("some real output"));
+        ctx.process_kiro_event(&event);
+        assert!(!ctx.is_empty_response());
+
+        let final_events = ctx.generate_final_events();
+        assert!(
+            final_events.iter().any(|e| e.event == "message_delta"),
+            "有内容收尾必须包含 message_delta"
+        );
+        assert!(
+            final_events.iter().any(|e| e.event == "message_stop"),
+            "有内容收尾必须包含 message_stop"
+        );
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
     }
 }
