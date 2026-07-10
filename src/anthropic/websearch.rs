@@ -518,7 +518,7 @@ pub async fn handle_websearch_request(
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
+            tracing::warn!(error = %e, "MCP API 调用失败");
             None
         }
     };

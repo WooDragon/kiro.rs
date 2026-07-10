@@ -54,10 +54,23 @@ impl std::fmt::Display for ProviderError {
                 write!(f, "Token 获取失败 ({}/{})", available, total)
             }
             ProviderError::UpstreamClientError { status, body } => {
-                write!(f, "上游客户端错误 {}: {}", status, body)
+                // Display 是诊断表示，会被日志 `error=%err` 消费——body 必须截断，
+                // 否则完整上游 body（可达数百 KB）连同其转义会糊进日志字段，抵消
+                // #71 的结构化/可观测目标（Copilot review #72）。
+                write!(
+                    f,
+                    "上游客户端错误 {}: {}",
+                    status,
+                    truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                )
             }
             ProviderError::UpstreamTransientExhausted { last_status, body } => {
-                write!(f, "上游瞬态错误重试耗尽 {}: {}", last_status, body)
+                write!(
+                    f,
+                    "上游瞬态错误重试耗尽 {}: {}",
+                    last_status,
+                    truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                )
             }
             ProviderError::ConnectionFailed { detail } => {
                 write!(f, "网络连接失败重试耗尽: {}", detail)
@@ -338,16 +351,28 @@ impl KiroProvider {
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status,
+                        truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                    );
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                );
             }
 
             // 401/403 凭据问题
@@ -372,9 +397,17 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status,
+                        truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                    );
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 continue;
             }
 
@@ -387,7 +420,11 @@ impl KiroProvider {
                     upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
                     "MCP 请求失败（上游瞬态错误）"
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 self.token_manager.report_no_result(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
@@ -399,11 +436,19 @@ impl KiroProvider {
             // 其他 4xx
             if status.is_client_error() {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                );
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(anyhow::anyhow!(
+                "MCP 请求失败: {} {}",
+                status,
+                truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+            ));
             self.token_manager.report_no_result(ctx.id);
             failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {

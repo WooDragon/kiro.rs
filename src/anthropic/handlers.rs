@@ -1984,6 +1984,90 @@ mod tests {
                 self.0.0.lock().unwrap().push(request_id);
             }
         }
+
+        /// Visitor：从 event 字段中提取 req_outcome 与 message（Task Change 6
+        /// 结局事件断言用——CapturingLayer/RequestIdVisitor 只认 request_id，
+        /// 结局事件断言还需要读 req_outcome 本身的值，故加一个专用 visitor
+        /// 而非改写既有 CapturedIds 类型影响 test_stream_events_carry_req_span_request_id）。
+        pub struct OutcomeVisitor {
+            pub req_outcome: Option<String>,
+            pub message: Option<String>,
+        }
+
+        impl tracing::field::Visit for OutcomeVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "req_outcome" => self.req_outcome = Some(value.to_string()),
+                    "message" => self.message = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "req_outcome" => self.req_outcome = Some(format!("{:?}", value)),
+                    "message" => self.message = Some(format!("{:?}", value)),
+                    _ => {}
+                }
+            }
+        }
+
+        /// 一条捕获到的 event：request_id 走既有 scope-walk 逻辑，
+        /// req_outcome/message 直接从 event 自身字段提取。
+        #[derive(Debug, Clone)]
+        pub struct CapturedOutcome {
+            pub request_id: Option<String>,
+            pub req_outcome: Option<String>,
+            pub message: Option<String>,
+        }
+
+        #[derive(Default, Clone)]
+        pub struct CapturedOutcomes(pub Arc<Mutex<Vec<CapturedOutcome>>>);
+
+        /// 结局事件专用 Layer：request_id 提取逻辑与 CapturingLayer 完全一致
+        /// （小段重复而非放宽 CapturingLayer 的字段可见性去共享——两个 Layer
+        /// 各自职责单一，改成通用容器反而让两处既有测试都要跟着改类型）。
+        pub struct OutcomeCapturingLayer(pub CapturedOutcomes);
+
+        impl<S> Layer<S> for OutcomeCapturingLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if let Some(span) = ctx.span(id) {
+                    let mut visitor = RequestIdVisitor(None);
+                    attrs.record(&mut visitor);
+                    if let Some(rid) = visitor.0 {
+                        span.extensions_mut().insert(RequestIdExt(rid));
+                    }
+                }
+            }
+
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                let request_id = ctx.event_scope(event).and_then(|mut scope| {
+                    scope.find_map(|span_ref| {
+                        span_ref
+                            .extensions()
+                            .get::<RequestIdExt>()
+                            .map(|r| r.0.clone())
+                    })
+                });
+                let mut visitor = OutcomeVisitor {
+                    req_outcome: None,
+                    message: None,
+                };
+                event.record(&mut visitor);
+                self.0.0.lock().unwrap().push(CapturedOutcome {
+                    request_id,
+                    req_outcome: visitor.req_outcome,
+                    message: visitor.message,
+                });
+            }
+        }
     }
 
     /// BDD: 对 stream::unfold 闭包返回的 async block 挂 .instrument(span) 后，
@@ -2047,6 +2131,86 @@ mod tests {
             ids.iter().all(|id| id.as_deref() == Some("test_req_abc")),
             "部分 stream event 未携带 request_id — .instrument(span) 未生效: {:?}",
             &*ids
+        );
+    }
+
+    /// BDD（#71）：请求结局事件必须携带正确的 `req_outcome` 字段值，且靠 span
+    /// 继承带上 request_id。这是痛点 1+4 的核心断言——运维按 conversation_id
+    /// grep `request outcome` 事件聚合成功/失败分布，字段值错则整个视图失真。
+    ///
+    /// 覆盖流内部发射场景：event 在 span 之外被 poll 的 unfold 闭包里发出，
+    /// 仍须继承 request_id（与 test_stream_events_carry_req_span_request_id 同构，
+    /// 但额外断言 req_outcome 的具体取值，用 OutcomeCapturingLayer）。
+    #[test]
+    fn test_outcome_event_carries_req_outcome_and_request_id() {
+        use self::span_capture::{CapturedOutcomes, OutcomeCapturingLayer};
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedOutcomes::default();
+        let layer = OutcomeCapturingLayer(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("req", request_id = "test_req_xyz");
+            let captured_span = {
+                let _guard = span.enter();
+                tracing::Span::current()
+            };
+            // span 已退出——模拟流式 handler 返回后 req span 已 drop 的场景
+            let outcomes = ["success", "overloaded_error", "rate_limit_error"];
+            let test_stream = futures::stream::unfold(0usize, move |i| {
+                let s = captured_span.clone();
+                async move {
+                    if i >= outcomes.len() {
+                        return None;
+                    }
+                    // 复刻生产发射点：tracing::info!(req_outcome = %x, "request outcome")
+                    tracing::info!(req_outcome = outcomes[i], "request outcome");
+                    Some((i, i + 1))
+                }
+                .instrument(s)
+            });
+            futures::executor::block_on(async move {
+                use futures::StreamExt;
+                let mut s = Box::pin(test_stream);
+                while s.next().await.is_some() {}
+            });
+        });
+
+        let events = captured.0.lock().unwrap();
+        // 只看结局事件（message == "request outcome"）
+        let outcome_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.as_deref() == Some("request outcome"))
+            .collect();
+        assert_eq!(
+            outcome_events.len(),
+            3,
+            "应捕获 3 条结局事件，实得 {:?}",
+            &*events
+        );
+        // 断言 1：req_outcome 取值逐条正确（视图聚合的正确性根基）
+        let got: Vec<_> = outcome_events
+            .iter()
+            .map(|e| e.req_outcome.as_deref())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some("success"),
+                Some("overloaded_error"),
+                Some("rate_limit_error")
+            ],
+            "req_outcome 字段值不符"
+        );
+        // 断言 2：request_id 靠 span 继承带上（去掉 .instrument 则全 None 必红）
+        assert!(
+            outcome_events
+                .iter()
+                .all(|e| e.request_id.as_deref() == Some("test_req_xyz")),
+            "结局事件未继承 request_id — span 传递失效: {:?}",
+            &*events
         );
     }
 
