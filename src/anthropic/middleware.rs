@@ -106,7 +106,13 @@ pub async fn request_id_middleware(request: Request<Body>, next: Next) -> Respon
         path = %request.uri().path(),
         conversation_id = tracing::field::Empty,
     );
-    let mut response = next.run(request).instrument(span).await;
+    let mut response = next.run(request).instrument(span.clone()).await;
+    // 全量请求完成事件（含路由层早拒的 404/400），HTTP 层诊断轴：
+    // 客户端看到的最终 status_code 服务端 grep 得到。span.in_scope 显式进入
+    // span 上下文发射，不依赖 span CLOSE 行 late-record 合并时机（#71）。
+    span.in_scope(|| {
+        tracing::info!(status = response.status().as_u16(), "request completed");
+    });
     insert_request_id_header(response.headers_mut(), &id);
     response
 }

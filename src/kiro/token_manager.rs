@@ -24,6 +24,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::{LOG_PAYLOAD_LIMIT, truncate_for_log};
 use crate::model::config::Config;
 use crate::model::registry::ModelRegistry;
 
@@ -93,9 +94,17 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 /// 当服务端返回永久性失败（如 400 `invalid_grant` 或 401 `invalid_client`）时，
 /// 表示凭据已不可恢复（refreshToken 被撤销/过期，或 clientId/clientSecret 无效），
 /// 不应重试，需立即禁用对应凭据。
+///
+/// `message` 刻意不拼接上游原始 body（#71 结构化日志改造前曾整段塞入，导致消费处
+/// `error = %e` 打出的日志字段值本身就是一大段 JSON，grep/jq 精确抠字段困难）；
+/// 完整 body 改由 [`classify_permanent_refresh_failure`] 就近发一条 debug 级日志
+/// 携带 `upstream_body` 字段。`error_code` 让消费处可按字段精确匹配 invalid_grant /
+/// invalid_client，无需再从 message 文本里正则抠。
 #[derive(Debug)]
 pub(crate) struct RefreshTokenInvalidError {
     pub message: String,
+    /// OAuth 错误码：`"invalid_grant"` / `"invalid_client"`
+    pub error_code: &'static str,
 }
 
 impl fmt::Display for RefreshTokenInvalidError {
@@ -137,16 +146,30 @@ fn classify_permanent_refresh_failure(
         && error_code == "invalid_grant"
         && body.contains("Invalid refresh token provided")
     {
+        tracing::debug!(
+            source,
+            error_code = "invalid_grant",
+            upstream_body = %truncate_for_log(body, LOG_PAYLOAD_LIMIT),
+            "refreshToken 永久失效判定命中（invalid_grant）"
+        );
         return Some(RefreshTokenInvalidError {
-            message: format!("{} refreshToken 已失效 (invalid_grant): {}", source, body),
+            message: format!("{} refreshToken 已失效 (invalid_grant)", source),
+            error_code: "invalid_grant",
         });
     }
 
     // 401 + invalid_client → clientId/clientSecret 无效，永久失效。
     // Social 路径不发 client 凭证，对其为死分支但无害（更鲁棒）。
     if status == 401 && error_code == "invalid_client" {
+        tracing::debug!(
+            source,
+            error_code = "invalid_client",
+            upstream_body = %truncate_for_log(body, LOG_PAYLOAD_LIMIT),
+            "refreshToken 永久失效判定命中（invalid_client）"
+        );
         return Some(RefreshTokenInvalidError {
-            message: format!("{} 客户端凭证无效 (invalid_client): {}", source, body),
+            message: format!("{} 客户端凭证无效 (invalid_client)", source),
+            error_code: "invalid_client",
         });
     }
 
@@ -1142,13 +1165,19 @@ impl MultiTokenManager {
                     // 真失效（refreshToken 永久失效 / 过多失败）走 report_refresh_token_invalid /
                     // report_refresh_failure 累计禁用，禁用时 clear_sticky_sessions_for_credential 负责清。
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        tracing::warn!(credential_id = id, error = %e, "refreshToken 永久失效");
-                        self.report_refresh_token_invalid(id)
-                    } else {
-                        tracing::warn!(credential_id = id, error = %e, "Token 刷新失败");
-                        self.report_refresh_failure(id)
-                    };
+                    let has_available =
+                        if let Some(invalid) = e.downcast_ref::<RefreshTokenInvalidError>() {
+                            tracing::warn!(
+                                credential_id = id,
+                                error_code = invalid.error_code,
+                                error = %e,
+                                "refreshToken 永久失效"
+                            );
+                            self.report_refresh_token_invalid(id)
+                        } else {
+                            tracing::warn!(credential_id = id, error = %e, "Token 刷新失败");
+                            self.report_refresh_failure(id)
+                        };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1925,9 +1954,11 @@ impl MultiTokenManager {
                                 // 余额查询路径原先静默吞错误（#52）。补日志保证可观测，
                                 // 并对不可重试的永久性刷新失败立即隔离凭据——与 acquire
                                 // 主路径行为对齐，避免下个业务请求再撞上同一坏凭据白跑一轮。
-                                if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                                if let Some(invalid) = e.downcast_ref::<RefreshTokenInvalidError>()
+                                {
                                     tracing::warn!(
                                         credential_id = id,
+                                        error_code = invalid.error_code,
                                         error = %e,
                                         "Token 刷新永久失效（余额查询）"
                                     );

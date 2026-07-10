@@ -42,10 +42,13 @@ use crate::model::registry::ModelRegistry;
 use std::sync::Arc;
 
 /// 日志 payload 截断上限：8 KB
-const LOG_PAYLOAD_LIMIT: usize = 8 * 1024;
+///
+/// `pub(crate)`：websearch.rs 的 MCP 调试日志复用同一截断逻辑与上限（#71），
+/// 避免维护两份等价实现。
+pub(crate) const LOG_PAYLOAD_LIMIT: usize = 8 * 1024;
 
 /// 日志用：超过 `limit` 字节则在 UTF-8 安全边界截断并标注省略字节数。
-fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+pub(crate) fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
     if s.len() <= limit {
         std::borrow::Cow::Borrowed(s)
     } else {
@@ -172,6 +175,7 @@ fn map_provider_error(err: Error) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR => tracing::error!(error = %err, "内部配置错误"),
             _ => tracing::error!(error = %err, "Kiro API 调用失败"),
         }
+        tracing::info!(req_outcome = %error_type, "request outcome");
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
@@ -184,6 +188,7 @@ fn map_provider_error(err: Error) -> Response {
         response
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败（未分类错误）");
+        tracing::info!(req_outcome = "api_error", "request outcome");
         (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -336,7 +341,7 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
+    tracing::debug!(target: "kiro_rs::payload", body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -568,8 +573,13 @@ fn create_sse_stream(
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不补 message_delta/message_stop），避免把失败伪装成正常完成。
+                                let transient = crate::http_client::is_transient(&e);
+                                tracing::info!(
+                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
+                                    "request outcome"
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                    super::stream::error_sse_event(transient).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                             }
@@ -578,8 +588,10 @@ fn create_sse_stream(
                                 // 否则正常收尾（有内容分支逐字保留原调用）。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                     vec![super::stream::error_sse_event(true)]
                                 } else {
+                                    tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.generate_final_events()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -661,6 +673,8 @@ async fn handle_non_stream_request(
                 .into();
                 return map_provider_error(provider_err);
             }
+            // 非瞬态分支绕过 map_provider_error，结局事件在此单独补发。
+            tracing::info!(req_outcome = "api_error", "request outcome");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -874,6 +888,7 @@ async fn handle_non_stream_request(
             model = model,
             "上游响应为空（无内容且无显式终止信号），返回可重试错误以触发客户端重试"
         );
+        tracing::info!(req_outcome = "overloaded_error", "request outcome");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -908,6 +923,8 @@ async fn handle_non_stream_request(
             min_cacheable_tokens,
         );
     }
+
+    tracing::info!(req_outcome = "success", "request outcome");
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1110,7 +1127,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
+    tracing::debug!(target: "kiro_rs::payload", body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1336,8 +1353,13 @@ fn create_prefix_buffered_sse_stream(
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不调 ctx.finish()），避免把失败伪装成正常完成。
+                                let transient = crate::http_client::is_transient(&e);
+                                tracing::info!(
+                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
+                                    "request outcome"
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                    super::stream::error_sse_event(transient).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
                             }
@@ -1353,8 +1375,10 @@ fn create_prefix_buffered_sse_stream(
                                 // 遗漏已产出内容（未 flush 的 message_start 随 ctx drop 丢弃，无残留）。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                     vec![super::stream::error_sse_event(true)]
                                 } else {
+                                    tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.finish()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1506,11 +1530,17 @@ fn create_buffered_sse_stream(
                             // 故断连时只发干净 error 帧、丢弃未 flush 的缓冲——是「要么全成功要么全失败」
                             // 的自洽语义；若改成「先 flush 收尾（含 message_stop）再追加 error」，会发出
                             // message_stop 后又 error 的自相矛盾序列（先告知成功再告知失败），反而更糟。
+                            let transient = crate::http_client::is_transient(&e);
+                            tracing::info!(
+                                req_outcome = if transient {
+                                    "overloaded_error"
+                                } else {
+                                    "api_error"
+                                },
+                                "request outcome"
+                            );
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                super::stream::error_sse_event(crate::http_client::is_transient(
-                                    &e,
-                                ))
-                                .to_sse_string(),
+                                super::stream::error_sse_event(transient).to_sse_string(),
                             ))];
                             return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                         }
@@ -1521,8 +1551,10 @@ fn create_buffered_sse_stream(
                                 tracing::error!(
                                     "上游响应为空（无内容），返回 error 事件以触发客户端重试"
                                 );
+                                tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                 vec![super::stream::error_sse_event(true)]
                             } else {
+                                tracing::info!(req_outcome = "success", "request outcome");
                                 ctx.finish_and_get_all_events()
                             };
                             let bytes: Vec<Result<Bytes, Infallible>> = all_events

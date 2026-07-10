@@ -72,6 +72,7 @@ repo 内不保留 `docs/` 目录，所有设计文档、实现细节归私有侧
 - 业务长响应（generateAssistantResponse 流式/非流式）走 idle/read 超时（930s，>ALB 900），不设全局总超时——上游在吐字节就不超时；短请求（MCP/WebSearch/oauth/count_tokens）保留 total 死线，与业务 client 按 ClientKind 解耦防 Slowloris（#31）
 - 上游 body 读错误诊断须先判 is_timeout 再分类——reqwest 把 body 读超时无差别包成 Decode（Display 恒为 "error decoding response body"），真因藏 source chain（reqwest #2839，#31）
 - tool_result 内的 image content block 提取后 hoist 到当轮 `userInputMessage.images`（复用 user 贴图路径），tool_result content 保留纯文本、仅图无文时塞占位——上游 `toolResults[].content` 只认 text 不承载图片；图片与 tool_result 落同一 userInputMessage、下游 with_images 零改动（kiro-go 源码 + 黑盒 A/B + e2e 三重背书，#35）
+- 日志默认 JSON Lines（生产排障用 jq），`LOG_FORMAT=text` 回退人类可读文本（本地开发）；请求结局靠显式事件观测而非 span CLOSE 携带 late-record 字段——middleware 发 `request completed`(带 status) 覆盖全量请求，每个业务终结点发 `request outcome`(带 req_outcome=success 或 anthropic error_type)，新增终结点须同步补发结局事件、且勿在已走 map_provider_error 的路径重复发；大 body debug 日志统一挂 `target:"kiro_rs::payload"` 供一键静音、必经 `truncate_for_log` 截断；上游 body 入日志一律 `upstream_body=%truncate` 结构化字段，不整段插值进 message（细节见私有 docs/debug-log-observability.md，#71）
 
 ## 私有文档
 
