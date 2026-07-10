@@ -56,7 +56,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::UpstreamClientError { status, body } => {
                 // Display 是诊断表示，会被日志 `error=%err` 消费——body 必须截断，
                 // 否则完整上游 body（可达数百 KB）连同其转义会糊进日志字段，抵消
-                // #71 的结构化/可观测目标（Copilot review #72）。
+                // #71 的结构化/可观测目标。
                 write!(
                     f,
                     "上游客户端错误 {}: {}",

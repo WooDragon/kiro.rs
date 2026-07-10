@@ -113,18 +113,18 @@ fn map_provider_error(err: Error) -> Response {
                 Some(60u64),
             ),
             ProviderError::UpstreamClientError { status, body } => {
-                if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                if *status == 400 {
+                    let message = if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                        "Context window is full. Reduce conversation history, system prompt, or tools.".to_string()
+                    } else if body.contains("Input is too long") {
+                        "Input is too long. Reduce the size of your messages.".to_string()
+                    } else {
+                        format!("Upstream error: {}", body)
+                    };
                     (
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        "Context window is full. Reduce conversation history, system prompt, or tools.".to_string(),
-                        None,
-                    )
-                } else if body.contains("Input is too long") {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "Input is too long. Reduce the size of your messages.".to_string(),
+                        message,
                         None,
                     )
                 } else {
@@ -175,7 +175,10 @@ fn map_provider_error(err: Error) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR => tracing::error!(error = %err, "内部配置错误"),
             _ => tracing::error!(error = %err, "Kiro API 调用失败"),
         }
-        tracing::info!(req_outcome = %error_type, "request outcome");
+        // req_outcome 统一以字符串字段记录（不加 %）：`%` 走 Display→record_debug，
+        // 与其余发射点的 record_str 提取路径不一致，会让捕获层/JSON 里同一字段
+        // 时而带引号时而不带，污染 jq 聚合。error_type 是 &str 可直接传。
+        tracing::info!(req_outcome = error_type, "request outcome");
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
@@ -1756,6 +1759,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_map_upstream_client_error_400_unknown_body_gives_400() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamClientError {
+            status: 400,
+            body: r#"{"message":"Mantle request failed with status 400","reason":"TOOL_SCHEMA_INVALID"}"#.to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "invalid_request_error");
+    }
+
+    #[tokio::test]
     async fn test_map_transient_exhausted_429_gives_429() {
         use crate::kiro::provider::ProviderError;
         let err: anyhow::Error = ProviderError::UpstreamTransientExhausted {
@@ -1816,6 +1833,130 @@ mod tests {
         assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
         assert!(!response_has_retry_after(&r));
         assert_eq!(response_error_type(r).await, "api_error");
+    }
+
+    // -----------------------------------------------------------------------
+    // #71 Change 6 / Group B — map_provider_error 结局事件（非流式路径代表）
+    //
+    // 上面十二个 test_map_* 只断言 HTTP 响应体（status/retry-after/error type
+    // 字段），从不检查 Change 2 新增的 `tracing::info!(req_outcome, "request
+    // outcome")` 是否真的发出——这正是 Change 6 要补的缺口：响应体正确不代表
+    // 日志事件被发出，两者是独立的副作用。用 span_capture::OutcomeCapturingLayer
+    // （复用既有 request_id 提取逻辑，另加 req_outcome/message 字段提取）在
+    // set_default 作用域内调用 map_provider_error，直接断言捕获到的事件。
+    //
+    // handle_non_stream_request 的三个终结点（Change 3a/3b/3c）不在此处覆盖：
+    // 该函数要求 Arc<KiroProvider>，与文件下方 S3/S4 rationale 段落记录的
+    // 脚手架成本论证完全相同——3a（success）、3b（空响应→503）、3c（非瞬态
+    // →502）都是无分支的直线胶水代码，其判定输入（is_transient/字符串比较）
+    // 已被 http_client.rs 与本文件既有测试覆盖。三条路径里 3c 之外的瞬态分支
+    // 复用 map_provider_error（已被本组覆盖）；3a/3b 未被自动化测试覆盖，
+    // 如实标注在回报里而非略过。
+    // -----------------------------------------------------------------------
+
+    /// 在 OutcomeCapturingLayer 下调用 map_provider_error，返回捕获到的
+    /// 「带 req_outcome 字段」那一条 event（同一次调用还会发 warn!/error! 等
+    /// 不带 req_outcome 的日志，用 find 定位而非假设只有一条捕获记录）。
+    fn capture_outcome_event(
+        f: impl FnOnce() -> Response,
+    ) -> (Response, Option<span_capture::CapturedOutcome>) {
+        use span_capture::{CapturedOutcomes, OutcomeCapturingLayer};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedOutcomes::default();
+        let layer = OutcomeCapturingLayer(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = f();
+
+        let outcome_event = captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.req_outcome.is_some())
+            .cloned();
+        (response, outcome_event)
+    }
+
+    /// BDD：ProviderError::ConnectionFailed 走 map_provider_error 时，
+    /// req_outcome 必须与响应体的 error type（"overloaded_error"）一致——
+    /// 证明 Change 2 在这条分支真的发出了结局事件，而非只是改对了响应体。
+    #[test]
+    fn test_map_provider_error_outcome_matches_error_type_for_connection_failed() {
+        use crate::kiro::provider::ProviderError;
+
+        let (response, outcome) = capture_outcome_event(|| {
+            let err: anyhow::Error = ProviderError::ConnectionFailed {
+                detail: "connection refused".to_string(),
+            }
+            .into();
+            map_provider_error(err)
+        });
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let outcome = outcome.expect(
+            "map_provider_error 必须发出带 req_outcome 字段的 tracing::info! 事件（Change 2）",
+        );
+        assert_eq!(
+            outcome.req_outcome.as_deref(),
+            Some("overloaded_error"),
+            "req_outcome 必须与 error_type 一致，实际：{:?}",
+            outcome.req_outcome
+        );
+        assert_eq!(outcome.message.as_deref(), Some("request outcome"));
+    }
+
+    /// BDD：未分类的 plain anyhow 错误走 fallback 分支时，
+    /// req_outcome 必须硬编码为 "api_error"（Change 2 else 分支）。
+    #[test]
+    fn test_map_provider_error_fallback_outcome_is_api_error() {
+        let (response, outcome) = capture_outcome_event(|| {
+            let err: anyhow::Error = anyhow::anyhow!("some generic error without ProviderError");
+            map_provider_error(err)
+        });
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let outcome = outcome.expect(
+            "map_provider_error fallback 分支必须发出带 req_outcome 字段的事件（Change 2）",
+        );
+        assert_eq!(outcome.req_outcome.as_deref(), Some("api_error"));
+    }
+
+    /// BDD：map_provider_error 本身不建 span，结局事件的 request_id 完全依赖
+    /// 调用处的 ambient span（生产环境里就是 request_id_middleware 建立、
+    /// .instrument(span.clone()) 覆盖整个 next.run() 的那个 req span）。
+    /// 用 span.enter() 模拟"调用处已在 req span 内"，证明 request_id 能
+    /// 正确向上找到——若调用处不在任何 span 内（如误从 spawn 出去的裸 task
+    /// 调用），request_id 会是 None，这不是 bug 而是 tracing scope 的固有语义，
+    /// 此测试确认的是「在 span 内调用时能拿到」这一正向路径。
+    #[test]
+    fn test_map_provider_error_outcome_inherits_ambient_request_id() {
+        use crate::kiro::provider::ProviderError;
+
+        // span 必须在 capture_outcome_event 的 subscriber 上下文内创建：若在外层
+        // （测试无全局 subscriber = noop）建 span，该 span 无真实 span data，进到
+        // capture 的 registry 里 enter 时 event_scope 找不到 request_id → None。
+        // 生产环境无此问题（middleware 建 span 时全局 subscriber 已就位），这纯是
+        // 测试脚手架的 subscriber 时序要求。
+        let (_response, outcome) = capture_outcome_event(|| {
+            let span = tracing::info_span!("req", request_id = "test_req_map_err");
+            let _guard = span.enter();
+            let err: anyhow::Error = ProviderError::InternalConfig {
+                detail: "unknown endpoint: foo".to_string(),
+            }
+            .into();
+            map_provider_error(err)
+        });
+
+        let outcome = outcome.expect("必须捕获到带 req_outcome 的事件");
+        assert_eq!(
+            outcome.request_id.as_deref(),
+            Some("test_req_map_err"),
+            "req_outcome 事件必须继承调用处 ambient span 的 request_id，实际：{:?}",
+            outcome.request_id
+        );
     }
 
     // --- truncate_for_log tests ---
@@ -2165,7 +2306,8 @@ mod tests {
                     if i >= outcomes.len() {
                         return None;
                     }
-                    // 复刻生产发射点：tracing::info!(req_outcome = %x, "request outcome")
+                    // 复刻生产发射点，统一以字符串字段记录（不加 %，与所有生产
+                    // 发射点一致——% 走 Display→record_debug 会造成字段格式不一致）
                     tracing::info!(req_outcome = outcomes[i], "request outcome");
                     Some((i, i + 1))
                 }
