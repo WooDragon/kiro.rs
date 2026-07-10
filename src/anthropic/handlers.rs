@@ -42,10 +42,13 @@ use crate::model::registry::ModelRegistry;
 use std::sync::Arc;
 
 /// 日志 payload 截断上限：8 KB
-const LOG_PAYLOAD_LIMIT: usize = 8 * 1024;
+///
+/// `pub(crate)`：websearch.rs 的 MCP 调试日志复用同一截断逻辑与上限（#71），
+/// 避免维护两份等价实现。
+pub(crate) const LOG_PAYLOAD_LIMIT: usize = 8 * 1024;
 
 /// 日志用：超过 `limit` 字节则在 UTF-8 安全边界截断并标注省略字节数。
-fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+pub(crate) fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, str> {
     if s.len() <= limit {
         std::borrow::Cow::Borrowed(s)
     } else {
@@ -110,25 +113,35 @@ fn map_provider_error(err: Error) -> Response {
                 Some(60u64),
             ),
             ProviderError::UpstreamClientError { status, body } => {
-                if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                if *status == 400 {
+                    let message = if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                        "Context window is full. Reduce conversation history, system prompt, or tools.".to_string()
+                    } else if body.contains("Input is too long") {
+                        "Input is too long. Reduce the size of your messages.".to_string()
+                    } else {
+                        // body 截断：未知上游错误原样回填对外 message，完整 body 可达
+                        // 数百 KB，会让错误响应体异常膨胀（内存/带宽），与 #71 大 body
+                        // 截断约束一致（Copilot re-review）。
+                        format!(
+                            "Upstream error: {}",
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        )
+                    };
                     (
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        "Context window is full. Reduce conversation history, system prompt, or tools.".to_string(),
-                        None,
-                    )
-                } else if body.contains("Input is too long") {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "Input is too long. Reduce the size of your messages.".to_string(),
+                        message,
                         None,
                     )
                 } else {
                     (
                         StatusCode::BAD_GATEWAY,
                         "api_error",
-                        format!("Upstream error: {} {}", status, body),
+                        format!(
+                            "Upstream error: {} {}",
+                            status,
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        ),
                         None,
                     )
                 }
@@ -138,7 +151,10 @@ fn map_provider_error(err: Error) -> Response {
                     (
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limit_error",
-                        format!("Upstream rate limited (retries exhausted): {}", body),
+                        format!(
+                            "Upstream rate limited (retries exhausted): {}",
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        ),
                         Some(30u64),
                     )
                 } else {
@@ -147,7 +163,8 @@ fn map_provider_error(err: Error) -> Response {
                         "overloaded_error",
                         format!(
                             "Upstream service error (retries exhausted): {} {}",
-                            last_status, body
+                            last_status,
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
                         ),
                         Some(30u64),
                     )
@@ -172,6 +189,10 @@ fn map_provider_error(err: Error) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR => tracing::error!(error = %err, "内部配置错误"),
             _ => tracing::error!(error = %err, "Kiro API 调用失败"),
         }
+        // req_outcome 统一以字符串字段记录（不加 %）：`%` 走 Display→record_debug，
+        // 与其余发射点的 record_str 提取路径不一致，会让捕获层/JSON 里同一字段
+        // 时而带引号时而不带，污染 jq 聚合。error_type 是 &str 可直接传。
+        tracing::info!(req_outcome = error_type, "request outcome");
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
@@ -184,6 +205,7 @@ fn map_provider_error(err: Error) -> Response {
         response
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败（未分类错误）");
+        tracing::info!(req_outcome = "api_error", "request outcome");
         (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -336,7 +358,7 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
+    tracing::debug!(target: "kiro_rs::payload", body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -568,8 +590,13 @@ fn create_sse_stream(
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不补 message_delta/message_stop），避免把失败伪装成正常完成。
+                                let transient = crate::http_client::is_transient(&e);
+                                tracing::info!(
+                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
+                                    "request outcome"
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                    super::stream::error_sse_event(transient).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                             }
@@ -578,8 +605,10 @@ fn create_sse_stream(
                                 // 否则正常收尾（有内容分支逐字保留原调用）。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                     vec![super::stream::error_sse_event(true)]
                                 } else {
+                                    tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.generate_final_events()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -661,6 +690,8 @@ async fn handle_non_stream_request(
                 .into();
                 return map_provider_error(provider_err);
             }
+            // 非瞬态分支绕过 map_provider_error，结局事件在此单独补发。
+            tracing::info!(req_outcome = "api_error", "request outcome");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -874,6 +905,7 @@ async fn handle_non_stream_request(
             model = model,
             "上游响应为空（无内容且无显式终止信号），返回可重试错误以触发客户端重试"
         );
+        tracing::info!(req_outcome = "overloaded_error", "request outcome");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -908,6 +940,8 @@ async fn handle_non_stream_request(
             min_cacheable_tokens,
         );
     }
+
+    tracing::info!(req_outcome = "success", "request outcome");
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1110,7 +1144,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!(body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
+    tracing::debug!(target: "kiro_rs::payload", body = %truncate_for_log(&request_body, LOG_PAYLOAD_LIMIT), "Kiro request body");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1336,8 +1370,13 @@ fn create_prefix_buffered_sse_stream(
                                 tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不调 ctx.finish()），避免把失败伪装成正常完成。
+                                let transient = crate::http_client::is_transient(&e);
+                                tracing::info!(
+                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
+                                    "request outcome"
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(crate::http_client::is_transient(&e)).to_sse_string(),
+                                    super::stream::error_sse_event(transient).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
                             }
@@ -1353,8 +1392,10 @@ fn create_prefix_buffered_sse_stream(
                                 // 遗漏已产出内容（未 flush 的 message_start 随 ctx drop 丢弃，无残留）。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
+                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                     vec![super::stream::error_sse_event(true)]
                                 } else {
+                                    tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.finish()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1506,11 +1547,17 @@ fn create_buffered_sse_stream(
                             // 故断连时只发干净 error 帧、丢弃未 flush 的缓冲——是「要么全成功要么全失败」
                             // 的自洽语义；若改成「先 flush 收尾（含 message_stop）再追加 error」，会发出
                             // message_stop 后又 error 的自相矛盾序列（先告知成功再告知失败），反而更糟。
+                            let transient = crate::http_client::is_transient(&e);
+                            tracing::info!(
+                                req_outcome = if transient {
+                                    "overloaded_error"
+                                } else {
+                                    "api_error"
+                                },
+                                "request outcome"
+                            );
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                super::stream::error_sse_event(crate::http_client::is_transient(
-                                    &e,
-                                ))
-                                .to_sse_string(),
+                                super::stream::error_sse_event(transient).to_sse_string(),
                             ))];
                             return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                         }
@@ -1521,8 +1568,10 @@ fn create_buffered_sse_stream(
                                 tracing::error!(
                                     "上游响应为空（无内容），返回 error 事件以触发客户端重试"
                                 );
+                                tracing::info!(req_outcome = "overloaded_error", "request outcome");
                                 vec![super::stream::error_sse_event(true)]
                             } else {
+                                tracing::info!(req_outcome = "success", "request outcome");
                                 ctx.finish_and_get_all_events()
                             };
                             let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -1724,6 +1773,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_map_upstream_client_error_400_unknown_body_gives_400() {
+        use crate::kiro::provider::ProviderError;
+        let err: anyhow::Error = ProviderError::UpstreamClientError {
+            status: 400,
+            body: r#"{"message":"Mantle request failed with status 400","reason":"TOOL_SCHEMA_INVALID"}"#.to_string(),
+        }
+        .into();
+        let r = map_provider_error(err);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(!response_has_retry_after(&r));
+        assert_eq!(response_error_type(r).await, "invalid_request_error");
+    }
+
+    #[tokio::test]
     async fn test_map_transient_exhausted_429_gives_429() {
         use crate::kiro::provider::ProviderError;
         let err: anyhow::Error = ProviderError::UpstreamTransientExhausted {
@@ -1784,6 +1847,130 @@ mod tests {
         assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
         assert!(!response_has_retry_after(&r));
         assert_eq!(response_error_type(r).await, "api_error");
+    }
+
+    // -----------------------------------------------------------------------
+    // #71 Change 6 / Group B — map_provider_error 结局事件（非流式路径代表）
+    //
+    // 上面十二个 test_map_* 只断言 HTTP 响应体（status/retry-after/error type
+    // 字段），从不检查 Change 2 新增的 `tracing::info!(req_outcome, "request
+    // outcome")` 是否真的发出——这正是 Change 6 要补的缺口：响应体正确不代表
+    // 日志事件被发出，两者是独立的副作用。用 span_capture::OutcomeCapturingLayer
+    // （复用既有 request_id 提取逻辑，另加 req_outcome/message 字段提取）在
+    // set_default 作用域内调用 map_provider_error，直接断言捕获到的事件。
+    //
+    // handle_non_stream_request 的三个终结点（Change 3a/3b/3c）不在此处覆盖：
+    // 该函数要求 Arc<KiroProvider>，与文件下方 S3/S4 rationale 段落记录的
+    // 脚手架成本论证完全相同——3a（success）、3b（空响应→503）、3c（非瞬态
+    // →502）都是无分支的直线胶水代码，其判定输入（is_transient/字符串比较）
+    // 已被 http_client.rs 与本文件既有测试覆盖。三条路径里 3c 之外的瞬态分支
+    // 复用 map_provider_error（已被本组覆盖）；3a/3b 未被自动化测试覆盖，
+    // 如实标注在回报里而非略过。
+    // -----------------------------------------------------------------------
+
+    /// 在 OutcomeCapturingLayer 下调用 map_provider_error，返回捕获到的
+    /// 「带 req_outcome 字段」那一条 event（同一次调用还会发 warn!/error! 等
+    /// 不带 req_outcome 的日志，用 find 定位而非假设只有一条捕获记录）。
+    fn capture_outcome_event(
+        f: impl FnOnce() -> Response,
+    ) -> (Response, Option<span_capture::CapturedOutcome>) {
+        use span_capture::{CapturedOutcomes, OutcomeCapturingLayer};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedOutcomes::default();
+        let layer = OutcomeCapturingLayer(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = f();
+
+        let outcome_event = captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.req_outcome.is_some())
+            .cloned();
+        (response, outcome_event)
+    }
+
+    /// BDD：ProviderError::ConnectionFailed 走 map_provider_error 时，
+    /// req_outcome 必须与响应体的 error type（"overloaded_error"）一致——
+    /// 证明 Change 2 在这条分支真的发出了结局事件，而非只是改对了响应体。
+    #[test]
+    fn test_map_provider_error_outcome_matches_error_type_for_connection_failed() {
+        use crate::kiro::provider::ProviderError;
+
+        let (response, outcome) = capture_outcome_event(|| {
+            let err: anyhow::Error = ProviderError::ConnectionFailed {
+                detail: "connection refused".to_string(),
+            }
+            .into();
+            map_provider_error(err)
+        });
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let outcome = outcome.expect(
+            "map_provider_error 必须发出带 req_outcome 字段的 tracing::info! 事件（Change 2）",
+        );
+        assert_eq!(
+            outcome.req_outcome.as_deref(),
+            Some("overloaded_error"),
+            "req_outcome 必须与 error_type 一致，实际：{:?}",
+            outcome.req_outcome
+        );
+        assert_eq!(outcome.message.as_deref(), Some("request outcome"));
+    }
+
+    /// BDD：未分类的 plain anyhow 错误走 fallback 分支时，
+    /// req_outcome 必须硬编码为 "api_error"（Change 2 else 分支）。
+    #[test]
+    fn test_map_provider_error_fallback_outcome_is_api_error() {
+        let (response, outcome) = capture_outcome_event(|| {
+            let err: anyhow::Error = anyhow::anyhow!("some generic error without ProviderError");
+            map_provider_error(err)
+        });
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let outcome = outcome.expect(
+            "map_provider_error fallback 分支必须发出带 req_outcome 字段的事件（Change 2）",
+        );
+        assert_eq!(outcome.req_outcome.as_deref(), Some("api_error"));
+    }
+
+    /// BDD：map_provider_error 本身不建 span，结局事件的 request_id 完全依赖
+    /// 调用处的 ambient span（生产环境里就是 request_id_middleware 建立、
+    /// .instrument(span.clone()) 覆盖整个 next.run() 的那个 req span）。
+    /// 用 span.enter() 模拟"调用处已在 req span 内"，证明 request_id 能
+    /// 正确向上找到——若调用处不在任何 span 内（如误从 spawn 出去的裸 task
+    /// 调用），request_id 会是 None，这不是 bug 而是 tracing scope 的固有语义，
+    /// 此测试确认的是「在 span 内调用时能拿到」这一正向路径。
+    #[test]
+    fn test_map_provider_error_outcome_inherits_ambient_request_id() {
+        use crate::kiro::provider::ProviderError;
+
+        // span 必须在 capture_outcome_event 的 subscriber 上下文内创建：若在外层
+        // （测试无全局 subscriber = noop）建 span，该 span 无真实 span data，进到
+        // capture 的 registry 里 enter 时 event_scope 找不到 request_id → None。
+        // 生产环境无此问题（middleware 建 span 时全局 subscriber 已就位），这纯是
+        // 测试脚手架的 subscriber 时序要求。
+        let (_response, outcome) = capture_outcome_event(|| {
+            let span = tracing::info_span!("req", request_id = "test_req_map_err");
+            let _guard = span.enter();
+            let err: anyhow::Error = ProviderError::InternalConfig {
+                detail: "unknown endpoint: foo".to_string(),
+            }
+            .into();
+            map_provider_error(err)
+        });
+
+        let outcome = outcome.expect("必须捕获到带 req_outcome 的事件");
+        assert_eq!(
+            outcome.request_id.as_deref(),
+            Some("test_req_map_err"),
+            "req_outcome 事件必须继承调用处 ambient span 的 request_id，实际：{:?}",
+            outcome.request_id
+        );
     }
 
     // --- truncate_for_log tests ---
@@ -1952,6 +2139,90 @@ mod tests {
                 self.0.0.lock().unwrap().push(request_id);
             }
         }
+
+        /// Visitor：从 event 字段中提取 req_outcome 与 message（Task Change 6
+        /// 结局事件断言用——CapturingLayer/RequestIdVisitor 只认 request_id，
+        /// 结局事件断言还需要读 req_outcome 本身的值，故加一个专用 visitor
+        /// 而非改写既有 CapturedIds 类型影响 test_stream_events_carry_req_span_request_id）。
+        pub struct OutcomeVisitor {
+            pub req_outcome: Option<String>,
+            pub message: Option<String>,
+        }
+
+        impl tracing::field::Visit for OutcomeVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "req_outcome" => self.req_outcome = Some(value.to_string()),
+                    "message" => self.message = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "req_outcome" => self.req_outcome = Some(format!("{:?}", value)),
+                    "message" => self.message = Some(format!("{:?}", value)),
+                    _ => {}
+                }
+            }
+        }
+
+        /// 一条捕获到的 event：request_id 走既有 scope-walk 逻辑，
+        /// req_outcome/message 直接从 event 自身字段提取。
+        #[derive(Debug, Clone)]
+        pub struct CapturedOutcome {
+            pub request_id: Option<String>,
+            pub req_outcome: Option<String>,
+            pub message: Option<String>,
+        }
+
+        #[derive(Default, Clone)]
+        pub struct CapturedOutcomes(pub Arc<Mutex<Vec<CapturedOutcome>>>);
+
+        /// 结局事件专用 Layer：request_id 提取逻辑与 CapturingLayer 完全一致
+        /// （小段重复而非放宽 CapturingLayer 的字段可见性去共享——两个 Layer
+        /// 各自职责单一，改成通用容器反而让两处既有测试都要跟着改类型）。
+        pub struct OutcomeCapturingLayer(pub CapturedOutcomes);
+
+        impl<S> Layer<S> for OutcomeCapturingLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if let Some(span) = ctx.span(id) {
+                    let mut visitor = RequestIdVisitor(None);
+                    attrs.record(&mut visitor);
+                    if let Some(rid) = visitor.0 {
+                        span.extensions_mut().insert(RequestIdExt(rid));
+                    }
+                }
+            }
+
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                let request_id = ctx.event_scope(event).and_then(|mut scope| {
+                    scope.find_map(|span_ref| {
+                        span_ref
+                            .extensions()
+                            .get::<RequestIdExt>()
+                            .map(|r| r.0.clone())
+                    })
+                });
+                let mut visitor = OutcomeVisitor {
+                    req_outcome: None,
+                    message: None,
+                };
+                event.record(&mut visitor);
+                self.0.0.lock().unwrap().push(CapturedOutcome {
+                    request_id,
+                    req_outcome: visitor.req_outcome,
+                    message: visitor.message,
+                });
+            }
+        }
     }
 
     /// BDD: 对 stream::unfold 闭包返回的 async block 挂 .instrument(span) 后，
@@ -2015,6 +2286,87 @@ mod tests {
             ids.iter().all(|id| id.as_deref() == Some("test_req_abc")),
             "部分 stream event 未携带 request_id — .instrument(span) 未生效: {:?}",
             &*ids
+        );
+    }
+
+    /// BDD（#71）：请求结局事件必须携带正确的 `req_outcome` 字段值，且靠 span
+    /// 继承带上 request_id。这是痛点 1+4 的核心断言——运维按 conversation_id
+    /// grep `request outcome` 事件聚合成功/失败分布，字段值错则整个视图失真。
+    ///
+    /// 覆盖流内部发射场景：event 在 span 之外被 poll 的 unfold 闭包里发出，
+    /// 仍须继承 request_id（与 test_stream_events_carry_req_span_request_id 同构，
+    /// 但额外断言 req_outcome 的具体取值，用 OutcomeCapturingLayer）。
+    #[test]
+    fn test_outcome_event_carries_req_outcome_and_request_id() {
+        use self::span_capture::{CapturedOutcomes, OutcomeCapturingLayer};
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedOutcomes::default();
+        let layer = OutcomeCapturingLayer(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("req", request_id = "test_req_xyz");
+            let captured_span = {
+                let _guard = span.enter();
+                tracing::Span::current()
+            };
+            // span 已退出——模拟流式 handler 返回后 req span 已 drop 的场景
+            let outcomes = ["success", "overloaded_error", "rate_limit_error"];
+            let test_stream = futures::stream::unfold(0usize, move |i| {
+                let s = captured_span.clone();
+                async move {
+                    if i >= outcomes.len() {
+                        return None;
+                    }
+                    // 复刻生产发射点，统一以字符串字段记录（不加 %，与所有生产
+                    // 发射点一致——% 走 Display→record_debug 会造成字段格式不一致）
+                    tracing::info!(req_outcome = outcomes[i], "request outcome");
+                    Some((i, i + 1))
+                }
+                .instrument(s)
+            });
+            futures::executor::block_on(async move {
+                use futures::StreamExt;
+                let mut s = Box::pin(test_stream);
+                while s.next().await.is_some() {}
+            });
+        });
+
+        let events = captured.0.lock().unwrap();
+        // 只看结局事件（message == "request outcome"）
+        let outcome_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.as_deref() == Some("request outcome"))
+            .collect();
+        assert_eq!(
+            outcome_events.len(),
+            3,
+            "应捕获 3 条结局事件，实得 {:?}",
+            &*events
+        );
+        // 断言 1：req_outcome 取值逐条正确（视图聚合的正确性根基）
+        let got: Vec<_> = outcome_events
+            .iter()
+            .map(|e| e.req_outcome.as_deref())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some("success"),
+                Some("overloaded_error"),
+                Some("rate_limit_error")
+            ],
+            "req_outcome 字段值不符"
+        );
+        // 断言 2：request_id 靠 span 继承带上（去掉 .instrument 则全 None 必红）
+        assert!(
+            outcome_events
+                .iter()
+                .all(|e| e.request_id.as_deref() == Some("test_req_xyz")),
+            "结局事件未继承 request_id — span 传递失效: {:?}",
+            &*events
         );
     }
 

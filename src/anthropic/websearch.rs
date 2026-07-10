@@ -518,7 +518,7 @@ pub async fn handle_websearch_request(
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
+            tracing::warn!(error = %e, "MCP API 调用失败");
             None
         }
     };
@@ -580,12 +580,21 @@ async fn call_mcp_api(
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
-    tracing::debug!("MCP request: {}", request_body);
+    // 复用 handlers.rs 的截断逻辑与上限，避免维护两份等价实现（#71）。
+    tracing::debug!(
+        target: "kiro_rs::payload",
+        body = %super::handlers::truncate_for_log(&request_body, super::handlers::LOG_PAYLOAD_LIMIT),
+        "MCP request"
+    );
 
     let response = provider.call_mcp(&request_body).await?;
 
     let body = response.text().await?;
-    tracing::debug!("MCP response: {}", body);
+    tracing::debug!(
+        target: "kiro_rs::payload",
+        body = %super::handlers::truncate_for_log(&body, super::handlers::LOG_PAYLOAD_LIMIT),
+        "MCP response"
+    );
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
 

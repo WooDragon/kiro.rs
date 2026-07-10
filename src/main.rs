@@ -25,14 +25,28 @@ async fn main() {
     let args = Args::parse();
 
     // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_target(true)
-        .init();
+    // 默认输出 JSON Lines（生产排障主场景，便于 jq 抠字段）；LOG_FORMAT=text 回退人类可读文本（本地开发）
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let use_text_format = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("text"))
+        .unwrap_or(false);
+    if use_text_format {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(true)
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .init();
+    }
 
     // 加载配置
     let config_path = args

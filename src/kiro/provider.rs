@@ -18,6 +18,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::{LOG_PAYLOAD_LIMIT, truncate_for_log};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -53,10 +54,23 @@ impl std::fmt::Display for ProviderError {
                 write!(f, "Token 获取失败 ({}/{})", available, total)
             }
             ProviderError::UpstreamClientError { status, body } => {
-                write!(f, "上游客户端错误 {}: {}", status, body)
+                // Display 是诊断表示，会被日志 `error=%err` 消费——body 必须截断，
+                // 否则完整上游 body（可达数百 KB）连同其转义会糊进日志字段，抵消
+                // #71 的结构化/可观测目标。
+                write!(
+                    f,
+                    "上游客户端错误 {}: {}",
+                    status,
+                    truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                )
             }
             ProviderError::UpstreamTransientExhausted { last_status, body } => {
-                write!(f, "上游瞬态错误重试耗尽 {}: {}", last_status, body)
+                write!(
+                    f,
+                    "上游瞬态错误重试耗尽 {}: {}",
+                    last_status,
+                    truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                )
             }
             ProviderError::ConnectionFailed { detail } => {
                 write!(f, "网络连接失败重试耗尽: {}", detail)
@@ -307,10 +321,10 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        attempt = attempt + 1,
                         max_retries,
-                        e
+                        error = %e,
+                        "MCP 请求发送失败"
                     );
                     last_error = Some(e.into());
                     self.token_manager.report_no_result(ctx.id);
@@ -337,16 +351,28 @@ impl KiroProvider {
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status,
+                        truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                    );
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                );
             }
 
             // 401/403 凭据问题
@@ -371,22 +397,34 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!(
+                        "MCP 请求失败（所有凭据已用尽）: {} {}",
+                        status,
+                        truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                    );
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 continue;
             }
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    status = %status,
+                    upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                    "MCP 请求失败（上游瞬态错误）"
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                ));
                 self.token_manager.report_no_result(ctx.id);
                 failed_credential_ids.insert(ctx.id);
                 if attempt + 1 < max_retries {
@@ -398,11 +436,19 @@ impl KiroProvider {
             // 其他 4xx
             if status.is_client_error() {
                 self.token_manager.report_no_result(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                );
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(anyhow::anyhow!(
+                "MCP 请求失败: {} {}",
+                status,
+                truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+            ));
             self.token_manager.report_no_result(ctx.id);
             failed_credential_ids.insert(ctx.id);
             if attempt + 1 < max_retries {
@@ -510,10 +556,10 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        attempt = attempt + 1,
                         max_retries,
-                        e
+                        error = %e,
+                        "API 请求发送失败"
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
@@ -546,11 +592,11 @@ impl KiroProvider {
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    status = %status,
+                    upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                    "API 请求失败（额度已用尽，禁用凭据并切换）"
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -580,11 +626,11 @@ impl KiroProvider {
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    status = %status,
+                    upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                    "API 请求失败（可能为凭据错误）"
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -625,11 +671,11 @@ impl KiroProvider {
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    status = %status,
+                    upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                    "API 请求失败（上游瞬态错误）"
                 );
                 last_error = Some(ProviderError::UpstreamTransientExhausted {
                     last_status: status.as_u16(),
@@ -654,11 +700,11 @@ impl KiroProvider {
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
-                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
+                attempt = attempt + 1,
                 max_retries,
-                status,
-                body
+                status = %status,
+                upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                "API 请求失败（未知错误）"
             );
             last_error = Some(ProviderError::UpstreamTransientExhausted {
                 last_status: status.as_u16(),
