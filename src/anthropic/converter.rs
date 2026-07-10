@@ -19,100 +19,28 @@ use crate::model::registry::ModelRegistry;
 use super::types::{ContentBlock, MessagesRequest};
 
 /// JSON Schema composition/reference keys that are valid without object-only fields.
+///
+/// "$ref" 留在此数组是历史沿留（最小化改动）：自 `should_default_to_object_type`
+/// 新增显式 $ref 短路判据（`obj.contains_key("$ref")` 优先命中）后，$ref 是否
+/// 出现在本数组已不影响该函数的返回结果——有 $ref 时显式判据必先短路。保留只是
+/// 因为移除有风险，不代表 $ref 仍在走 composition（anyOf/oneOf/allOf）判断路径。
 const COMPOSITION_SCHEMA_KEYS: &[&str] = &["anyOf", "oneOf", "allOf", "$ref"];
-
-/// $ref 展开的最大递归深度，防止自引用/循环引用导致无限递归。
-const MAX_REF_DEPTH: usize = 16;
-
-/// 提取 schema 顶层 `$defs` / `definitions` 中的定义，合并为一张解析表。
-///
-/// 只读，不修改输入 schema；`$defs` 与 `definitions` 是同一概念的两种命名习惯
-/// (JSON Schema 2019-09+ 用 `$defs`，Draft-07 及更早用 `definitions`)，两者都要认。
-fn extract_schema_defs(schema: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    let mut defs = serde_json::Map::new();
-    for key in ["$defs", "definitions"] {
-        if let Some(serde_json::Value::Object(entries)) = schema.get(key) {
-            for (name, value) in entries {
-                defs.insert(name.clone(), value.clone());
-            }
-        }
-    }
-    defs
-}
-
-/// 深度优先展开 `$ref`，Kiro 不理解 `$ref`，未展开的引用会导致该属性退化为无约束。
-///
-/// 命中 `$defs`/`definitions` 中的定义则递归展开合并；命中不了（OpenAPI 风格的
-/// `#/components/...`、外部引用、缺失的定义名）则退化为 `{"type": "object"}`，
-/// 好过什么都不做——至少还是个 object 而不是被上游直接判定 400。
-fn resolve_schema_refs(
-    value: serde_json::Value,
-    defs: &serde_json::Map<String, serde_json::Value>,
-    depth: usize,
-) -> serde_json::Value {
-    if depth > MAX_REF_DEPTH {
-        return serde_json::json!({"type": "object", "additionalProperties": true});
-    }
-
-    match value {
-        serde_json::Value::Object(mut obj) => {
-            if let Some(serde_json::Value::String(ref_str)) = obj.remove("$ref") {
-                let name = ref_str
-                    .strip_prefix("#/$defs/")
-                    .or_else(|| ref_str.strip_prefix("#/definitions/"));
-
-                let resolved = name.and_then(|n| defs.get(n)).cloned();
-                match resolved {
-                    Some(target) => {
-                        let resolved_target = resolve_schema_refs(target, defs, depth + 1);
-                        if let serde_json::Value::Object(target_obj) = resolved_target {
-                            for (k, v) in target_obj {
-                                obj.entry(k).or_insert(v);
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::debug!(schema_ref = %ref_str, "无法解析的 $ref，退化为 object 类型");
-                        obj.entry("type".to_string())
-                            .or_insert(serde_json::Value::String("object".to_string()));
-                    }
-                }
-            }
-
-            let mut resolved_obj = serde_json::Map::with_capacity(obj.len());
-            for (k, v) in obj {
-                resolved_obj.insert(k, resolve_schema_refs(v, defs, depth + 1));
-            }
-            serde_json::Value::Object(resolved_obj)
-        }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .into_iter()
-                .map(|item| resolve_schema_refs(item, defs, depth + 1))
-                .collect(),
-        ),
-        other => other,
-    }
-}
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
 /// 导致上游返回 400 "Improperly formed request"。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
-    let defs = extract_schema_defs(&schema);
-    let schema = resolve_schema_refs(schema, &defs, 0);
-
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
             "type": "object",
             "properties": {}
         });
     };
-    obj.remove("$defs");
-    obj.remove("definitions");
 
-    // type：只在缺失或无效且不是组合/$ref schema 时补 object，避免改变有效 schema 语义。
+    // type：只在缺失或无效时补 object，避免改变有效 schema 语义。
+    // anyOf/oneOf/allOf 组合 schema 保持原样不补；但顶层裸 $ref（如 {"$ref":...,"$defs":{...}}）
+    // 上游硬约束 inputSchema.json 顶层必须有 type:object，$ref 本身不提供 type，故仍需补上（issue92）。
     let has_composition = COMPOSITION_SCHEMA_KEYS
         .iter()
         .any(|key| obj.contains_key(*key));
@@ -161,7 +89,19 @@ fn should_default_to_object_type(
     obj: &serde_json::Map<String, serde_json::Value>,
     has_composition: bool,
 ) -> bool {
-    !has_composition || obj.contains_key("properties") || obj.contains_key("required")
+    // 顶层裸 $ref（如 {"$ref":"#/$defs/Root","$defs":{...}}）自身不提供 type，
+    // 但上游硬约束 inputSchema.json 顶层必须有 type:object，故即使没有
+    // properties/required 也要补（issue92）。anyOf/oneOf/allOf 组合 schema
+    // 保持原有行为不变——那些形态本就合法地没有顶层 type。
+    //
+    // 若顶层同时含 $ref 与 anyOf/oneOf/allOf（极罕见的组合形态），$ref 判据
+    // 优先命中、仍补 type:object，这是有意为之而非 bug：上游硬约束顶层必须
+    // type:object，顶层缺 type 本就 400，此组合无论如何都要补，不存在
+    // "该保持组合 schema 原样不补" 的合法诉求。
+    obj.contains_key("$ref")
+        || !has_composition
+        || obj.contains_key("properties")
+        || obj.contains_key("required")
 }
 
 fn clean_nested_schema_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
@@ -1707,8 +1647,10 @@ mod tests {
         assert_eq!(normalized, schema);
     }
 
+    /// issue92：Kiro 上游实测普遍认 $ref/$defs（原样透传全 200），$ref 展开反而是
+    /// 真实回归根因（见下一测试）。normalize 不再展开引用，$ref/$defs 原样保留。
     #[test]
-    fn test_normalize_resolves_ref_from_defs() {
+    fn test_normalize_preserves_ref_and_defs_untouched() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -1728,47 +1670,129 @@ mod tests {
         });
 
         let normalized = normalize_json_schema(schema);
-        assert_eq!(normalized["properties"]["filter"]["type"], "object");
         assert_eq!(
-            normalized["properties"]["filter"]["properties"]["name"]["type"],
+            normalized["properties"]["filter"]["$ref"], "#/$defs/Filter",
+            "$ref 应原样保留，不被展开"
+        );
+        assert!(
+            normalized.get("$defs").is_some(),
+            "$defs 应原样保留，供上游自解析"
+        );
+        assert_eq!(
+            normalized["$defs"]["Filter"]["properties"]["name"]["type"],
             "string"
         );
-        assert_eq!(
-            normalized["properties"]["filter"]["properties"]["limit"]["type"],
-            "integer"
-        );
-        assert_eq!(
-            normalized["properties"]["filter"]["required"],
-            serde_json::json!(["name"])
-        );
-        assert!(normalized.get("$defs").is_none());
-        assert!(normalized["properties"]["filter"].get("$ref").is_none());
     }
 
+    /// issue92 补充回归：移除顶层 `remove($defs)` 后（$defs 不再被摘出来单独
+    /// 处理），$defs 内部字段仍必须被 `clean_nested_schema_fields` 递归清理到——
+    /// 这条路径容易在未来被误改成"跳过 $defs"，一旦跳过，$defs 内部残留的
+    /// additionalProperties/非法 required 元素会让上游 400。
     #[test]
-    fn test_normalize_ref_cycle_does_not_panic() {
+    fn test_normalize_cleans_additionalproperties_inside_defs() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "node": {"$ref": "#/$defs/Node"}
+                "filter": {"$ref": "#/$defs/Filter"}
             },
+            "required": ["filter"],
             "$defs": {
-                "Node": {
+                "Filter": {
                     "type": "object",
                     "properties": {
-                        "child": {"$ref": "#/$defs/Node"}
+                        "name": {"type": "string"}
+                    },
+                    "required": ["name", 42],
+                    "additionalProperties": false
+                }
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+
+        // $ref/$defs 结构本身仍保留（不展开、不丢失）。
+        assert_eq!(
+            normalized["properties"]["filter"]["$ref"], "#/$defs/Filter",
+            "$ref 应原样保留"
+        );
+        assert!(normalized.get("$defs").is_some(), "$defs 应原样保留");
+
+        // $defs 内部字段被递归清理：additionalProperties 剥掉，
+        // required 中的非法元素（数字 42）被过滤，只剩合法 string 项。
+        let filter_def = &normalized["$defs"]["Filter"];
+        assert_eq!(
+            filter_def.get("additionalProperties"),
+            None,
+            "$defs 内部的 additionalProperties 应被清理，不能因为顶层不再 remove($defs) 而漏网"
+        );
+        assert_eq!(
+            filter_def["required"],
+            serde_json::json!(["name"]),
+            "$defs 内部 required 的非法元素应被过滤"
+        );
+    }
+
+    /// issue92 核心回归测试：递归自引用 schema（Tree 含 children 数组，item 是
+    /// 指回自身的 $ref）经 normalize 后，$ref/$defs 保留，且绝不产生畸形的
+    /// `type: {...}` 嵌套对象——旧展开逻辑会把递归引用展开成套娃，导致 type
+    /// 字段值变成 object 而非合法的 string，上游报 400 TOOL_SCHEMA_INVALID。
+    #[test]
+    fn test_normalize_recursive_ref_no_type_corruption() {
+        let schema = serde_json::json!({
+            "$ref": "#/$defs/Tree",
+            "$defs": {
+                "Tree": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "children": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Tree"}
+                        }
                     }
                 }
             }
         });
 
         let normalized = normalize_json_schema(schema);
-        assert_eq!(normalized["properties"]["node"]["type"], "object");
-        assert!(normalized.get("$defs").is_none());
+
+        assert_eq!(normalized["$ref"], "#/$defs/Tree", "顶层 $ref 应原样保留");
+        assert!(normalized.get("$defs").is_some(), "$defs 应原样保留");
+
+        // 关键断言：schema 里任何 "type" 字段的值都必须是 string 或 array，
+        // 绝不能是 object（那是旧展开逻辑套娃出的畸形结构）。
+        assert_no_object_typed_type_field(&normalized);
     }
 
+    /// 递归检查：schema 树中任何键为 "type" 的字段，其值只能是字符串或数组，
+    /// 不能是 object（后者是 $ref 展开套娃产生的畸形结构，issue92 回归信号）。
+    fn assert_no_object_typed_type_field(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(type_value) = map.get("type") {
+                    assert!(
+                        !type_value.is_object(),
+                        "发现畸形 type 字段：值是 object 而非 string/array: {:?}",
+                        type_value
+                    );
+                }
+                for child in map.values() {
+                    assert_no_object_typed_type_field(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_object_typed_type_field(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// issue92：OpenAPI 风格外部引用（`#/components/schemas/...`）实测上游对保留的
+    /// 外部 $ref 返回 200，不再退化为 object——展开/退化都不是上游要求的行为。
     #[test]
-    fn test_normalize_unresolvable_ref_degrades_to_object() {
+    fn test_normalize_openapi_external_ref_preserved() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -1778,10 +1802,67 @@ mod tests {
         });
 
         let normalized = normalize_json_schema(schema);
-        assert_eq!(normalized["properties"]["a"]["type"], "object");
-        assert_eq!(normalized["properties"]["b"]["type"], "object");
-        assert!(normalized["properties"]["a"].get("$ref").is_none());
-        assert!(normalized["properties"]["b"].get("$ref").is_none());
+        assert_eq!(
+            normalized["properties"]["a"]["$ref"], "#/components/schemas/Foo",
+            "外部 $ref 应原样保留，不退化为 object"
+        );
+        assert_eq!(
+            normalized["properties"]["b"]["$ref"], "#/$defs/Missing",
+            "未命中的 $defs 引用同样应原样保留，不退化为 object"
+        );
+    }
+
+    /// issue92：顶层裸 $ref（无 anyOf/oneOf/allOf，只有 $ref + $defs）本身不带 type，
+    /// 但上游硬约束 inputSchema.json 顶层必须有 type:object，故 normalize 需补上——
+    /// 实测 cand2（type:object + $ref + $defs 共存）上游 200。
+    #[test]
+    fn test_normalize_toplevel_bare_ref_gets_type_object() {
+        let schema = serde_json::json!({
+            "$ref": "#/$defs/Root",
+            "$defs": {
+                "Root": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    }
+                }
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(
+            normalized["type"], "object",
+            "顶层裸 $ref 缺 type 时应补 type:object"
+        );
+        assert_eq!(normalized["$ref"], "#/$defs/Root", "$ref 应保留");
+        assert!(normalized.get("$defs").is_some(), "$defs 应保留");
+    }
+
+    /// issue92：property 内嵌 $ref（非顶层）应原样透传，不受顶层补 type 逻辑影响。
+    #[test]
+    fn test_normalize_nested_ref_in_property_preserved() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {"$ref": "#/$defs/Config"}
+            },
+            "$defs": {
+                "Config": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"}
+                    }
+                }
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+        assert_eq!(normalized["type"], "object", "顶层 type 保留");
+        assert_eq!(
+            normalized["properties"]["config"]["$ref"], "#/$defs/Config",
+            "property 内的 $ref 应原样透传"
+        );
+        assert!(normalized.get("$defs").is_some(), "$defs 应保留");
     }
 
     #[test]
