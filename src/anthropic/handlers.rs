@@ -119,7 +119,13 @@ fn map_provider_error(err: Error) -> Response {
                     } else if body.contains("Input is too long") {
                         "Input is too long. Reduce the size of your messages.".to_string()
                     } else {
-                        format!("Upstream error: {}", body)
+                        // body 截断：未知上游错误原样回填对外 message，完整 body 可达
+                        // 数百 KB，会让错误响应体异常膨胀（内存/带宽），与 #71 大 body
+                        // 截断约束一致（Copilot re-review）。
+                        format!(
+                            "Upstream error: {}",
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        )
                     };
                     (
                         StatusCode::BAD_REQUEST,
@@ -131,7 +137,11 @@ fn map_provider_error(err: Error) -> Response {
                     (
                         StatusCode::BAD_GATEWAY,
                         "api_error",
-                        format!("Upstream error: {} {}", status, body),
+                        format!(
+                            "Upstream error: {} {}",
+                            status,
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        ),
                         None,
                     )
                 }
@@ -141,7 +151,10 @@ fn map_provider_error(err: Error) -> Response {
                     (
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate_limit_error",
-                        format!("Upstream rate limited (retries exhausted): {}", body),
+                        format!(
+                            "Upstream rate limited (retries exhausted): {}",
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
+                        ),
                         Some(30u64),
                     )
                 } else {
@@ -150,7 +163,8 @@ fn map_provider_error(err: Error) -> Response {
                         "overloaded_error",
                         format!(
                             "Upstream service error (retries exhausted): {} {}",
-                            last_status, body
+                            last_status,
+                            truncate_for_log(body, LOG_PAYLOAD_LIMIT)
                         ),
                         Some(30u64),
                     )
