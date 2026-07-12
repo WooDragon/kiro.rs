@@ -29,8 +29,17 @@ pub(crate) fn detect_text_tool_call_leak(text: &str) -> Option<&'static str> {
 /// 从历史 assistant text content 中剥离尾部的工具调用 XML 泄漏块。
 /// 循环执行直到尾部不再有泄漏闭合标签。
 pub(crate) fn strip_leaked_tool_call_xml(text: &mut String) {
+    let original_len = text.len();
     while let Some(pos) = find_tail_leak_start(text.trim_end()) {
         text.truncate(text[..pos].trim_end().len());
+    }
+    if text.len() < original_len {
+        tracing::warn!(
+            original_len,
+            stripped_len = text.len(),
+            stripped_bytes = original_len - text.len(),
+            "历史消毒：截断泄漏的工具调用 XML(#43)"
+        );
     }
 }
 
@@ -61,7 +70,7 @@ fn find_tail_leak_start(text: &str) -> Option<usize> {
             Some(pos)
         }
         "</invoke>" | "</parameter>" => {
-            let pos = text.rfind("<invoke")?;
+            let pos = text.rfind("<invoke ")?;
             let close_tag = if tail_tag == "</invoke>" {
                 "</invoke>"
             } else {
