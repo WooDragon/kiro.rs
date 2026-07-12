@@ -28,6 +28,7 @@ mod middleware;
 mod prompt_cache;
 mod router;
 mod stream;
+pub(crate) mod tool_call_leak;
 pub mod types;
 mod websearch;
 

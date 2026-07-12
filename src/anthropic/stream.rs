@@ -15,27 +15,9 @@ use super::prompt_cache::{
     PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
     decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
-
-/// #43 上游 opus-4-8 偶发把 Claude 内部工具调用协议明文（`<invoke name="...">` /
-/// `<function_calls>`）当普通文本吐进 assistantResponseEvent，而非走结构化 tool_use 通道，
-/// 导致 CC 屏幕"突然停止 + call 字样"、用户被迫「继续」。
-///
-/// 本函数仅做**可观测检测**（命中返回标记字面），不改任何透传行为、不改 stop_reason。
-/// 误报收敛由调用方组合 `!has_tool_use`（真退化时模型没走结构化通道）完成。
-///
-/// 最长标记 `<function_calls>` = 16 字节，流式滑动窗口保留 15 字符即可覆盖跨 chunk 截断。
-const TOOL_CALL_LEAK_MARKERS: [&str; 2] = ["<invoke name=\"", "<function_calls>"];
-
-/// 滑动窗口需保留的字符数：max(markers.len()) - 1，覆盖跨 chunk 截断的最坏情况。
-const TOOL_CALL_LEAK_TAIL_CHARS: usize = 15;
-
-/// 检测文本中是否含工具调用 XML 明文标记，命中返回该标记字面，否则 None。
-pub(crate) fn detect_text_tool_call_leak(text: &str) -> Option<&'static str> {
-    TOOL_CALL_LEAK_MARKERS
-        .iter()
-        .find(|m| text.contains(**m))
-        .copied()
-}
+use super::tool_call_leak::{
+    TOOL_CALL_LEAK_MARKERS, TOOL_CALL_LEAK_TAIL_CHARS, detect_text_tool_call_leak,
+};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///

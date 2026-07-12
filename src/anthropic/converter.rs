@@ -1029,6 +1029,8 @@ fn convert_assistant_message(
         _ => {}
     }
 
+    super::tool_call_leak::strip_leaked_tool_call_xml(&mut text_content);
+
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     // 纯 tool_use 轮 content 留空串：对齐 kiro2api（content 无 omitempty → "content":""）
@@ -1278,6 +1280,64 @@ mod tests {
         assert!(!system_history.contains("x-anthropic-billing-header"));
         assert!(!system_history.contains("cch=aaaa"));
         assert!(system_history.contains("stable system prompt"));
+    }
+
+    #[test]
+    fn test_convert_request_strips_leaked_xml_from_history() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 4096,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hello"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!(
+                        "分析完成\n<invoke name=\"Bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>"
+                    ),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &test_registry()).expect("request should convert");
+
+        let assistant_content = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|msg| match msg {
+                Message::Assistant(am) => Some(&am.assistant_response_message.content),
+                _ => None,
+            })
+            .expect("history should contain an assistant turn");
+
+        assert!(
+            !assistant_content.contains("<invoke"),
+            "leaked tool call XML should be stripped from history, got: {}",
+            assistant_content
+        );
+        assert!(
+            assistant_content.contains("分析完成"),
+            "legitimate text should be preserved, got: {}",
+            assistant_content
+        );
     }
 
     #[test]
