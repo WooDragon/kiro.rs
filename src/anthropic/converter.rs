@@ -1029,6 +1029,8 @@ fn convert_assistant_message(
         _ => {}
     }
 
+    super::tool_call_leak::strip_leaked_tool_call_xml(&mut text_content);
+
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     // 纯 tool_use 轮 content 留空串：对齐 kiro2api（content 无 omitempty → "content":""）

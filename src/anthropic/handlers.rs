@@ -836,7 +836,8 @@ async fn handle_non_stream_request(
 
     // #43 非流式路径同款检测：上游把工具调用 XML 当纯文本吐出且本轮无结构化 tool_use
     // → stop_reason 修正为 max_tokens（CC 自动续机制兜底），仅在 stop_reason 仍为默认值时介入。
-    if !has_tool_use && let Some(marker) = super::stream::detect_text_tool_call_leak(&text_content)
+    if !has_tool_use
+        && let Some(marker) = super::tool_call_leak::detect_text_tool_call_leak(&text_content)
     {
         if stop_reason == "end_turn" {
             stop_reason = "max_tokens".to_string();
