@@ -22,6 +22,23 @@ max_tokens = 64000
 # ============================================================================
 
 [[models]]
+id = "claude-opus-5"
+kiro_id = "claude-opus-5"
+family = "opus"
+display_name = "Claude Opus 5"
+match_family = "opus"
+match_version = ["opus-5"]
+context_window = 1_000_000
+max_tokens = 64000
+created = 1785110400
+tier = "pro"
+min_cacheable_tokens = 4096
+thinking_type = "adaptive"
+thinking_budget_tokens = 20000
+thinking_effort = "high"
+expose_thinking_variant = true
+
+[[models]]
 id = "claude-opus-4-8"
 kiro_id = "claude-opus-4.8"
 family = "opus"
@@ -156,3 +173,50 @@ tier = "free"
 thinking_type = "enabled"
 thinking_budget_tokens = 20000
 expose_thinking_variant = true
+
+# ============================================================================
+# GPT-5.6 Family (pro tier)
+# Blackbox-verified 2026-07-28: sol/terra return HTTP 200, text output.
+# Thinking silently ignored by upstream (no 400, no thinking blocks produced).
+# context_window = 272K (Kiro upstream spec; OpenAI native 1M not adopted).
+# credit multiplier: sol 2.4x / terra 1.2x / luna 0.6x
+# ============================================================================
+
+[[models]]
+id = "gpt-5-6-sol"
+kiro_id = "gpt-5.6-sol"
+family = "gpt-5-6"
+display_name = "GPT-5.6 Sol"
+match_family = "gpt"
+match_version = ["5.6-sol", "5-6-sol"]
+context_window = 272_000
+max_tokens = 64000
+created = 1780000000
+tier = "pro"
+expose_thinking_variant = false
+
+[[models]]
+id = "gpt-5-6-terra"
+kiro_id = "gpt-5.6-terra"
+family = "gpt-5-6"
+display_name = "GPT-5.6 Terra"
+match_family = "gpt"
+match_version = ["5.6-terra", "5-6-terra"]
+context_window = 272_000
+max_tokens = 64000
+created = 1780000000
+tier = "pro"
+expose_thinking_variant = false
+
+[[models]]
+id = "gpt-5-6-luna"
+kiro_id = "gpt-5.6-luna"
+family = "gpt-5-6"
+display_name = "GPT-5.6 Luna"
+match_family = "gpt"
+match_version = ["5.6-luna", "5-6-luna"]
+context_window = 272_000
+max_tokens = 64000
+created = 1780000000
+tier = "pro"
+expose_thinking_variant = false
