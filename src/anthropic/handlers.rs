@@ -1671,19 +1671,17 @@ mod tests {
         );
     }
 
-    // === effort 透传修正 · 改动 A 回归测试 ===
+    // === effort 透传 · 客户端优先回归测试 ===
     //
-    // C2 bug：override_thinking_from_model_name 现在无条件用配置 thinking_effort
-    // 覆盖 payload.output_config，丢弃客户端已显式传入的 effort 意图。
-    // 应改为「仅当 payload.output_config.is_none() 时才用配置值填充」。
+    // 回归防护：override_thinking_from_model_name 曾无条件用配置 thinking_effort
+    // 覆盖 payload.output_config，丢弃客户端已显式传入的 effort 意图。现为
+    // 「仅当 payload.output_config.is_none() 时才用配置值填充」。
 
     #[test]
     fn test_effort_client_output_config_wins_over_thinking_suffix_config() {
         // 客户端已显式传 output_config.effort=max，即便命中 "-thinking" 后缀
         // 覆写路径，最终 effort 也应保留客户端的 "max"，而不是被配置的
         // thinking_effort（"high"）覆盖。
-        //
-        // 当前实现（改动 A 落地前）会无条件覆盖成配置值 "high"，此用例现在应为红。
         let mut payload = request_for_model("claude-sonnet-5-thinking");
         payload.output_config = Some(OutputConfig {
             effort: "max".to_string(),
@@ -1717,6 +1715,29 @@ mod tests {
             payload.output_config.as_ref().map(|c| c.effort.as_str()),
             Some("high"),
             "客户端未传 output_config 时应回退到配置的 thinking_effort"
+        );
+    }
+
+    #[test]
+    fn test_effort_client_priority_survives_full_convert_path() {
+        // 端到端钉：override_thinking_from_model_name → convert_request →
+        // build_additional_model_request_fields 全路径上客户端 effort 都不被吞。
+        // 单测 override 函数只覆盖了第一段，这里补上真正发往上游的那个字段。
+        let registry = crate::model::registry::ModelRegistry::default();
+        let mut payload = request_for_model("claude-sonnet-5-thinking");
+        payload.output_config = Some(OutputConfig {
+            effort: "max".to_string(),
+        });
+
+        override_thinking_from_model_name(&mut payload, &registry);
+        let result = convert_request(&payload, &registry).expect("convert_request 应成功");
+
+        let structured = result
+            .additional_model_request_fields
+            .expect("adaptive 模型应产出结构化字段");
+        assert_eq!(
+            structured["output_config"]["effort"], "max",
+            "客户端 effort=max 应一路透传到 additionalModelRequestFields"
         );
     }
 

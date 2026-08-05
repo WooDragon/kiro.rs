@@ -803,7 +803,7 @@ fn build_additional_model_request_fields(
 /// 构建历史消息
 ///
 /// # Arguments
-/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
+/// * `req` - 原始请求，用于读取 `system` 字段
 /// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
@@ -4118,6 +4118,26 @@ mod tests {
                 build_additional_model_request_fields(&req, &registry).is_none(),
                 "model {model} 传 output_config.effort 时仍不应产出结构化字段"
             );
+
+            // 分支 4/5：客户端传 adaptive 或 disabled，同样不得产出——
+            // adaptive 是最危险的一支（模型配置不是 adaptive，但客户端可能主动发），
+            // 若判据误读请求 type 就会给这些模型发出 400 payload。
+            for req_type in ["adaptive", "disabled"] {
+                let req = thinking_req(
+                    model,
+                    Some(super::super::types::Thinking {
+                        thinking_type: req_type.to_string(),
+                        budget_tokens: 20000,
+                    }),
+                    Some(super::super::types::OutputConfig {
+                        effort: "max".to_string(),
+                    }),
+                );
+                assert!(
+                    build_additional_model_request_fields(&req, &registry).is_none(),
+                    "model {model} 传 thinking.type={req_type} 时仍不应产出结构化字段"
+                );
+            }
         }
     }
 
@@ -4142,9 +4162,11 @@ mod tests {
                 structured["thinking"]["type"], "adaptive",
                 "model {model} thinking.type 应为 adaptive"
             );
-            assert!(
-                structured["output_config"]["effort"].is_string(),
-                "model {model} 应含 output_config.effort"
+            // 钉死确值而非仅 is_string()：这些模型在 models.toml 里都配了
+            // thinking_effort = "high"，配置写空串或错值时必须失败而非放过。
+            assert_eq!(
+                structured["output_config"]["effort"], "high",
+                "model {model} 应取配置的 thinking_effort=high"
             );
         }
     }
