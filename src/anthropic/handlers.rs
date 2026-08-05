@@ -991,8 +991,13 @@ fn override_thinking_from_model_name(
             budget_tokens: thinking.budget_tokens,
         });
 
-        if let Some(effort_str) = thinking.effort {
-            payload.output_config = Some(OutputConfig { effort: effort_str });
+        // 客户端显式 output_config 优先于配置默认值，与 converter 的 effort 取值链
+        // （客户端 ?? 配置 thinking_effort ?? "high"）语义一致。Claude Code 的 /effort、
+        // --effort、CLAUDE_CODE_EFFORT_LEVEL 都落在这个字段上，覆盖它等于丢弃用户意图。
+        if payload.output_config.is_none() {
+            if let Some(effort_str) = thinking.effort {
+                payload.output_config = Some(OutputConfig { effort: effort_str });
+            }
         }
     }
 }
@@ -1663,6 +1668,55 @@ mod tests {
         assert_eq!(
             payload.output_config.as_ref().map(|c| c.effort.as_str()),
             Some("high")
+        );
+    }
+
+    // === effort 透传修正 · 改动 A 回归测试 ===
+    //
+    // C2 bug：override_thinking_from_model_name 现在无条件用配置 thinking_effort
+    // 覆盖 payload.output_config，丢弃客户端已显式传入的 effort 意图。
+    // 应改为「仅当 payload.output_config.is_none() 时才用配置值填充」。
+
+    #[test]
+    fn test_effort_client_output_config_wins_over_thinking_suffix_config() {
+        // 客户端已显式传 output_config.effort=max，即便命中 "-thinking" 后缀
+        // 覆写路径，最终 effort 也应保留客户端的 "max"，而不是被配置的
+        // thinking_effort（"high"）覆盖。
+        //
+        // 当前实现（改动 A 落地前）会无条件覆盖成配置值 "high"，此用例现在应为红。
+        let mut payload = request_for_model("claude-sonnet-5-thinking");
+        payload.output_config = Some(OutputConfig {
+            effort: "max".to_string(),
+        });
+
+        override_thinking_from_model_name(
+            &mut payload,
+            &crate::model::registry::ModelRegistry::default(),
+        );
+
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("max"),
+            "客户端显式 effort 应优先于配置 thinking_effort"
+        );
+    }
+
+    #[test]
+    fn test_effort_thinking_suffix_falls_back_to_config_when_client_absent() {
+        // 守住不回归：客户端没有传 output_config 时，仍应用配置的
+        // thinking_effort 填充（这是改动 A 修复后必须保留的老行为）。
+        let mut payload = request_for_model("claude-sonnet-5-thinking");
+        assert!(payload.output_config.is_none());
+
+        override_thinking_from_model_name(
+            &mut payload,
+            &crate::model::registry::ModelRegistry::default(),
+        );
+
+        assert_eq!(
+            payload.output_config.as_ref().map(|c| c.effort.as_str()),
+            Some("high"),
+            "客户端未传 output_config 时应回退到配置的 thinking_effort"
         );
     }
 
