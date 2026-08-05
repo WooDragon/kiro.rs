@@ -15,9 +15,7 @@ use super::prompt_cache::{
     PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
     decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
-use super::tool_call_leak::{
-    TOOL_CALL_LEAK_MARKERS, TOOL_CALL_LEAK_TAIL_CHARS, detect_text_tool_call_leak,
-};
+use super::tool_call_leak::{TOOL_CALL_LEAK_TAIL_CHARS, detect_text_tool_call_leak};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///

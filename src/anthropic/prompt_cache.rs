@@ -50,6 +50,8 @@ struct PromptCacheBreakpoint {
 pub struct PromptCacheProfile {
     breakpoints: Vec<PromptCacheBreakpoint>,
     total_input_tokens: i32,
+    /// 仅用于排障时的 Debug 输出，无读取方；保留字段以免丢失诊断信息。
+    #[allow(dead_code)]
     model: String,
 }
 
