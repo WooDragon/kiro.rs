@@ -994,10 +994,8 @@ fn override_thinking_from_model_name(
         // 客户端显式 output_config 优先于配置默认值，与 converter 的 effort 取值链
         // （客户端 ?? 配置 thinking_effort ?? "high"）语义一致。Claude Code 的 /effort、
         // --effort、CLAUDE_CODE_EFFORT_LEVEL 都落在这个字段上，覆盖它等于丢弃用户意图。
-        if payload.output_config.is_none() {
-            if let Some(effort_str) = thinking.effort {
-                payload.output_config = Some(OutputConfig { effort: effort_str });
-            }
+        if let (None, Some(effort_str)) = (&payload.output_config, thinking.effort) {
+            payload.output_config = Some(OutputConfig { effort: effort_str });
         }
     }
 }
