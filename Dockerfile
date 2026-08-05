@@ -16,6 +16,9 @@ RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
+# models.toml 被 registry.rs 以 include_str! 在编译期读入作为内嵌 fallback，
+# 缺它直接编译失败，故必须进构建上下文（不是仅运行期配置）。
+COPY models.toml ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
