@@ -82,10 +82,10 @@ fn find_tail_leak_start(text: &str) -> Option<usize> {
                 return None;
             }
             let before = text[..pos].trim_end();
-            if let Some(fc_pos) = before.rfind("<function_calls>") {
-                if !text[fc_pos..pos].contains("</function_calls>") {
-                    return Some(fc_pos);
-                }
+            if let Some(fc_pos) = before.rfind("<function_calls>")
+                && !text[fc_pos..pos].contains("</function_calls>")
+            {
+                return Some(fc_pos);
             }
             Some(pos)
         }

@@ -6,6 +6,9 @@ pub struct ModelDefaults {
     pub context_window: i32,
     #[serde(default = "default_min_cacheable_tokens")]
     pub min_cacheable_tokens: i32,
+    /// models.toml `[defaults]` 段的兜底值，经 `default_max_tokens` 反序列化；
+    /// 当前各模型条目都显式配了 max_tokens，故此默认值无读取方。
+    #[allow(dead_code)]
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
 }
@@ -24,6 +27,9 @@ impl Default for ModelDefaults {
 pub struct ModelEntry {
     pub id: String,
     pub kiro_id: String,
+    /// models.toml 里的模型族标注（如 "opus"/"sonnet"），当前仅作配置可读性说明；
+    /// 实际族匹配走 `match_family` 子串判断，故此字段无读取方。
+    #[allow(dead_code)]
     pub family: String,
     pub display_name: String,
     pub match_family: String,
@@ -72,6 +78,9 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// 从指定路径加载 models.toml。当前入口走 `from_toml` + 内嵌 fallback，
+    /// 此函数作为公开 API 保留（外部 `--models` 路径加载的备用入口）。
+    #[allow(dead_code)]
     pub fn load(path: &str) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read models config from {}: {}", path, e))?;
