@@ -78,15 +78,6 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
-    /// 从指定路径加载 models.toml。当前入口走 `from_toml` + 内嵌 fallback，
-    /// 此函数作为公开 API 保留（外部 `--models` 路径加载的备用入口）。
-    #[allow(dead_code)]
-    pub fn load(path: &str) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read models config from {}: {}", path, e))?;
-        Self::from_toml(&content)
-    }
-
     pub fn from_toml(toml_str: &str) -> Result<Self, String> {
         let config: ModelsConfig = toml::from_str(toml_str)
             .map_err(|e| format!("Failed to parse models config: {}", e))?;
