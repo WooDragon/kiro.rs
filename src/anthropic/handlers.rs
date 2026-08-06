@@ -515,6 +515,21 @@ fn create_ping_interval() -> tokio::time::Interval {
     )
 }
 
+/// 把 `StreamFailure` 映射为 `failure_mode` 日志字段取值（#83）。
+///
+/// 沿用 #71 结构化日志口径：snake_case 字符串常量，供 jq 按成因聚合、
+/// 长期验证 200s 首字截止线闸门是否稳定。`FirstTokenTimeout` 与
+/// `ConnectionInterrupted` 分开打标，`EmptyResponse`/`Fatal` 不经此路径
+/// （前者走 None 分支单独记日志，后者归 non_transient）。
+fn failure_mode_label(failure: &super::stream::StreamFailure) -> &'static str {
+    match failure {
+        super::stream::StreamFailure::FirstTokenTimeout { .. } => "first_token_timeout",
+        super::stream::StreamFailure::ConnectionInterrupted => "connection_interrupted",
+        super::stream::StreamFailure::EmptyResponse => "empty_response",
+        super::stream::StreamFailure::Fatal => "non_transient",
+    }
+}
+
 /// 创建 SSE 事件流
 ///
 /// `span` 是 handler 执行期间捕获的 req span。stream::unfold 闭包返回的每个
@@ -532,6 +547,11 @@ fn create_sse_stream(
             .into_iter()
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     );
+
+    // #83：入口即上游响应头已收到的时刻，用于给 classify_stream_failure 提供
+    // 「本轮已运行多久」的 elapsed。Instant 是 Copy，move 闭包按值捕获即可，
+    // 不必塞进 unfold 状态元组。
+    let stream_start = Instant::now();
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
@@ -587,26 +607,42 @@ fn create_sse_stream(
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                             }
                             Some(Err(e)) => {
-                                tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不补 message_delta/message_stop），避免把失败伪装成正常完成。
+                                // #83：把 transient/is_empty_response/elapsed 三个既有信号交给
+                                // classify_stream_failure 分类，区分「上游首字截止线超时」与
+                                // 「普通连接中断」——error_type/req_outcome 语义不变，只改归因与文案。
                                 let transient = crate::http_client::is_transient(&e);
+                                let elapsed = stream_start.elapsed();
+                                let failure = super::stream::classify_stream_failure(
+                                    transient,
+                                    ctx.is_empty_response(),
+                                    elapsed,
+                                );
+                                tracing::error!(
+                                    error = %crate::http_client::describe_reqwest_error(&e),
+                                    failure_mode = failure_mode_label(&failure),
+                                    elapsed_secs = elapsed.as_secs(),
+                                    "读取响应流失败"
+                                );
                                 tracing::info!(
                                     req_outcome = if transient { "overloaded_error" } else { "api_error" },
                                     "request outcome"
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(transient).to_sse_string(),
+                                    super::stream::error_sse_event(failure).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                             }
                             None => {
                                 // 流结束。#64：本轮零产出（上游 200 空响应）时发 error 帧诱导重试，
                                 // 否则正常收尾（有内容分支逐字保留原调用）。
+                                // #83：干净结束零产出压根没有断连，改用 EmptyResponse 变体，
+                                // 与非流式路径（handlers.rs 空响应分支）措辞对齐。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
                                     tracing::info!(req_outcome = "overloaded_error", "request outcome");
-                                    vec![super::stream::error_sse_event(true)]
+                                    vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
                                     tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.generate_final_events()
@@ -1310,6 +1346,8 @@ fn create_prefix_buffered_sse_stream(
     span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
+    // #83：同 create_sse_stream，入口即上游响应头已收到的时刻。
+    let stream_start = Instant::now();
 
     stream::unfold(
         (
@@ -1371,16 +1409,28 @@ fn create_prefix_buffered_sse_stream(
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, prefix_timeout)))
                             }
                             Some(Err(e)) => {
-                                tracing::error!(error = %crate::http_client::describe_reqwest_error(&e), "读取响应流失败");
                                 // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                                 // 绝不走正常收尾（不调 ctx.finish()），避免把失败伪装成正常完成。
+                                // #83：同 create_sse_stream，用 classify_stream_failure 区分成因。
                                 let transient = crate::http_client::is_transient(&e);
+                                let elapsed = stream_start.elapsed();
+                                let failure = super::stream::classify_stream_failure(
+                                    transient,
+                                    ctx.is_empty_response(),
+                                    elapsed,
+                                );
+                                tracing::error!(
+                                    error = %crate::http_client::describe_reqwest_error(&e),
+                                    failure_mode = failure_mode_label(&failure),
+                                    elapsed_secs = elapsed.as_secs(),
+                                    "读取响应流失败"
+                                );
                                 tracing::info!(
                                     req_outcome = if transient { "overloaded_error" } else { "api_error" },
                                     "request outcome"
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                    super::stream::error_sse_event(transient).to_sse_string(),
+                                    super::stream::error_sse_event(failure).to_sse_string(),
                                 ))];
                                 Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, prefix_timeout)))
                             }
@@ -1394,10 +1444,11 @@ fn create_prefix_buffered_sse_stream(
                                 // stop_reason）。真空响应（无内容无 stop_reason）才走 error 帧：此时
                                 // 缓冲区未 released，除占位 message_start 外无内容，直接发 error 帧不会
                                 // 遗漏已产出内容（未 flush 的 message_start 随 ctx drop 丢弃，无残留）。
+                                // #83：干净结束零产出改用 EmptyResponse 变体，与非流式路径对齐措辞。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
                                     tracing::info!(req_outcome = "overloaded_error", "request outcome");
-                                    vec![super::stream::error_sse_event(true)]
+                                    vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
                                     tracing::info!(req_outcome = "success", "request outcome");
                                     ctx.finish()
@@ -1508,6 +1559,8 @@ fn create_buffered_sse_stream(
     span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
+    // #83：同 create_sse_stream，入口即上游响应头已收到的时刻。
+    let stream_start = Instant::now();
 
     stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false),
@@ -1541,17 +1594,26 @@ fn create_buffered_sse_stream(
                             // 继续读取下一个 chunk，不发送任何数据
                         }
                         Some(Err(e)) => {
-                            tracing::error!(
-                                error = %crate::http_client::describe_reqwest_error(&e),
-                                "读取响应流失败"
-                            );
                             // #64：上游中途断连——发 error 帧让客户端感知失败并重试，
                             // 绝不走正常收尾（不调 finish_and_get_all_events），避免把失败伪装成正常完成。
                             // 缓冲模式本就未 flush 过任何事件（Some(Ok) 只往 buffer 追加不 emit），
                             // 故断连时只发干净 error 帧、丢弃未 flush 的缓冲——是「要么全成功要么全失败」
                             // 的自洽语义；若改成「先 flush 收尾（含 message_stop）再追加 error」，会发出
                             // message_stop 后又 error 的自相矛盾序列（先告知成功再告知失败），反而更糟。
+                            // #83：同 create_sse_stream，用 classify_stream_failure 区分成因。
                             let transient = crate::http_client::is_transient(&e);
+                            let elapsed = stream_start.elapsed();
+                            let failure = super::stream::classify_stream_failure(
+                                transient,
+                                ctx.is_empty_response(),
+                                elapsed,
+                            );
+                            tracing::error!(
+                                error = %crate::http_client::describe_reqwest_error(&e),
+                                failure_mode = failure_mode_label(&failure),
+                                elapsed_secs = elapsed.as_secs(),
+                                "读取响应流失败"
+                            );
                             tracing::info!(
                                 req_outcome = if transient {
                                     "overloaded_error"
@@ -1561,19 +1623,22 @@ fn create_buffered_sse_stream(
                                 "request outcome"
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
-                                super::stream::error_sse_event(transient).to_sse_string(),
+                                super::stream::error_sse_event(failure).to_sse_string(),
                             ))];
                             return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                         }
                         None => {
                             // 流结束。#64：本轮零产出（上游 200 空响应）时发 error 帧诱导重试，
                             // 否则正常收尾（有内容分支逐字保留 finish_and_get_all_events）。
+                            // #83：干净结束零产出改用 EmptyResponse 变体，与非流式路径对齐措辞。
                             let all_events = if ctx.is_empty_response() {
                                 tracing::error!(
                                     "上游响应为空（无内容），返回 error 事件以触发客户端重试"
                                 );
                                 tracing::info!(req_outcome = "overloaded_error", "request outcome");
-                                vec![super::stream::error_sse_event(true)]
+                                vec![super::stream::error_sse_event(
+                                    super::stream::StreamFailure::EmptyResponse,
+                                )]
                             } else {
                                 tracing::info!(req_outcome = "success", "request outcome");
                                 ctx.finish_and_get_all_events()
@@ -2529,6 +2594,38 @@ mod tests {
         addr
     }
 
+    /// 启动一个「只发响应头、零 body 字节、随即 TCP RST」的 mock 上游（#83）。
+    ///
+    /// 与 `spawn_mid_body_reset_upstream` 的区别：后者无论 `force_rst` 取值都会先写
+    /// 一个不完整 chunk（chunk-size 声明 100 字节、实际写 10 字节 `"partial..."`），
+    /// 不是零 body 字节场景。这里只发响应头就立即 `SO_LINGER(0)` 后 drop，拿到「零内容 +
+    /// 真实 TCP RST」这个更纯净的前提，对应 classify_stream_failure 的 empty==true 输入。
+    async fn spawn_header_only_rst_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server bind 失败");
+        let addr = listener.local_addr().expect("获取 mock server 地址失败");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept 失败");
+            let mut req_buf = vec![0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+
+            let headers =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(headers).await.expect("写响应头失败");
+
+            // 零 body 字节，直接 RST：SO_LINGER(0) 后 drop 近似 TCP RST。
+            let _ = stream.set_linger(Some(std::time::Duration::ZERO));
+            drop(stream);
+        });
+
+        addr
+    }
+
     /// 构造一个 fresh StreamContext + 对应 initial_events，供 S1/S1b/S2 复用。
     fn fresh_ctx_with_initial_events() -> (StreamContext, Vec<SseEvent>) {
         let mut ctx = StreamContext::new_with_thinking(
@@ -2821,6 +2918,50 @@ mod tests {
         assert!(
             !text.contains("message_delta"),
             "C2b：零产出不应补 message_delta，实际：{text}"
+        );
+    }
+
+    /// S1c（#83）— 零内容 + 真实 TCP RST 走进 empty 链路，error.type 仍是
+    /// overloaded_error。
+    ///
+    /// 诚实标注该用例的能力边界：E2E 不可能真等 200s 让 elapsed 越过
+    /// FIRST_TOKEN_DEADLINE_HINT_SECS 闸门，故本用例只验证「零内容 + 真实
+    /// TCP RST 落进 is_empty_response()==true 分支、classify_stream_failure
+    /// 判定为瞬态可重试」这条链路本身是通的；`elapsed >= 200s` 那一半判定
+    /// 已由 stream.rs 的 test_classify_stream_failure_matrix 单元矩阵覆盖。
+    /// 本用例不引入 sleep、不调小生产常量、不注入测试专用阈值来迁就
+    /// FirstTokenTimeout 分支——那会把这条护栏本身变成假背书。
+    #[tokio::test]
+    async fn test_s1c_stream_header_only_rst_no_content_emits_error_overloaded() {
+        let addr = spawn_header_only_rst_upstream().await;
+        let client = crate::http_client::build_idle_client(
+            None,
+            30,
+            crate::model::config::TlsBackend::Rustls,
+        )
+        .expect("构建测试 client 失败");
+        let response = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("send 失败（预期在读 body 阶段失败）");
+
+        let (ctx, initial_events) = fresh_ctx_with_initial_events();
+        let span = tracing::Span::none();
+        let stream = create_sse_stream(response, ctx, initial_events, span);
+        let text = collect_sse_text(stream).await;
+
+        assert!(
+            text.contains("event: error"),
+            "S1c：零内容 + 真实 TCP RST 必须发 error 帧，实际 SSE 文本：{text}"
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "S1c：零内容 + TCP RST 是瞬态失败，error.type 应为 overloaded_error，实际：{text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "S1c：零内容断连不应补 message_stop 伪装成正常完成，实际：{text}"
         );
     }
 
