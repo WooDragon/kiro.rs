@@ -519,8 +519,10 @@ fn create_ping_interval() -> tokio::time::Interval {
 ///
 /// 沿用 #71 结构化日志口径：snake_case 字符串常量，供 jq 按成因聚合、
 /// 长期验证 200s 首字截止线闸门是否稳定。`FirstTokenTimeout` 与
-/// `ConnectionInterrupted` 分开打标，`EmptyResponse`/`Fatal` 不经此路径
-/// （前者走 None 分支单独记日志，后者归 non_transient）。
+/// `ConnectionInterrupted` 分开打标；match 穷举完整覆盖四个 variant，但
+/// Err 路径当前实际只会打 `first_token_timeout` / `connection_interrupted` /
+/// `non_transient` 三种——`empty_response` 分支是为穷举完整性与将来对称
+/// 调用预留（`None` 分支目前单独记日志，不经此函数）。
 fn failure_mode_label(failure: &super::stream::StreamFailure) -> &'static str {
     match failure {
         super::stream::StreamFailure::FirstTokenTimeout { .. } => "first_token_timeout",
@@ -2771,8 +2773,8 @@ mod tests {
     /// 复用 http_client.rs 的 spawn_empty_body_200_upstream：连接正常结束
     /// （非 Err），body_stream.next() 最终产出 None。create_sse_stream 的
     /// None 分支里 ctx.is_empty_response()==true（从未收到任何内容），
-    /// 应发 error_sse_event(true) 而非 ctx.generate_final_events()
-    /// 的正常收尾（不应出现 end_turn stop_reason）。
+    /// 应发 error_sse_event(StreamFailure::EmptyResponse) 而非
+    /// ctx.generate_final_events() 的正常收尾（不应出现 end_turn stop_reason）。
     #[tokio::test]
     async fn test_s2_stream_empty_response_emits_error_not_end_turn() {
         let addr = spawn_empty_body_200_upstream().await;
@@ -2808,6 +2810,18 @@ mod tests {
         assert!(
             !text.contains("message_stop"),
             "S2：零产出不能补 message_stop 伪装成正常完成，实际 SSE 文本：{text}"
+        );
+        // 钉死 EmptyResponse 文案（PR #84 评审 Minor 2）：本 PR 把客户端可见
+        // 文案从旧 "Upstream connection interrupted. Please retry." 改为新
+        // "Upstream returned an empty response. Please retry."，没有本断言
+        // 的话被人改回旧文案照样绿，这是本 PR 最值钱的一条防回归。
+        assert!(
+            text.contains("Upstream returned an empty response"),
+            "S2：空响应文案必须是 EmptyResponse 专属措辞，实际 SSE 文本：{text}"
+        );
+        assert!(
+            !text.contains("connection interrupted"),
+            "S2：干净结束零内容压根没断连，绝不能报连接中断，实际 SSE 文本：{text}"
         );
     }
 

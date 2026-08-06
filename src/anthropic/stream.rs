@@ -2938,8 +2938,25 @@ mod tests {
                 240,
                 StreamFailure::FirstTokenTimeout { elapsed_secs: 240 },
             ),
-            // 闸门下界：199s 未达 200s 阈值，不归因为首字超时（早期抖动）。
-            (true, true, 199, StreamFailure::ConnectionInterrupted),
+            // 闸门边界成对钉死（PR #84 评审 Minor 1）：`>=` 语义要求恰好达阈值
+            // 归因为首字超时、差一秒则不归因，防止日后有人把 `>=` 误改成 `>`
+            // 导致 200s 静默从 FirstTokenTimeout 掉回 ConnectionInterrupted
+            // 而矩阵毫无察觉。阈值取自常量而非字面量 200/199，阈值调整时
+            // 测试跟着走、不会悄悄失效。
+            (
+                true,
+                true,
+                FIRST_TOKEN_DEADLINE_HINT_SECS,
+                StreamFailure::FirstTokenTimeout {
+                    elapsed_secs: FIRST_TOKEN_DEADLINE_HINT_SECS,
+                },
+            ),
+            (
+                true,
+                true,
+                FIRST_TOKEN_DEADLINE_HINT_SECS - 1,
+                StreamFailure::ConnectionInterrupted,
+            ),
             // 回应 plan-review Round 1 [Major]：2 秒抖动绝不能被绝对化归因为
             // ~240s 首字超时，否则会把早期网络问题误报成确定性上限。
             (true, true, 2, StreamFailure::ConnectionInterrupted),
