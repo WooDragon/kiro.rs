@@ -249,15 +249,78 @@ impl SseEvent {
     }
 }
 
-/// 构造 Anthropic SSE `error` 事件帧（#64）。
+/// 流式失败成因（#83）。
+///
+/// 用枚举替掉原先的 `transient: bool`——`bool` 只能表达「可重试/不可重试」两态，
+/// 承载不了「零内容+瞬态错误」这类还需要区分「是否已跑够久到能归因为上游首字
+/// 截止线」的第三态。继续在 bool 上叠参数是往烂设计上叠补丁，枚举让四种成因
+/// 各自独立成变体，`error_sse_event` 的映射逻辑随之变成穷举匹配而非条件分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFailure {
+    /// 零内容 + 瞬态传输错误 + 已运行够久（`elapsed >= FIRST_TOKEN_DEADLINE_HINT_SECS`）。
+    /// 归因为上游首字截止线超时，`elapsed_secs` 是运行时实测值（非硬编码 240）。
+    FirstTokenTimeout { elapsed_secs: u64 },
+    /// 已有内容中断，或零内容但发生在早期（未达闸门）——不做首字超时归因，
+    /// 沿用原「连接中断」文案，逐字保留现状。
+    ConnectionInterrupted,
+    /// 上游 200 干净结束但零产出（无 Err，`body_stream.next()` 直接返回 `None`）。
+    /// 与 `ConnectionInterrupted` 区分开是因为这里压根没有断连，用「连接中断」
+    /// 文案会误导排查方向；与非流式路径（`handlers.rs` 空响应分支）对齐措辞。
+    EmptyResponse,
+    /// 非瞬态失败，不可重试。
+    Fatal,
+}
+
+/// 首字超时归因的最小 elapsed 闸门（秒）。
+///
+/// 只影响对外 message 措辞与日志分类，**绝不影响** `error_type` / `req_outcome` /
+/// 请求生命周期——三者均由 `transient` 一票决定，闸门只在 `transient==true` 内部
+/// 再切分「归因为首字超时」还是「归因为连接中断」。
+///
+/// 阈值取 200s：#83 生产样本 29 例 min=240s、无一例低于此值，240s 是观测到的死线
+/// 地板；`elapsed` 从 `create_sse_stream` 入口（即上游响应头已收到）起算，比请求
+/// 总时长略短，200 的余量足以吸收这段差值，同时把 2 秒级早期网络抖动排除在
+/// 「首字超时」归因之外（避免把抖动误报成 ~240s 的确定性上限）。
+pub const FIRST_TOKEN_DEADLINE_HINT_SECS: u64 = 200;
+
+/// 把「瞬态与否 + 本轮是否零产出 + 已运行时长」三个既有信号分类为流失败成因（#83）。
+///
+/// 纯函数：无副作用、无 I/O，三条流式路径共用同一份判定逻辑，可表驱动单测覆盖
+/// 全部输入组合，避免三处调用点各自实现一份判定逻辑漂移出不一致的行为。
+///
+/// - `transient`：来自 `http_client::is_transient`，决定可重试与否，一票通盘。
+/// - `empty`：来自 `ctx.is_empty_response()`，本轮是否零产出。
+/// - `elapsed`：从流构造入口（上游响应头已收到）到本次失败判定的耗时。
+pub fn classify_stream_failure(
+    transient: bool,
+    empty: bool,
+    elapsed: std::time::Duration,
+) -> StreamFailure {
+    if !transient {
+        return StreamFailure::Fatal;
+    }
+    let elapsed_secs = elapsed.as_secs();
+    if empty && elapsed_secs >= FIRST_TOKEN_DEADLINE_HINT_SECS {
+        StreamFailure::FirstTokenTimeout { elapsed_secs }
+    } else {
+        StreamFailure::ConnectionInterrupted
+    }
+}
+
+/// 构造 Anthropic SSE `error` 事件帧（#64，#83 扩展为四态成因）。
 ///
 /// **全仓唯一 error 帧构造点**——三条流式路径的异常分支与「本轮零产出」分支统一经此
 /// 构造，禁止在各路径就地拼 error JSON。
 ///
-/// - `transient==true` → `overloaded_error`，文案诱导 Claude Code 退避重试
-///   （对齐 `map_provider_error` 瞬态语义）；用于上游 HTTP/2 中断 / body 断连 /
-///   200 空响应等可重试失败。
-/// - `transient==false` → `api_error`，不可重试文案；用于非瞬态失败。
+/// 四个成因变体到 `(error_type, message)` 的映射：
+/// - `FirstTokenTimeout{elapsed_secs}` → `overloaded_error` + 携实测 `elapsed_secs`
+///   的专属文案，把「上游首字截止线超时」讲清楚，不再被误报成「连接中断」而
+///   误导排查方向（#83 的核心诉求）。
+/// - `ConnectionInterrupted` → `overloaded_error` + 原文案逐字保留（#64 现状）。
+/// - `EmptyResponse` → `overloaded_error` + 与非流式路径（`handlers.rs` 空响应
+///   分支）对齐的文案——上游 200 干净结束但零产出压根没有断连，不该用「连接
+///   中断」表述。
+/// - `Fatal` → `api_error`，不可重试文案，原文案逐字保留（#64 现状）。
 ///
 /// 语义要点：异常分支发此帧后即置 `finished=true`，绝不再走正常收尾
 /// （`message_delta`/`message_stop`），使失败对客户端可感知、不被伪装成正常完成。
@@ -266,14 +329,25 @@ impl SseEvent {
 /// 补 `content_block_stop`/`message_stop`。这依赖 **Anthropic SSE 契约：`error` 事件作为流终止
 /// 信号，客户端（Claude Code）识别后即中止本轮**，故半开的 content_block 不会导致客户端挂起——
 /// 属可接受状态，无需强行补齐收尾帧。
-pub fn error_sse_event(transient: bool) -> SseEvent {
-    let (error_type, message) = if transient {
-        (
+pub fn error_sse_event(failure: StreamFailure) -> SseEvent {
+    let (error_type, message) = match failure {
+        StreamFailure::FirstTokenTimeout { elapsed_secs } => (
             "overloaded_error",
-            "Upstream connection interrupted. Please retry.",
-        )
-    } else {
-        ("api_error", "Upstream response failed.")
+            format!(
+                "Upstream produced no content in {elapsed_secs}s before resetting the stream \
+                 (upstream first-token deadline). Retrying an identical long-reasoning request \
+                 may hit the same limit; consider lowering reasoning effort for this request."
+            ),
+        ),
+        StreamFailure::ConnectionInterrupted => (
+            "overloaded_error",
+            "Upstream connection interrupted. Please retry.".to_string(),
+        ),
+        StreamFailure::EmptyResponse => (
+            "overloaded_error",
+            "Upstream returned an empty response. Please retry.".to_string(),
+        ),
+        StreamFailure::Fatal => ("api_error", "Upstream response failed.".to_string()),
     };
     SseEvent::new(
         "error",
@@ -2817,8 +2891,8 @@ mod tests {
     }
 
     #[test]
-    fn test_error_sse_event_transient_true_is_overloaded_error() {
-        let event = error_sse_event(true);
+    fn test_error_sse_event_connection_interrupted_is_overloaded_error() {
+        let event = error_sse_event(StreamFailure::ConnectionInterrupted);
         assert_eq!(event.event, "error");
         assert_eq!(event.data["type"], "error");
         assert_eq!(event.data["error"]["type"], "overloaded_error");
@@ -2829,19 +2903,142 @@ mod tests {
     }
 
     #[test]
-    fn test_error_sse_event_transient_false_is_api_error() {
-        let event = error_sse_event(false);
+    fn test_error_sse_event_fatal_is_api_error() {
+        let event = error_sse_event(StreamFailure::Fatal);
         assert_eq!(event.event, "error");
         assert_eq!(event.data["type"], "error");
         assert_eq!(event.data["error"]["type"], "api_error");
         assert_eq!(event.data["error"]["message"], "Upstream response failed.");
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // #83 — StreamFailure 四变体 + classify_stream_failure 判定矩阵
+    //
+    // 分两层：classify_stream_failure 是纯函数，可表驱动穷举所有输入组合；
+    // error_sse_event 的四变体映射另起用例分别核对 (error_type, message)。
+    // 两层合起来才完整覆盖「输入信号 → 成因分类 → 对外文案」这条链路。
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_classify_stream_failure_matrix() {
+        use std::time::Duration;
+
+        // (transient, empty, elapsed_secs, 期望成因)
+        let cases: Vec<(bool, bool, u64, StreamFailure)> = vec![
+            // 瞬态 + 零产出 + 已运行够久 → 首字超时归因，携带实测 elapsed。
+            (
+                true,
+                true,
+                300,
+                StreamFailure::FirstTokenTimeout { elapsed_secs: 300 },
+            ),
+            (
+                true,
+                true,
+                240,
+                StreamFailure::FirstTokenTimeout { elapsed_secs: 240 },
+            ),
+            // 闸门边界成对钉死（PR #84 评审 Minor 1）：`>=` 语义要求恰好达阈值
+            // 归因为首字超时、差一秒则不归因，防止日后有人把 `>=` 误改成 `>`
+            // 导致 200s 静默从 FirstTokenTimeout 掉回 ConnectionInterrupted
+            // 而矩阵毫无察觉。阈值取自常量而非字面量 200/199，阈值调整时
+            // 测试跟着走、不会悄悄失效。
+            (
+                true,
+                true,
+                FIRST_TOKEN_DEADLINE_HINT_SECS,
+                StreamFailure::FirstTokenTimeout {
+                    elapsed_secs: FIRST_TOKEN_DEADLINE_HINT_SECS,
+                },
+            ),
+            (
+                true,
+                true,
+                FIRST_TOKEN_DEADLINE_HINT_SECS - 1,
+                StreamFailure::ConnectionInterrupted,
+            ),
+            // 回应 plan-review Round 1 [Major]：2 秒抖动绝不能被绝对化归因为
+            // ~240s 首字超时，否则会把早期网络问题误报成确定性上限。
+            (true, true, 2, StreamFailure::ConnectionInterrupted),
+            // 有内容不算首字超时，即便运行时长已过闸门。
+            (true, false, 300, StreamFailure::ConnectionInterrupted),
+            // 非瞬态一票归 Fatal，empty/elapsed 取值不再参与判定。
+            (false, true, 300, StreamFailure::Fatal),
+        ];
+
+        for (transient, empty, elapsed_secs, expected) in cases {
+            let actual =
+                classify_stream_failure(transient, empty, Duration::from_secs(elapsed_secs));
+            assert_eq!(
+                actual, expected,
+                "classify_stream_failure(transient={transient}, empty={empty}, elapsed={elapsed_secs}s) \
+                 期望 {expected:?}，实际 {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_sse_event_first_token_timeout_message_contains_measured_elapsed() {
+        // 钉死「报实测不报硬编码 240s」：message 必须逐字含运行时实测秒数，
+        // 300 与 240 都要能在文案里各自精确出现，防止实现里悄悄写死 240。
+        let event_300 = error_sse_event(StreamFailure::FirstTokenTimeout { elapsed_secs: 300 });
+        let message_300 = event_300.data["error"]["message"].as_str().unwrap();
+        assert!(
+            message_300.contains("300s"),
+            "FirstTokenTimeout{{300}} 的文案应含实测秒数 300s，实际：{message_300}"
+        );
+        assert!(
+            !message_300.contains("240s"),
+            "300s 的实测值不应被硬编码的 240s 顶替，实际：{message_300}"
+        );
+
+        let event_240 = error_sse_event(StreamFailure::FirstTokenTimeout { elapsed_secs: 240 });
+        let message_240 = event_240.data["error"]["message"].as_str().unwrap();
+        assert!(
+            message_240.contains("240s"),
+            "FirstTokenTimeout{{240}} 的文案应含实测秒数 240s，实际：{message_240}"
+        );
+
+        assert_eq!(event_300.data["error"]["type"], "overloaded_error");
+        assert_eq!(event_240.data["error"]["type"], "overloaded_error");
+    }
+
+    #[test]
+    fn test_error_sse_event_empty_response_is_overloaded_error_aligned_with_non_stream() {
+        let event = error_sse_event(StreamFailure::EmptyResponse);
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data["error"]["type"], "overloaded_error");
+        // 与非流式路径（handlers.rs 空响应分支）对齐措辞，不再复用「连接中断」。
+        assert_eq!(
+            event.data["error"]["message"],
+            "Upstream returned an empty response. Please retry."
+        );
+    }
+
+    #[test]
+    fn test_all_three_transient_failures_are_overloaded_error() {
+        // 重试语义防回归护栏（硬约束1）：三种可重试成因的 error.type 必须
+        // 全部保持 overloaded_error，本次改动只改文案分类，不改重试语义。
+        let transient_failures = [
+            StreamFailure::FirstTokenTimeout { elapsed_secs: 300 },
+            StreamFailure::ConnectionInterrupted,
+            StreamFailure::EmptyResponse,
+        ];
+        for failure in transient_failures {
+            let event = error_sse_event(failure);
+            assert_eq!(
+                event.data["error"]["type"], "overloaded_error",
+                "{failure:?} 的 error.type 必须是 overloaded_error，实际：{:?}",
+                event.data["error"]["type"]
+            );
+        }
+    }
+
     #[test]
     fn test_error_sse_event_to_sse_string_has_error_event_line() {
         // S1/S2 端到端断言都靠 to_sse_string() 里的 "event: error\n" 文本判定，
         // 这里独立锚定该格式不被后续改动破坏。
-        let sse = error_sse_event(true).to_sse_string();
+        let sse = error_sse_event(StreamFailure::ConnectionInterrupted).to_sse_string();
         assert!(sse.starts_with("event: error\n"));
         assert!(sse.contains("overloaded_error"));
     }
