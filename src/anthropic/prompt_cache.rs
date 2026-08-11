@@ -243,19 +243,28 @@ impl UsageSnapshot {
 
 impl PromptCacheTracker {
     pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile> {
-        let blocks = flatten_cache_blocks(req);
+        Self::build_profile_from_blocks(req.model.clone(), flatten_cache_blocks(req))
+    }
+
+    /// 从已扁平化的 cache block 构造 profile。
+    ///
+    /// 保持独立入口使 token 累加不变量可直接被最小内部夹具验证，无需构造巨大 payload。
+    fn build_profile_from_blocks(
+        model: String,
+        blocks: Vec<CacheBlock>,
+    ) -> Option<PromptCacheProfile> {
         if blocks.is_empty() {
             return None;
         }
 
         let mut hasher = Sha256::new();
         let mut breakpoints = Vec::new();
-        let mut cumulative_tokens = 0;
+        let mut cumulative_tokens: i32 = 0;
         let mut active_ttl = None;
 
         for block in blocks {
             write_hash_chunk(&mut hasher, block.canonical.as_bytes());
-            cumulative_tokens += block.tokens;
+            cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
 
             let breakpoint_ttl = if let Some(ttl) = block.ttl {
                 active_ttl = Some(ttl);
@@ -284,7 +293,7 @@ impl PromptCacheTracker {
             // 分母必须是本循环累加器的终值——不是 `breakpoints.last().cumulative_tokens`
             // （那个等式只在"最后一个 block 恰好被判为断点"时成立，是前提不是通则，#85）。
             local_total_tokens: cumulative_tokens.max(1),
-            model: req.model.clone(),
+            model,
         })
     }
 
@@ -714,9 +723,25 @@ fn append_cache_block(
     if is_anthropic_billing_header_block(value.get("block").unwrap_or(&value)) {
         return;
     }
-    let canonical = canonical_json(&strip_position_keys(value));
+    // Identity and ruler deliberately diverge only for recognized media blocks:
+    // canonical remains the complete request payload for hashing, while the ruler view
+    // replaces media bytes with null and restores their fixed estimate separately.
+    let mut canonical_value = strip_position_keys(value);
+    let canonical = canonical_json(&canonical_value);
+    let ruler = canonical_value
+        .get("block")
+        .and_then(crate::token::content_block_token_view);
+    let tokens = match (canonical_value.get_mut("block"), ruler) {
+        (Some(block), Some((ruler_block, fixed_estimate))) => {
+            *block = ruler_block;
+            let fixed_estimate = fixed_estimate.min(i32::MAX as u64) as i32;
+            crate::token::count_text(&canonical_json(&canonical_value))
+                .saturating_add(fixed_estimate)
+        }
+        _ => crate::token::count_text(&canonical),
+    };
     blocks.push(CacheBlock {
-        tokens: crate::token::count_text(&canonical),
+        tokens,
         canonical,
         ttl,
         is_message_end,
@@ -1968,6 +1993,241 @@ pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile>
             "越过 Opus 门槛后 compute() 应报正的 cache_creation，实际={}",
             usage_4096.cache_creation_input_tokens
         );
+    }
+
+    fn req_with_cached_system_and_content(content: Value) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content,
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: long_text(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        }
+    }
+
+    /// #92：单个 block 已被钳到 i32::MAX 后，后续 block 不得令累计值回绕或在 debug
+    /// 构建 panic。夹具直达内部 block 路径，避免为测试制造数十 MiB 的媒体 payload。
+    #[test]
+    fn build_profile_saturates_cumulative_tokens_at_i32_max() {
+        let profile = PromptCacheTracker::build_profile_from_blocks(
+            "claude-opus-5".to_string(),
+            vec![
+                CacheBlock {
+                    canonical: "first".to_string(),
+                    tokens: i32::MAX,
+                    ttl: Some(DEFAULT_PROMPT_CACHE_TTL),
+                    is_message_end: false,
+                },
+                CacheBlock {
+                    canonical: "second".to_string(),
+                    tokens: 1,
+                    ttl: None,
+                    is_message_end: true,
+                },
+            ],
+        )
+        .expect("fixture contains cache breakpoints");
+
+        assert_eq!(profile.local_total_tokens(), i32::MAX);
+        assert_eq!(profile.breakpoints.len(), 2);
+        assert!(
+            profile
+                .breakpoints
+                .iter()
+                .all(|breakpoint| breakpoint.cumulative_tokens == i32::MAX),
+            "all post-saturation breakpoints must remain clamped"
+        );
+    }
+
+    /// #92：plain text 与非 base64 document 不进入媒体 ruler，必须严格沿用
+    /// 旧的 canonical `count_text` 结果，避免正常文本被意外替换。
+    #[test]
+    fn plain_and_non_base64_document_blocks_keep_canonical_text_ruler() {
+        for block in [
+            json!({"type": "text", "text": "ordinary text must retain its BPE count"}),
+            json!({"type": "document", "source": {"type": "text", "data": "ordinary document text"}}),
+            json!({"type": "document", "source": {"type": "url", "url": "https://example.test/document.txt"}}),
+        ] {
+            let value = json!({"kind": "message", "block": block});
+            let canonical = canonical_json(&strip_position_keys(value.clone()));
+            let mut blocks = Vec::new();
+            append_cache_block(&mut blocks, value, None, true);
+            assert_eq!(blocks[0].tokens, crate::token::count_text(&canonical));
+        }
+    }
+
+    /// #92 BDD：多模态媒体的字节长度不得改变本地缓存尺子；但完整 canonical
+    /// 仍必须参与指纹，因此 payload 变化必须使 fingerprint 变化。
+    #[test]
+    fn multimodal_cache_ruler_uses_fixed_media_estimate_without_changing_identity() {
+        let short = req_with_cached_system_and_content(json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AQID"}
+        }]));
+        let long = req_with_cached_system_and_content(json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(20_000)}
+        }]));
+        let tracker = PromptCacheTracker::default();
+        let short_profile = tracker.build_profile(&short).unwrap();
+        let long_profile = tracker.build_profile(&long).unwrap();
+
+        assert_eq!(
+            short_profile.local_total_tokens(),
+            long_profile.local_total_tokens(),
+            "long base64 payload must not inflate the cache ruler"
+        );
+        assert_ne!(
+            short_profile.breakpoints.last().unwrap().fingerprint,
+            long_profile.breakpoints.last().unwrap().fingerprint,
+            "canonical identity must retain the complete payload"
+        );
+        let short_blocks = flatten_cache_blocks(&short);
+        let long_blocks = flatten_cache_blocks(&long);
+        assert!(short_blocks.last().unwrap().canonical.contains("AQID"));
+        assert!(
+            long_blocks.last().unwrap().canonical.len()
+                > short_blocks.last().unwrap().canonical.len()
+        );
+    }
+
+    /// #92 BDD：`tool_result.content[]` 内的文本按实际内容计量，base64 媒体按固定
+    /// 估算计量。媒体字节变化不得改变总量，但完整 canonical 仍须改变 fingerprint。
+    #[test]
+    fn tool_result_content_uses_media_ruler_without_discarding_text() {
+        let media = |data: Value, text: &str| {
+            req_with_cached_system_and_content(json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_test",
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": data,
+                    }},
+                ],
+            }]))
+        };
+        let short = media(json!("AQID"), "tool output");
+        let long = media(
+            json!(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(20_000)
+            ),
+            "tool output",
+        );
+        let text_growth = media(json!("AQID"), "tool output with additional text");
+        let tracker = PromptCacheTracker::default();
+        let short_profile = tracker.build_profile(&short).unwrap();
+        let long_profile = tracker.build_profile(&long).unwrap();
+        let text_growth_profile = tracker.build_profile(&text_growth).unwrap();
+
+        assert_eq!(
+            short_profile.local_total_tokens(),
+            long_profile.local_total_tokens(),
+            "base64 media inside tool_result.content must use a fixed ruler"
+        );
+        assert_ne!(
+            short_profile.breakpoints.last().unwrap().fingerprint,
+            long_profile.breakpoints.last().unwrap().fingerprint,
+            "complete canonical tool_result payload must keep media bytes in its identity"
+        );
+        assert!(
+            text_growth_profile.local_total_tokens() > short_profile.local_total_tokens(),
+            "text inside tool_result.content must increase the local token total"
+        );
+    }
+
+    /// #92 BDD：相同可缓存前缀之后的长短多模态 suffix 应给出相同的精确命中 token 数。
+    #[test]
+    fn multimodal_suffix_length_does_not_dilute_matched_cache_ratio() {
+        let short = req_with_cached_system_and_content(json!([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "AQID"}
+        }]));
+        let long = req_with_cached_system_and_content(json!([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(20_000)}
+        }]));
+        let prefix = req_with_cached_system_and_content(Value::Null);
+        let tracker = PromptCacheTracker::default();
+        let prefix_profile = tracker.build_profile(&prefix).unwrap();
+        let short_profile = tracker.build_profile(&short).unwrap();
+        let long_profile = tracker.build_profile(&long).unwrap();
+        assert_eq!(
+            short_profile.local_total_tokens(),
+            long_profile.local_total_tokens(),
+            "base64 documents must use the same fixed ruler regardless of payload length"
+        );
+        tracker.update("same-prefix", Some(&prefix_profile), TEST_MIN_CACHEABLE);
+        let short_usage = tracker.compute("same-prefix", Some(&short_profile), TEST_MIN_CACHEABLE);
+        let long_usage = tracker.compute("same-prefix", Some(&long_profile), TEST_MIN_CACHEABLE);
+
+        assert!(
+            short_usage.cache_read_input_tokens > 0,
+            "short suffix must hit the seeded prefix"
+        );
+        assert!(
+            long_usage.cache_read_input_tokens > 0,
+            "long suffix must hit the seeded prefix"
+        );
+        assert_eq!(
+            short_usage.cache_read_input_tokens,
+            prefix_profile.local_total_tokens(),
+            "short suffix must report the seeded prefix's exact token count"
+        );
+        assert_eq!(
+            long_usage.cache_read_input_tokens,
+            prefix_profile.local_total_tokens(),
+            "long suffix must report the seeded prefix's exact token count"
+        );
+    }
+
+    /// #92 BDD：固定媒体尺子应跨默认 1024 门槛但不跨 Opus 的 4096 门槛，
+    /// 并锁定 min-1/min/min+1 三个 cache gate 边界。
+    #[test]
+    fn fixed_media_ruler_changes_opus_threshold_snapshot_at_boundaries() {
+        let req = req_with_cached_system_and_content(json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(20_000)}
+        }]));
+        let tracker = PromptCacheTracker::default();
+        let profile = tracker.build_profile(&req).unwrap();
+        let total = profile.local_total_tokens();
+
+        assert!(
+            total >= 1024,
+            "fixed ruler must clear the default 1024 tier: total={total}"
+        );
+        assert!(
+            total < 4096,
+            "fixed ruler must not falsely clear the Opus 4096 tier: total={total}"
+        );
+        for (threshold, expected_creation) in [(total - 1, true), (total, true), (total + 1, false)]
+        {
+            let usage = tracker.compute("threshold-boundary", Some(&profile), threshold);
+            assert_eq!(
+                usage.cache_creation_input_tokens > 0,
+                expected_creation,
+                "threshold={threshold}, total={total}"
+            );
+        }
     }
 
     /// 守恒律必须是"构造性恒等"，不能靠 `uncached_input_tokens` 的 `.max(0)`
