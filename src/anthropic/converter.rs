@@ -2566,14 +2566,22 @@ mod tests {
 
     /// Scenario: 分隔符后紧跟非 ASCII 字符（emoji）时不 panic（#86 返工 MUST FIX 2）
     ///
-    /// Given user_id 完全由客户端提供，"_session_" 分隔符后紧跟 10 个 4 字节 emoji
-    ///       （40 字节 >= 36，但字节偏移 36 落在某个 emoji 内部、非字符边界）
+    /// Given user_id 完全由客户端提供，"_session_" 分隔符后是 1 个 ASCII 字符
+    ///       紧跟 10 个 4 字节 emoji（混合宽度，共 41 字节 >= 36）
     /// When  提取 session id
     /// Then  不应 panic（原按字节 [..36] 切片会 "byte index 36 is not a char
     ///       boundary"），应安全返回 None（提取失败，落到调用方既有的随机 UUID 兜底）
+    ///
+    /// 输入构造说明（#86 返工返工二轮：原 10 个纯 emoji 输入是恒绿测试）：纯
+    /// emoji（等宽 4 字节）串的字符边界必然是 4 的倍数，而 36 恰好能被 4 整除，
+    /// 于是 `[..36]`/`get(..36)` 在原输入上永远落在合法边界（切出前 9 个 emoji），
+    /// 两个实现在修复前后都返回 None，断言恒真、对被修的 panic 缺陷零覆盖。要让
+    /// 字节 36 落在非边界，必须用**混合宽度**：前缀 1 个 1 字节 ASCII 字符
+    /// 把所有后续 emoji 边界整体错开奇偶，字符边界序列变为
+    /// [0,1,5,9,...,33,37,41]，36 恰好落在第 9 个 emoji（[33,37) 区间）内部。
     #[test]
     fn test_extract_session_id_non_char_boundary_does_not_panic() {
-        let user_id = "a_session_😀😀😀😀😀😀😀😀😀😀";
+        let user_id = "a_session_x😀😀😀😀😀😀😀😀😀😀";
         let session_id = extract_session_id(user_id);
         assert_eq!(
             session_id, None,

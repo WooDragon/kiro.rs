@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -624,10 +624,22 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
-    /// 最近一次统计持久化时间（用于 debounce）
+    /// 最近一次统计持久化*尝试*时间（用于 debounce；#86 返工 SUGGESTION：
+    /// 无论落盘成败都推进，语义是"上次尝试"而非"上次成功"，与脏状态解耦——
+    /// 否则坏盘场景下每个请求都会因快判恒真而去抢 `stats_save_lock`）
     last_stats_save_at: Mutex<Option<Instant>>,
-    /// 统计数据是否有未落盘更新
-    stats_dirty: AtomicBool,
+    /// 统计数据变更版本号（#86 返工 MUST FIX 1）：`save_stats_debounced` 每次
+    /// 标记变更时递增。与 `stats_saved_version` 配合表达"脏"语义，参见下方字段注释。
+    stats_dirty_version: AtomicU64,
+    /// 已成功落盘覆盖到的版本号。"脏" = `stats_dirty_version != stats_saved_version`。
+    ///
+    /// 用版本号取代原先的 `AtomicBool`，是因为布尔值无法区分"这次标记发生在快照
+    /// 之前"还是"快照之后"：`save_stats_locked` 在取 entries 快照*之前*先读一次
+    /// `stats_dirty_version`，成功落盘后只把 `stats_saved_version` 推进到那个读到
+    /// 的值——若快照期间又有新变更把 `stats_dirty_version` 继续递增，两者就不相等，
+    /// 状态依然是脏，`Drop` 会兜底重试。任何非成功出口（写失败/序列化失败/无路径）
+    /// 一律不触碰 `stats_saved_version`，脏状态保持不变。
+    stats_saved_version: AtomicU64,
     /// 统计落盘专用锁（#86 返工 MUST FIX 1）：序列化 `save_stats_locked` 的所有
     /// 调用方（`save_stats_debounced` 的惊群路径 + Admin API 直接调用 + `Drop`
     /// 兜底落盘），避免并发 truncate+write 同一个 tmp 路径产生 torn write。
@@ -825,7 +837,8 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
-            stats_dirty: AtomicBool::new(false),
+            stats_dirty_version: AtomicU64::new(0),
+            stats_saved_version: AtomicU64::new(0),
             stats_save_lock: Mutex::new(()),
             sticky_sessions: Mutex::new(HashMap::new()),
             last_sticky_prune_at: Mutex::new(None),
@@ -1526,7 +1539,10 @@ impl MultiTokenManager {
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
-        self.stats_dirty.store(false, Ordering::Relaxed);
+        // 启动时加载即视为与磁盘一致：把已落盘版本推进到当前版本（此刻恒为 0，
+        // 但写法上与 save_stats_locked 保持同一形状，不假设初始值）。
+        let version = self.stats_dirty_version.load(Ordering::SeqCst);
+        self.stats_saved_version.store(version, Ordering::SeqCst);
         tracing::info!(count = stats.len(), "已从缓存加载统计数据");
     }
 
@@ -1536,10 +1552,37 @@ impl MultiTokenManager {
     /// 自行加锁，是给 `save_stats` / `save_stats_debounced` 复用的内部构件，
     /// 避免同一把 `parking_lot::Mutex`（不可重入）被同一线程二次获取而死锁。
     fn save_stats_locked(&self) {
+        self.save_stats_locked_at(|| {});
+    }
+
+    /// `save_stats_locked` 的实现体，多接受一个 `at_snapshot` 钩子。
+    ///
+    /// 钩子在读完 `version_at_snapshot`、取 entries 快照之前被调用一次——这正是
+    /// MUST FIX 1 修的竞态窗口本身（另一线程在此期间修改 entries 并标记脏，会被
+    /// 当前落盘"看不见"）。生产路径（`save_stats_locked`）传空闭包，零行为影响；
+    /// 测试用它在单线程、无 sleep 的前提下确定性地把"并发新变更"注入到这个真实
+    /// 存在但无法用外部调用序列自然复现的窗口内，见 `test_stats_dirty_survives_change_during_inflight_flush`。
+    fn save_stats_locked_at(&self, at_snapshot: impl FnOnce()) {
+        // #86 返工 SUGGESTION：防抖时钟在函数入口无条件推进，覆盖所有出口（无路径 /
+        // 写失败 / 序列化失败 / 成功）——语义是"上次尝试落盘的时刻"而非"上次成功
+        // 落盘的时刻"，与下面的脏版本号彻底解耦。否则坏盘时该时钟永远停在很久以前，
+        // `save_stats_debounced` 的快判恒真，每个请求都会去抢 `stats_save_lock` 做
+        // 一次注定失败的落盘 + 一条 warn 日志。
+        *self.last_stats_save_at.lock() = Some(Instant::now());
+
         let path = match self.stats_path() {
             Some(p) => p,
             None => return,
         };
+
+        // #86 返工 MUST FIX 1：必须在取 entries 快照*之前*读版本号。若在快照之后
+        // 读，会把快照期间发生的新变更也算作"这次落盘已覆盖"，与旧的 AtomicBool
+        // 实现同样的 DCL 竞态——B 线程在 A 快照之后、写盘完成之前修改 entries 并
+        // 标记脏，若 A 读到的是"快照之后"的版本号，成功写盘后会把这个更新版本号
+        // 误判为"已覆盖"，B 的变更就此永久丢失且不会被 Drop 兜底。
+        let version_at_snapshot = self.stats_dirty_version.load(Ordering::SeqCst);
+
+        at_snapshot();
 
         let stats: HashMap<String, StatsEntry> = {
             let entries = self.entries.lock();
@@ -1573,12 +1616,17 @@ impl MultiTokenManager {
                     std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &path))
                 {
                     tracing::warn!(error = %e, "保存统计缓存失败");
+                    // 写失败：不推进 stats_saved_version，脏状态原样保留给 Drop 兜底重试。
                 } else {
-                    *self.last_stats_save_at.lock() = Some(Instant::now());
-                    self.stats_dirty.store(false, Ordering::Relaxed);
+                    // 只把已落盘版本推进到"取快照那一刻"读到的版本，而不是当前最新版本
+                    // ——若快照之后又有新变更把 stats_dirty_version 继续递增，两者不再相等，
+                    // 状态依然是脏。
+                    self.stats_saved_version
+                        .store(version_at_snapshot, Ordering::SeqCst);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "序列化统计数据失败"),
+            // 序列化失败：同上，不清脏。
         }
     }
 
@@ -1605,7 +1653,10 @@ impl MultiTokenManager {
     /// 锁序钉死：`stats_save_lock → entries`（`save_stats_locked` 内部会取
     /// `entries` 锁构造载荷），全仓其余路径不得反向持锁。
     fn save_stats_debounced(&self) {
-        self.stats_dirty.store(true, Ordering::Relaxed);
+        // #86 返工 MUST FIX 1：递增版本号而非置位布尔——见 stats_dirty_version /
+        // stats_saved_version 字段注释，这是让"脏"状态能区分"标记发生在快照之前
+        // 还是之后"的关键。
+        self.stats_dirty_version.fetch_add(1, Ordering::SeqCst);
 
         let maybe_should_flush = {
             let last = *self.last_stats_save_at.lock();
@@ -2523,7 +2574,11 @@ impl MultiTokenManager {
 
 impl Drop for MultiTokenManager {
     fn drop(&mut self) {
-        if self.stats_dirty.load(Ordering::Relaxed) {
+        // #86 返工 MUST FIX 1：脏 = 变更版本号与已落盘版本号不相等。门控语义不变——
+        // 有脏才写、写就是无条件立即写（save_stats 不经 debounce）。
+        if self.stats_dirty_version.load(Ordering::SeqCst)
+            != self.stats_saved_version.load(Ordering::SeqCst)
+        {
             self.save_stats();
         }
     }
@@ -2560,6 +2615,117 @@ mod tests {
 
     fn test_registry() -> Arc<ModelRegistry> {
         Arc::new(ModelRegistry::from_toml(include_str!("../../models.toml")).unwrap())
+    }
+
+    /// 构造一个 `stats_path()` 可写的 manager（#86 返工统计落盘回归测试专用）。
+    /// 返回 `(manager, 临时凭据目录)`，调用方用完须 `remove_dir_all` 清理。
+    fn test_manager_with_stats_path() -> (MultiTokenManager, PathBuf) {
+        let cred_dir =
+            std::env::temp_dir().join(format!("kiro-stats-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let cred_path = cred_dir.join("credentials.json");
+
+        let config = Config::default();
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            None,
+            Some(cred_path),
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        (manager, cred_dir)
+    }
+
+    /// #86 返工 MUST FIX 1 回归测试。
+    ///
+    /// 复现时序表：T0 线程 A 已读完 `version_at_snapshot`、正要取 entries 快照；
+    /// T1 线程 B 在此期间修改 entries 并调用 `save_stats_debounced` 标记新变更；
+    /// T2 A 完成写盘。断言 T2 之后状态仍必须是脏的——B 的变更不能被 A 的成功
+    /// 落盘掩盖，否则此后若无新变更再触发落盘，`Drop` 的脏门控也会跳过，B 的
+    /// 变更永久丢失。
+    ///
+    /// 用 `save_stats_locked_at` 钩子在真实竞态窗口内（读完版本号之后、取
+    /// entries 快照之前）确定性注入"B 的变更"，单线程、无 sleep，复现只有多
+    /// 线程环境才会触发的 DCL 竞态；其余步骤（路径解析/entries 快照/序列化/
+    /// 写盘/成功分支的版本号推进）全部走生产代码本身。
+    ///
+    /// 修复前必红：若把成功分支改回"存当前最新版本"而非"存快照前读到的
+    /// version_at_snapshot"（旧 `AtomicBool` 实现的等价行为——落盘成功就无条件
+    /// 清脏），T1 注入的变更会被这次成功覆盖，`assert_ne!` 会因两值相等而 panic。
+    #[test]
+    fn test_stats_dirty_survives_change_during_inflight_flush() {
+        let (manager, cred_dir) = test_manager_with_stats_path();
+
+        manager.save_stats_locked_at(|| {
+            // 等价于 save_stats_debounced 里唯一的标记语句：B 线程在 A 已读完
+            // version_at_snapshot、但还没取 entries 快照之前，标记了一次新变更。
+            manager.stats_dirty_version.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert_ne!(
+            manager.stats_dirty_version.load(Ordering::SeqCst),
+            manager.stats_saved_version.load(Ordering::SeqCst),
+            "B 在 A 落盘期间发生的新变更必须让状态保持脏，Drop 才会兜底重试"
+        );
+
+        std::fs::remove_dir_all(&cred_dir).ok();
+    }
+
+    /// #86 返工 SUGGESTION 回归测试：落盘失败后，防抖时钟（`last_stats_save_at`）
+    /// 仍必须推进，且脏状态必须继续保持真。
+    ///
+    /// 前者防止"每个请求都重新抢 `stats_save_lock` 做一次注定失败的落盘"；后者
+    /// 保证 `Drop` 仍会在下一次（可能已恢复写权限的）尝试中兜底重试，不因为时钟
+    /// 推进就误判为"已经落盘过了"。
+    ///
+    /// 用指向不存在目录的路径稳定复现"落盘失败"分支——`stats_path()` 基于纯字符
+    /// 串拼接不检查存在性，返回 `Some`；但写 tmp 文件时目录不存在必然报错，不依赖
+    /// 平台特定的权限设置，跨平台稳定复现。
+    ///
+    /// 修复前必红：若把 `last_stats_save_at` 的更新留在原位（只在成功分支里），
+    /// 落盘失败后它仍是 `None`，第一个 `assert!` 会因 `is_none()` 为真而失败。
+    #[test]
+    fn test_debounce_clock_advances_on_save_failure() {
+        let config = Config::default();
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let cred_path = std::env::temp_dir()
+            .join(format!("kiro-stats-nope-{}", uuid::Uuid::new_v4()))
+            .join("credentials.json");
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            None,
+            Some(cred_path),
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        assert!(manager.last_stats_save_at.lock().is_none());
+
+        manager.stats_dirty_version.fetch_add(1, Ordering::SeqCst);
+        manager.save_stats_locked();
+
+        assert!(
+            manager.last_stats_save_at.lock().is_some(),
+            "落盘失败后防抖时钟仍必须推进，否则每个请求都会重新抢锁做一次注定失败的落盘"
+        );
+        assert_ne!(
+            manager.stats_dirty_version.load(Ordering::SeqCst),
+            manager.stats_saved_version.load(Ordering::SeqCst),
+            "落盘失败不得清脏，Drop 仍要兜底重试"
+        );
     }
 
     #[test]
