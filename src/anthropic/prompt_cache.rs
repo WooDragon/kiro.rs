@@ -1463,6 +1463,12 @@ mod tests {
     ///   （`<=` 对 4999<=5000 会照样放行）。
     #[test]
     fn into_real_conserves_cc_plus_cr_uncached_identity() {
+        // 本数组仅接受 real_total >= 0：下方 `uncached == raw_subtraction`（裸减法）
+        // 断言隐含前提是 `uncached_input_tokens` 不对 real_total 做 `.max(0)` 预处理，
+        // 而 `into_real` 内部对 real_total<=0 会退化清零（见
+        // into_real_real_total_non_positive_degrades_to_zero_without_panic）。若把
+        // 负 real_total 顺手搬进这个数组，断言会以一个与「.max(0) 钳位」这个前提
+        // 完全无关、信息量为零的报错炸掉；负 real_total 场景已由上述另一测试专门覆盖。
         let cases = [
             // (cache_creation, cache_read, local_total, real_total)
             (0, 0, 3000, 5000),
@@ -1526,11 +1532,13 @@ mod tests {
                 real_total
             );
 
-            // #85 B2 断言 3：ratio 饱和(clamp 到 1.0)场景须精确打满 real_total——
-            // last_tokens(150_000) 远超 local_total(10_000)，ratio_cached 被 clamp
-            // 到 1.0，实算 cc=0/cr=5000，和恰好 == real_total。此前只有 `<=`，
-            // 饱和场景被悄悄放过。
-            if (cc, cr, local_total, real_total) == (100_000, 50_000, 10_000, 5000) {
+            // #85 B2 断言 3：ratio 饱和(clamp 到 1.0)场景须精确打满 real_total。
+            // 判据用结构条件而非硬编码某一条 case 的字面值：cc+cr >= local_total
+            // 就是 ratio_cached 被 clamp 到 1.0 的定义本身（输入 last_tokens 达到
+            // 或超过 local_total 时，比例饱和封顶），此时和恰好 == real_total。
+            // 用字面元组单点特判会导致任何人调整 cases 数组里的具体数值都让 `if`
+            // 静默不再匹配、断言退化成死代码；结构条件不受具体数值变动影响。
+            if cc + cr >= local_total {
                 assert_eq!(
                     real.cache_creation_input_tokens + real.cache_read_input_tokens,
                     real_total,

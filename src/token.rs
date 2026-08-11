@@ -164,6 +164,14 @@ const IMAGE_BLOCK_TOKEN_ESTIMATE: u64 = 1500;
 /// 同 `IMAGE_BLOCK_TOKEN_ESTIMATE` 一样只求「不再离谱」，不承诺精确计费口径
 /// （官方/上游均未提供 PDF 逐页 token 计价公式）。仅对 `source.type == "base64"`
 /// 生效；`text`/`url` 等非 base64 来源不携带大体积无意义载荷，仍走正常递归计数。
+///
+/// 注意：与 image 不同，这里的 1500 在量级上是**有意的低报取舍**，不是同等意义上
+/// 的"合理中位数"——image 单图成本有天然上界（约 1~1.6K token），1500 落在合理
+/// 区间；但 document 页数无界，100 页 PDF 真实 token 量级约 15 万，估成 1500 是
+/// 约 100 倍低报。之所以接受这个低报，是因为唯一的替代方案（把 base64 payload
+/// 当正文数）会造出约 40 万倍的高报（见上），两害相权取其轻。按 payload 长度
+/// 分档估算会引入新的魔法系数、且同样缺乏官方计价公式背书，本轮不做——1500
+/// 这个具体数值本身未经论证，只是"两个方向都离谱时选择离谱更小的那个"。
 const DOCUMENT_BLOCK_TOKEN_ESTIMATE: u64 = 1500;
 
 /// 递归统计任意 JSON 值里的文本 token（兜底路径）：
@@ -430,8 +438,15 @@ mod tests {
 
     /// document 块 `source.type == "text"`（非 base64）时，`data` 字段是真实正文，
     /// 仍应走正常递归计数，不能因为新增的 base64 特判而误伤非 base64 来源。
+    ///
+    /// 用 `assert!(total > 1)` 无法区分「走了 count_value_recursive 正文计数」与
+    /// 「被 base64 特判误吞成 DOCUMENT_BLOCK_TOKEN_ESTIMATE(1500) 占位常量」——
+    /// 两者都满足 `> 1`。这里改用 assert_eq! 精确对齐递归路径的计算方式（`type`/
+    /// `source.type`/`source.media_type`/`source.data` 四个字符串字段各自
+    /// count_text 求和），并额外用 assert_ne! 直接排除占位常量。
     #[test]
     fn document_text_source_still_counts_content_normally() {
+        let body = "this is a genuine plain text document body that should be counted normally";
         let messages = vec![Message {
             role: "user".to_string(),
             content: json!([
@@ -440,16 +455,25 @@ mod tests {
                     "source": {
                         "type": "text",
                         "media_type": "text/plain",
-                        "data": "this is a genuine plain text document body that should be counted normally"
+                        "data": body
                     }
                 }
             ]),
         }];
 
         let total = count_all_tokens_local(None, messages, None);
-        assert!(
-            total > 1,
-            "非 base64 document 来源应正常计数正文，got total={total}"
+        let expected = count_text("document") as u64
+            + count_text("text") as u64
+            + count_text("text/plain") as u64
+            + count_text(body) as u64;
+        assert_eq!(
+            total, expected,
+            "非 base64 document 来源应精确等于递归路径对各字符串字段的 count_text 求和，\
+             got total={total} expected={expected}"
+        );
+        assert_ne!(
+            total, DOCUMENT_BLOCK_TOKEN_ESTIMATE,
+            "不应落入 base64 占位常量分支，got total={total}"
         );
     }
 
