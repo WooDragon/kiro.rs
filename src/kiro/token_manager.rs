@@ -1632,6 +1632,32 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘（无条件立即写，供 Admin API 直接调用点 /
     /// `Drop` 使用）。
+    ///
+    /// #86 返工二轮：本函数自己不产生任何版本标记（不调用
+    /// `stats_dirty_version.fetch_add`），单看调用点容易被误当成"清脏但没标记
+    /// 过，是不是漏了什么"的漏洞——实际不是，原因是 `save_stats_locked_at` 内部
+    /// 的读取顺序保证了正确性，与"谁触发的落盘"无关：
+    ///
+    /// - `version_at_snapshot` 在 entries 快照*之前*读取，随后立刻加锁读
+    ///   entries；由于每个标记方（`save_stats_debounced` 里的 `fetch_add`）总是
+    ///   在对应的 entries 修改*之后*才调用（例如 `report_success` 先释放
+    ///   entries 锁再调 `save_stats_debounced`），"entries 里已经包含某次修改"
+    ///   与"该修改对应的版本号已经可见"之间存在稳定的先后关系：只要能读到某个
+    ///   版本号 V，就必然已经能通过 entries 锁看到 V 及之前所有标记对应的
+    ///   entries 状态（很可能还包含更晚的、正在被 debounce 压着还没触发落盘的
+    ///   变更——那只会让快照包含更多数据，不会更少）。
+    /// - 因此无论 `save_stats_locked_at` 是被谁触发的（`save_stats_debounced`
+    ///   的惊群路径、Admin API 的这个直接调用点、还是 `Drop` 兜底），它读到的
+    ///   `version_at_snapshot` 与它随后取到的 entries 快照永远是自洽的
+    ///   ["快照至少覆盖到这个版本号"]，把 `stats_saved_version` 推进到这个值
+    ///   就是安全的——不需要调用方自己先打标记再清标记。
+    ///
+    /// 调用方必须保证调这里之前**不持有 `entries` 锁**（锁序 `stats_save_lock →
+    /// entries` 不可反向，否则 `save_stats_locked_at` 内部再取 entries 锁会
+    /// 死锁）：`add_credential` / `delete_credential` 对 entries 的修改都在独立
+    /// 的 `{ let mut entries = self.entries.lock(); ... }` 块内，块结束、锁释放
+    /// 之后才分别调用 `persist_credentials()` / `save_stats()`，作用域已关闭，
+    /// 本轮改动未触碰这两个函数、未破坏这个前提。
     fn save_stats(&self) {
         let _guard = self.stats_save_lock.lock();
         self.save_stats_locked();
