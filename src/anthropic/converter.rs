@@ -203,7 +203,7 @@ impl std::error::Error for ConversionError {}
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
 /// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(session_id) = json.get("session_id").and_then(|v| v.as_str())
@@ -212,14 +212,23 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         return Some(session_id.to_string());
     }
 
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
+    // 回退到字符串格式：从右向左匹配 "_session_"（带前导下划线）。
+    // 真实格式恒为 user_<hash>_account__session_<uuid>，而 <hash> 段来自外部输入
+    // （例如用户名恰好含 "_session_" 字面串），从左向右 find 会在伪匹配处提前截断，
+    // 拿到无效串后整体退化为随机 UUID、彻底丧失粘性（#86）。UUID 恒在字符串末尾，
+    // 用 rsplit_once 从右向左匹配才与真实格式契合。
+    if let Some((_, session_part)) = user_id.rsplit_once("_session_") {
+        // #86 返工 MUST FIX 2：user_id 完全由客户端提供，session_part.len() 是
+        // 字节数而非字符数，非 ASCII 输入（例如分隔符后紧跟 emoji）按字节 [..36]
+        // 切片可能落在非字符边界，直接 panic（"byte index N is not a char
+        // boundary"）。改用 get(..36) 返回 Option<&str>：非法边界时得到 None，
+        // 落到下面的 None 兜底（既有的随机 UUID 兜底逻辑在调用方），从"客户端
+        // 输入即可让服务端 panic"退化为"提取失败"。UUID 恒为 36 个 ASCII 字符，
+        // 合法输入下 get 与切片等价，行为不变。
+        if let Some(uuid_str) = session_part.get(..36)
+            && is_valid_uuid(uuid_str)
+        {
+            return Some(uuid_str.to_string());
         }
     }
     None
@@ -2538,6 +2547,49 @@ mod tests {
         let user_id = "user_xxx_session_zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz";
         let session_id = extract_session_id(user_id);
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_json_key_name_does_not_leak_into_substring_fallback() {
+        // Scenario: user_id 里的 hash 段来自外部输入（如用户名恰好含 "_session_" 字面串），
+        // Given 一个内嵌了伪 "_session_" 干扰串（my_session_bot）的 user_id，
+        // When 提取 session id，
+        // Then 必须命中末尾真实的 "_session_<UUID>"，而不是被中段的伪匹配提前截断。
+        let user_id = "user_my_session_bot_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id,
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string()),
+            "用户名内含 _session_ 干扰串时，仍应提取末尾真实 session UUID"
+        );
+    }
+
+    /// Scenario: 分隔符后紧跟非 ASCII 字符（emoji）时不 panic（#86 返工 MUST FIX 2）
+    ///
+    /// Given user_id 完全由客户端提供，"_session_" 分隔符后是 1 个 ASCII 字符
+    ///       紧跟 10 个 4 字节 emoji（混合宽度，共 41 字节 >= 36）
+    /// When  提取 session id
+    /// Then  不应 panic（原按字节 [..36] 切片会 "byte index 36 is not a char
+    ///       boundary"），应安全返回 None（提取失败，落到调用方既有的随机 UUID 兜底）
+    ///
+    /// 输入构造说明（#86 返工返工二轮：原 10 个纯 emoji 输入是恒绿测试）：纯
+    /// emoji（等宽 4 字节）串的字符边界必然是 4 的倍数，而 36 恰好能被 4 整除，
+    /// 于是 `[..36]`/`get(..36)` 在原输入上永远落在合法边界（切出前 9 个 emoji），
+    /// 两个实现在修复前后都返回 None，断言恒真、对被修的 panic 缺陷零覆盖。要让
+    /// 字节 36 落在非边界，必须用**混合宽度**：前缀 1 个 1 字节 ASCII 字符
+    /// 把所有后续 emoji 边界整体错开奇偶，字符边界序列变为
+    /// [0,1,5,9,...,33,37,41]（**相对 `rsplit_once("_session_")` 切出的
+    /// `session_part` 的偏移，不含前缀 `"a_session_"` 的字节数**——`get(..36)`
+    /// 就是切在 `session_part` 上，不是原始 `user_id` 上），36 恰好落在第 9 个
+    /// emoji（[33,37) 区间）内部。
+    #[test]
+    fn test_extract_session_id_non_char_boundary_does_not_panic() {
+        let user_id = "a_session_x😀😀😀😀😀😀😀😀😀😀";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id, None,
+            "非字符边界的伪 UUID 段应安全返回 None，而不是 panic"
+        );
     }
 
     #[test]

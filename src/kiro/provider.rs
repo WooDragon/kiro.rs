@@ -259,12 +259,20 @@ impl KiroProvider {
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    pub async fn call_mcp(
+        &self,
+        request_body: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_retry(request_body, session_id).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -275,7 +283,7 @@ impl KiroProvider {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self
                 .token_manager
-                .acquire_context_for_session_excluding(None, None, &failed_credential_ids)
+                .acquire_context_for_session_excluding(None, session_id, &failed_credential_ids)
                 .await
             {
                 Ok(c) => c,
@@ -346,6 +354,16 @@ impl KiroProvider {
             let status = response.status();
 
             // 成功响应
+            //
+            // #86 返工 S4：只读不写——只把 session_id 传给上面的
+            // acquire_context_for_session_excluding 让 MCP 请求也能命中主链路已建立的
+            // 粘性绑定，但成功后用 report_success（不绑定新粘性），不用
+            // report_success_for_session。原因：MCP 调用不带模型名（第一个参数传
+            // None），is_entry_available_for_model 因此不做 premium tier 过滤，可能
+            // 选中并首绑一张不支持 opus 的凭据；若这次绑定恰好插在"主请求清掉
+            // entry"与"主请求成功后首绑"之间，会把 session 重新绑回不支持 opus 的
+            // 凭据，主请求 bind 被不变量拒绝，下一轮又清一次——来回抖动。读 sticky
+            // 已能拿到全部缓存收益，写绑定对本 PR 目标零增量贡献。
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
