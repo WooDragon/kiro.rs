@@ -103,14 +103,25 @@ fn log_request_outcome(
 /// PR-0 返工（redteam 采纳建议 1）：`cache_bucket_kind` 从实际构造出的
 /// `account_key` 字符串取前缀，而不是重新判断一次 `stable_conversation_id`
 /// 分支——避免这个字段沦为分桶逻辑的复制品：`account_key` 的构造规则将来变了，
-/// 这个字段自动跟着变，不会有旁路判断悄悄脱节。未识别前缀（如 websearch.rs
-/// 固定桶 `"websearch"`，本次未接入 `request outcome` 日志）落 `"cred"` 兜底，
-/// 维持字段现有的二值语义。
-fn cache_bucket_kind_from_account_key(account_key: &str) -> &'static str {
-    match account_key.split_once(':').map(|(prefix, _)| prefix) {
-        Some("conv") => "conv",
-        _ => "cred",
-    }
+/// 这个字段自动跟着变，不会有旁路判断悄悄脱节。
+///
+/// 第二轮返工（redteam 二次纠正）：不做"未识别前缀 → 兜底成已知值"的映射。
+/// 第一版把不认识的前缀兜底成 `"cred"`，是同一个"字段脱离真相"的毛病换了个
+/// 位置——将来真加了第三种桶，字段会言之凿凿地报一个看起来正常、实际错误
+/// 的 `"cred"`，比报一个没见过的新前缀更危险（后者一眼看出有新东西，前者会
+/// 安静污染聚合结果），还需要有人记得同步维护这张前缀白名单，多一处必然腐化
+/// 的耦合。改为直接返回 `account_key` 里 `':'` 之前的实际前缀，不映射、不兜底
+/// 重写；没有 `':'`（如 `websearch.rs:528` 的裸 `"websearch"`）就返回整串，
+/// 不 panic、不 unwrap。返回类型放宽成 `String`——前缀是从运行时字符串切出来的
+/// 借用，而调用点普遍要跨越 `account_key` 被移动（如 `.with_prompt_cache(...,
+/// Some(account_key), ...)`）之后继续使用，无法维持 `&'static str` 或对
+/// `account_key` 的借用，遂用小额堆分配换掉映射表这个持续腐化点。
+fn cache_bucket_kind_from_account_key(account_key: &str) -> String {
+    account_key
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(account_key)
+        .to_string()
 }
 
 /// 构建并序列化 KiroRequest。
@@ -738,7 +749,7 @@ fn create_sse_stream(
                                     ctx.credential_id,
                                     ctx.sticky_hit,
                                     ctx.session_id_extracted,
-                                    ctx.cache_bucket_kind,
+                                    &ctx.cache_bucket_kind,
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
                                     super::stream::error_sse_event(failure).to_sse_string(),
@@ -757,7 +768,7 @@ fn create_sse_stream(
                                         ctx.credential_id,
                                         ctx.sticky_hit,
                                         ctx.session_id_extracted,
-                                        ctx.cache_bucket_kind,
+                                        &ctx.cache_bucket_kind,
                                     );
                                     vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
@@ -766,7 +777,7 @@ fn create_sse_stream(
                                         ctx.credential_id,
                                         ctx.sticky_hit,
                                         ctx.session_id_extracted,
-                                        ctx.cache_bucket_kind,
+                                        &ctx.cache_bucket_kind,
                                     );
                                     ctx.generate_final_events()
                                 };
@@ -865,7 +876,7 @@ async fn handle_non_stream_request(
                         Some(api_response.credential_id),
                         api_response.sticky_hit,
                         session_id_extracted,
-                        cache_bucket_kind,
+                        &cache_bucket_kind,
                     )),
                 );
             }
@@ -875,7 +886,7 @@ async fn handle_non_stream_request(
                 Some(api_response.credential_id),
                 api_response.sticky_hit,
                 session_id_extracted,
-                cache_bucket_kind,
+                &cache_bucket_kind,
             );
             return (
                 StatusCode::BAD_GATEWAY,
@@ -1096,7 +1107,7 @@ async fn handle_non_stream_request(
             Some(api_response.credential_id),
             api_response.sticky_hit,
             session_id_extracted,
-            cache_bucket_kind,
+            &cache_bucket_kind,
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1138,7 +1149,7 @@ async fn handle_non_stream_request(
         Some(api_response.credential_id),
         api_response.sticky_hit,
         session_id_extracted,
-        cache_bucket_kind,
+        &cache_bucket_kind,
     );
 
     // 构建 Anthropic 响应
@@ -1606,7 +1617,7 @@ fn create_prefix_buffered_sse_stream(
                                         credential_id,
                                         sticky_hit,
                                         session_id_extracted,
-                                        cache_bucket_kind,
+                                        &cache_bucket_kind,
                                     );
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
@@ -1634,7 +1645,7 @@ fn create_prefix_buffered_sse_stream(
                                         credential_id,
                                         sticky_hit,
                                         session_id_extracted,
-                                        cache_bucket_kind,
+                                        &cache_bucket_kind,
                                     );
                                     vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
@@ -1645,7 +1656,7 @@ fn create_prefix_buffered_sse_stream(
                                         credential_id,
                                         sticky_hit,
                                         session_id_extracted,
-                                        cache_bucket_kind,
+                                        &cache_bucket_kind,
                                     );
                                     ctx.finish()
                                 };
@@ -1838,7 +1849,7 @@ fn create_buffered_sse_stream(
                                     credential_id,
                                     sticky_hit,
                                     session_id_extracted,
-                                    cache_bucket_kind,
+                                    &cache_bucket_kind,
                                 );
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
@@ -1865,7 +1876,7 @@ fn create_buffered_sse_stream(
                                     credential_id,
                                     sticky_hit,
                                     session_id_extracted,
-                                    cache_bucket_kind,
+                                    &cache_bucket_kind,
                                 );
                                 vec![super::stream::error_sse_event(
                                     super::stream::StreamFailure::EmptyResponse,
@@ -1882,7 +1893,7 @@ fn create_buffered_sse_stream(
                                     credential_id,
                                     sticky_hit,
                                     session_id_extracted,
-                                    cache_bucket_kind,
+                                    &cache_bucket_kind,
                                 );
                                 ctx.finish_and_get_all_events()
                             };

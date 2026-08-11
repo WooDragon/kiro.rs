@@ -720,9 +720,16 @@ pub struct StreamContext {
     /// PR-0：客户端 metadata.user_id 是否成功提取出稳定 session_id
     /// （对应 [`super::converter::ConversionResult::stable_conversation_id`] 是否为 `Some`）。
     pub session_id_extracted: bool,
-    /// PR-0：prompt cache 分桶键前缀——`"conv"`（按会话稳定分桶）或 `"cred"`
-    /// （退化按凭据分桶）。取值恒为二者之一，构造时未显式设置则用 `"cred"` 占位。
-    pub cache_bucket_kind: &'static str,
+    /// PR-0：prompt cache 分桶键前缀，取自 `account_key`（如 `"conv"`/`"cred"`）
+    /// 中 `':'` 之前的实际部分——不是枚举出来的已知值集合，account_key 的
+    /// 构造规则将来新增分桶时这里跟着变，不需要同步改这个类型。
+    ///
+    /// 第二轮返工（redteam 二次纠正）：类型从 `&'static str` 放宽为 `String`——
+    /// 值来自运行时构造的 `account_key` 字符串切片，且调用点普遍要跨越
+    /// `account_key` 本身被移动（塞进 `with_prompt_cache`）之后继续使用，无法
+    /// 维持 `'static` 生命周期或对 `account_key` 的借用。构造时未显式设置则用
+    /// `"cred".to_string()` 占位。
+    pub cache_bucket_kind: String,
 }
 
 impl StreamContext {
@@ -770,7 +777,7 @@ impl StreamContext {
             credential_id: None,
             sticky_hit: None,
             session_id_extracted: false,
-            cache_bucket_kind: "cred",
+            cache_bucket_kind: "cred".to_string(),
         }
     }
 
@@ -788,7 +795,7 @@ impl StreamContext {
         credential_id: u64,
         sticky_hit: Option<bool>,
         session_id_extracted: bool,
-        cache_bucket_kind: &'static str,
+        cache_bucket_kind: String,
     ) -> Self {
         self.credential_id = Some(credential_id);
         self.sticky_hit = sticky_hit;
@@ -1581,7 +1588,7 @@ impl BufferedStreamContext {
         credential_id: u64,
         sticky_hit: Option<bool>,
         session_id_extracted: bool,
-        cache_bucket_kind: &'static str,
+        cache_bucket_kind: String,
     ) -> Self {
         self.inner = self.inner.with_observability(
             credential_id,
@@ -1594,12 +1601,13 @@ impl BufferedStreamContext {
 
     /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
     /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
-    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, &'static str) {
+    /// `cache_bucket_kind` 现为 `String`（非 `Copy`），`&self` 取快照须 `.clone()`。
+    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, String) {
         (
             self.inner.credential_id,
             self.inner.sticky_hit,
             self.inner.session_id_extracted,
-            self.inner.cache_bucket_kind,
+            self.inner.cache_bucket_kind.clone(),
         )
     }
 
@@ -1722,7 +1730,7 @@ impl PrefixBufferedStreamContext {
         credential_id: u64,
         sticky_hit: Option<bool>,
         session_id_extracted: bool,
-        cache_bucket_kind: &'static str,
+        cache_bucket_kind: String,
     ) -> Self {
         self.inner = self.inner.with_observability(
             credential_id,
@@ -1735,12 +1743,13 @@ impl PrefixBufferedStreamContext {
 
     /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
     /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
-    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, &'static str) {
+    /// `cache_bucket_kind` 现为 `String`（非 `Copy`），`&self` 取快照须 `.clone()`。
+    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, String) {
         (
             self.inner.credential_id,
             self.inner.sticky_hit,
             self.inner.session_id_extracted,
-            self.inner.cache_bucket_kind,
+            self.inner.cache_bucket_kind.clone(),
         )
     }
 
