@@ -1562,6 +1562,13 @@ impl MultiTokenManager {
     /// 当前落盘"看不见"）。生产路径（`save_stats_locked`）传空闭包，零行为影响；
     /// 测试用它在单线程、无 sleep 的前提下确定性地把"并发新变更"注入到这个真实
     /// 存在但无法用外部调用序列自然复现的窗口内，见 `test_stats_dirty_survives_change_during_inflight_flush`。
+    ///
+    /// # 调用契约
+    /// 复述 `save_stats_locked`（`:1551`）的前提：调用方必须已持有
+    /// `stats_save_lock`。且 `at_snapshot` 闭包在这把锁的临界区*内部*执行——
+    /// 闭包内绝不能再去获取 `stats_save_lock`（`parking_lot::Mutex`
+    /// 不可重入，同线程重入会死锁），也不能间接调用任何会获取它的方法
+    /// （如 `save_stats`/`save_stats_locked`/`save_stats_debounced` 自身）。
     fn save_stats_locked_at(&self, at_snapshot: impl FnOnce()) {
         // #86 返工 SUGGESTION：防抖时钟在函数入口无条件推进，覆盖所有出口（无路径 /
         // 写失败 / 序列化失败 / 成功）——语义是"上次尝试落盘的时刻"而非"上次成功
@@ -1682,6 +1689,16 @@ impl MultiTokenManager {
         // #86 返工 MUST FIX 1：递增版本号而非置位布尔——见 stats_dirty_version /
         // stats_saved_version 字段注释，这是让"脏"状态能区分"标记发生在快照之前
         // 还是之后"的关键。
+        //
+        // ⚠️ 不变量（`save_stats` 的 doc comment 有完整推导，这里只放告警）：
+        // 本函数是当前唯一的标记点，且全部 5 个调用方
+        // （report_success/report_quota_exhausted/report_failure/
+        // report_refresh_failure/report_refresh_token_invalid）都保证先释放
+        // entries 锁、完成对 entries 的修改，再调用本函数标记版本号。这个顺序
+        // 是 `stats_saved_version` 清脏正确性的地基——新增任何调用点，都必须在
+        // entries 修改**提交、锁释放之后**才调用本函数；一旦反过来（先标记后
+        // 改 entries），落盘可能在标记之后、entries 修改之前完成，那次修改就会
+        // 被静默当成"已覆盖"永久丢弃，且不会有任何测试变红。
         self.stats_dirty_version.fetch_add(1, Ordering::SeqCst);
 
         let maybe_should_flush = {
@@ -2645,6 +2662,16 @@ mod tests {
 
     /// 构造一个 `stats_path()` 可写的 manager（#86 返工统计落盘回归测试专用）。
     /// 返回 `(manager, 临时凭据目录)`，调用方用完须 `remove_dir_all` 清理。
+    /// 测试专用清理 guard：无论测试函数体正常返回还是因断言失败 panic 退出，
+    /// `Drop` 都会执行，保证临时目录不残留——若把清理写成函数体末尾的裸调用，
+    /// 断言先 panic 就会跳过它，泄漏临时目录。
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
     fn test_manager_with_stats_path() -> (MultiTokenManager, PathBuf) {
         let cred_dir =
             std::env::temp_dir().join(format!("kiro-stats-test-{}", uuid::Uuid::new_v4()));
@@ -2685,9 +2712,18 @@ mod tests {
     /// 修复前必红：若把成功分支改回"存当前最新版本"而非"存快照前读到的
     /// version_at_snapshot"（旧 `AtomicBool` 实现的等价行为——落盘成功就无条件
     /// 清脏），T1 注入的变更会被这次成功覆盖，`assert_ne!` 会因两值相等而 panic。
+    ///
+    /// 落盘成功这个前提本身也被显式断言（`kiro_stats.json` 确实存在），而不是
+    /// 隐含在"跑通了就算数"里——否则若环境前提悄悄变了（`stats_path()` 推导
+    /// 改了 / 目录没建成 / 沙箱禁写）导致写盘分支根本没执行到，`assert_ne!`
+    /// 依然会通过（失败分支本就不推进 `stats_saved_version`），这个测试就退化
+    /// 成又一个恒绿测试——只是触发条件从"输入构造"换成了"环境前提"，跟
+    /// `test_extract_session_id_non_char_boundary_does_not_panic` 曾经踩的是
+    /// 同一类失效模式。
     #[test]
     fn test_stats_dirty_survives_change_during_inflight_flush() {
         let (manager, cred_dir) = test_manager_with_stats_path();
+        let _cleanup = TempDirGuard(cred_dir.clone());
 
         manager.save_stats_locked_at(|| {
             // 等价于 save_stats_debounced 里唯一的标记语句：B 线程在 A 已读完
@@ -2695,13 +2731,18 @@ mod tests {
             manager.stats_dirty_version.fetch_add(1, Ordering::SeqCst);
         });
 
+        assert!(
+            cred_dir.join("kiro_stats.json").exists(),
+            "前提断言：落盘必须真的成功执行到——否则下面的 assert_ne! 在写盘失败的\
+             失败分支下也会通过（该分支本就不推进 stats_saved_version），测试会\
+             退化成恒绿"
+        );
+
         assert_ne!(
             manager.stats_dirty_version.load(Ordering::SeqCst),
             manager.stats_saved_version.load(Ordering::SeqCst),
             "B 在 A 落盘期间发生的新变更必须让状态保持脏，Drop 才会兜底重试"
         );
-
-        std::fs::remove_dir_all(&cred_dir).ok();
     }
 
     /// #86 返工 SUGGESTION 回归测试：落盘失败后，防抖时钟（`last_stats_save_at`）

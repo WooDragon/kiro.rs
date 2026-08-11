@@ -2578,7 +2578,10 @@ mod tests {
     /// 两个实现在修复前后都返回 None，断言恒真、对被修的 panic 缺陷零覆盖。要让
     /// 字节 36 落在非边界，必须用**混合宽度**：前缀 1 个 1 字节 ASCII 字符
     /// 把所有后续 emoji 边界整体错开奇偶，字符边界序列变为
-    /// [0,1,5,9,...,33,37,41]，36 恰好落在第 9 个 emoji（[33,37) 区间）内部。
+    /// [0,1,5,9,...,33,37,41]（**相对 `rsplit_once("_session_")` 切出的
+    /// `session_part` 的偏移，不含前缀 `"a_session_"` 的字节数**——`get(..36)`
+    /// 就是切在 `session_part` 上，不是原始 `user_id` 上），36 恰好落在第 9 个
+    /// emoji（[33,37) 区间）内部。
     #[test]
     fn test_extract_session_id_non_char_boundary_does_not_panic() {
         let user_id = "a_session_x😀😀😀😀😀😀😀😀😀😀";
