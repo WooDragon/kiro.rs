@@ -79,6 +79,20 @@ pub(crate) fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, st
 /// `credential_id`/`sticky_hit` 用 `Option` 而非裸值：前者是 redteam 采纳建议 2
 /// （`0` 是凭据文件里合法可手写的 id，不能当"未回填"哨兵）；后者是 MUST FIX 2
 /// 的三态语义（`None` = 会话粘性机制未启用 / priority 模式，不是"未命中"）。
+/// MUST FIX 2 的三态语义落地：`sticky_hit` 是 `Option<bool>` 而非裸 `bool`，
+/// `None` 表示"会话粘性机制未启用 / priority 模式"，不是"未命中"——两者混淆
+/// 会让 sticky 命中率统计把"压根没跑这个机制"的请求错记成失败样本。抽成独立
+/// 纯函数（而非留在 `tracing::info!` 宏调用内联 `match`），是为了让 `n_a` 这一支
+/// 能被单测直接断言到：不然这条防复发线只能靠"起 subscriber 抓事件字段"这种
+/// 重量级验证，MUST FIX 2 真正修的语义反而没有一个轻量断言钉住它。
+fn sticky_hit_label(sticky_hit: Option<bool>) -> &'static str {
+    match sticky_hit {
+        Some(true) => "hit",
+        Some(false) => "miss",
+        None => "n_a",
+    }
+}
+
 fn log_request_outcome(
     req_outcome: &str,
     credential_id: Option<u64>,
@@ -89,11 +103,7 @@ fn log_request_outcome(
     tracing::info!(
         req_outcome = req_outcome,
         credential_id,
-        sticky_hit = match sticky_hit {
-            Some(true) => "hit",
-            Some(false) => "miss",
-            None => "n_a",
-        },
+        sticky_hit = sticky_hit_label(sticky_hit),
         session_id_extracted,
         cache_bucket_kind,
         "request outcome"
@@ -3339,4 +3349,40 @@ mod tests {
     // 也是与 test_map_all_credentials_disabled_gives_503 等测试相同的
     // ErrorResponse::new 构造路径，无需再搭一套 provider 才能验证格式正确性。
     // -----------------------------------------------------------------------
+
+    /// BDD（redteam SUGGESTION-2）：`sticky_hit_label` 三态映射的纯函数级钉子。
+    ///
+    /// 重点是 `None → "n_a"` 这一支——它是 MUST FIX 2 的全部内容（`Option<bool>`
+    /// 而非裸 `bool`，`None` 语义是"会话粘性未启用/priority 模式"而非"未命中"）。
+    /// 之前这个函数没有独立单测，`test_none_credential_id_omitted_from_event_fields`
+    /// 只验证了 `credential_id` 字段的缺席行为，从未断言过 `sticky_hit` 的三态取
+    /// 值本身——把 `None => "n_a"` 悄悄改回 `"miss"`，或把 `Option<bool>` 塌回
+    /// `bool`，415 个既有测试全绿，MUST FIX 2 修的缺陷会原样复活。
+    #[test]
+    fn test_sticky_hit_label_maps_all_three_states() {
+        assert_eq!(sticky_hit_label(Some(true)), "hit");
+        assert_eq!(sticky_hit_label(Some(false)), "miss");
+        assert_eq!(sticky_hit_label(None), "n_a");
+    }
+
+    /// BDD（redteam 二次纠正后的 SUGGESTION-2）：`cache_bucket_kind_from_account_key`
+    /// 直接透传前缀、不映射不兜底的纯函数级钉子。
+    ///
+    /// 第三条分支（无 `':'` 的裸串）当前在生产代码里没有调用点会走到——
+    /// `account_key` 只由 `format!("conv:{}", id)` 或 `format!("cred:{}", ..)`
+    /// 两种形态构造——但正因为它不可达，才更需要被断言到：一条既无调用点、
+    /// 又无测试覆盖的分支，将来被改坏（比如误加 `.expect()` 或改错 `unwrap_or`
+    /// 的默认值）不会有任何信号。断言的是"`unwrap_or(account_key)` 兜底返回
+    /// 整串"这个具体行为，不是猜测将来会不会用到。
+    #[test]
+    fn test_cache_bucket_kind_from_account_key_passthrough() {
+        assert_eq!(
+            cache_bucket_kind_from_account_key("conv:550e8400-e29b-41d4-a716-446655440000"),
+            "conv"
+        );
+        assert_eq!(cache_bucket_kind_from_account_key("cred:123"), "cred");
+        // 无 ':' 的裸串（如 websearch.rs:528 的 "websearch"）：split_once 返回
+        // None，unwrap_or 兜底成整串原样返回，不映射不重写。
+        assert_eq!(cache_bucket_kind_from_account_key("websearch"), "websearch");
+    }
 }
