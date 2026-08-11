@@ -860,12 +860,16 @@ mod tests {
     /// `input_tokens + cc + cr == real_total`，且传入 `ScaledCacheUsage::Local`
     /// 时必须真的按比例换算（而不是被当成 `PromptCacheUsage` 直接塞进去导致编译期
     /// 类型不匹配——本测试同时充当"这个调用点确实吃了新类型"的编译期证据）。
+    ///
+    /// 夹具刻意选 `cc(4000)+cr(1500)=5500 != real_total(5000)`——若两者恰好相等，
+    /// 调用点丢失 `Local` 缩放语义（被 `.raw()` 打平成 `Real` 再传入）也会巧合凑出
+    /// 同一个 5000，测不出问题（反事实验证曾在同构场景撞过一次假阴性）。
     #[test]
     fn generate_websearch_events_message_start_usage_conserves_against_real_total() {
         let scaled = ScaledCacheUsage::Local {
             usage: PromptCacheUsage {
                 cache_creation_input_tokens: 4000,
-                cache_read_input_tokens: 1000,
+                cache_read_input_tokens: 1500,
                 cache_creation_5m_input_tokens: 4000,
                 cache_creation_1h_input_tokens: 0,
             },

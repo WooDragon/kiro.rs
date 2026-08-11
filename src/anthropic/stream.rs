@@ -2268,10 +2268,15 @@ mod tests {
     /// 占 3 字节/字符，对中文输入约 3 倍高估。改走 `crate::token::count_text`
     /// （tiktoken cl100k）后，累计值应与其保持一致，且明显小于字节长度。
     ///
+    /// `OLD_RULER_TOOL_INPUT_BYTES` 是旧字节公式对本测试同一份 `cjk_input` 的
+    /// 历史实测值（#85 §3.5「1.5 段」，删除旧公式前反事实回退实测得出），仅作
+    /// 历史对照——这是"内联 3 倍高估"发作点专门喂含中文 tool_use.input 的基线。
+    ///
     /// 反例验证：临时把计数还原成 `(input.len() as i32 + 3) / 4` 会让
-    /// `ctx.output_tokens < byte_len` 断言失败（字节估算此时恰好约等于
-    /// `byte_len/4`，仍可能小于 `byte_len` 本身，但会显著大于 `count_text` 的真实值，
-    /// 使 `assert_eq!(ctx.output_tokens, expected)` 直接失败）。
+    /// `ctx.output_tokens` 撞回 `OLD_RULER_TOOL_INPUT_BYTES`（13），使
+    /// `assert_ne!`/`assert_eq!(ctx.output_tokens, expected)` 直接失败。
+    const OLD_RULER_TOOL_INPUT_BYTES: i32 = 13;
+
     #[test]
     fn process_tool_use_counts_input_tokens_via_tiktoken_not_utf8_bytes() {
         let mut ctx =
@@ -2293,6 +2298,57 @@ mod tests {
             "tiktoken 计数应明显小于 UTF-8 字节长度：output_tokens={} byte_len={}",
             ctx.output_tokens,
             byte_len
+        );
+        assert_ne!(
+            ctx.output_tokens, OLD_RULER_TOOL_INPUT_BYTES,
+            "换尺后应与旧字节公式的历史实测值不同，ruler shift 未被记录"
+        );
+    }
+
+    /// #85 §3.5「1.5 段」旧尺基线快照（output 面）：`stream.rs::estimate_tokens`
+    /// （已删除，CJK 加权字符启发式：中文 `(count*2+2)/3`、其余 `(count+3)/4`）
+    /// 在删除前对同一批样本文本（与 `prompt_cache.rs` 同族）的最后一次实测输出，
+    /// 仅作历史对照，不是期望值。换尺(tiktoken)后数值应有变化，方向不统一。
+    const OLD_RULER_OUTPUT_MIXED: i32 = 87;
+    const OLD_RULER_OUTPUT_CODE: i32 = 138;
+    /// 与 `prompt_cache.rs::cn_sample_text(20)` 同一句中文样本 ×20 遍的历史实测值。
+    const OLD_RULER_OUTPUT_CN: i32 = 840;
+
+    #[test]
+    fn baseline_output_ruler_shift_recorded() {
+        let mixed = "Rust ownership 是 Rust 语言最独特的特性之一。The borrow checker enforces memory safety at compile time without a garbage collector. 每个值都有一个所有者（owner），当所有者离开作用域时，值会被自动释放。This design eliminates entire classes of bugs such as use-after-free and double-free errors that plague C and C++ programs.";
+        let code = r#"
+pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile> {
+    let blocks = flatten_cache_blocks(req);
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut breakpoints = Vec::new();
+    let mut cumulative_tokens = 0;
+    for block in blocks {
+        write_hash_chunk(&mut hasher, block.canonical.as_bytes());
+        cumulative_tokens += block.tokens;
+    }
+    Some(PromptCacheProfile { breakpoints, local_total_tokens: cumulative_tokens.max(1), model: req.model.clone() })
+}
+"#;
+        let cn = "所有权系统是 Rust 语言在编译期保证内存安全的核心机制，它通过借用检查器在没有垃圾回收器的情况下追踪每一个值的生命周期与作用域边界。".repeat(20);
+
+        assert_ne!(
+            crate::token::count_text(mixed),
+            OLD_RULER_OUTPUT_MIXED,
+            "中英混合样本换尺后数值未变化，output 面 ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(code),
+            OLD_RULER_OUTPUT_CODE,
+            "纯代码样本换尺后数值未变化，output 面 ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(&cn),
+            OLD_RULER_OUTPUT_CN,
+            "纯中文样本换尺后数值未变化，output 面 ruler shift 未被记录"
         );
     }
 

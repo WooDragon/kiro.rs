@@ -1607,12 +1607,17 @@ mod tests {
     /// `build_usage_value` 端到端：input_tokens 字段必须满足
     /// `input_tokens_reported + cc + cr == real_total`（守恒律在最终 JSON 输出层的体现），
     /// 而不是像修复前那样在不同尺度间相减产生漂移。
+    ///
+    /// 夹具刻意选 `cc(4000)+cr(1500)=5500 != real_total(5000)`——若选成两者恰好
+    /// 相等（如曾经的 4000+1000=5000），跳过 `into_real` 直接用 `raw()` 相减也会
+    /// 巧合地凑出同一个 5000，测试就测不出"到底走没走 into_real"（反事实验证
+    /// 时曾在此撞过一次假阴性）。
     #[test]
     fn build_usage_value_reports_conserve_against_real_total() {
         let scaled = ScaledCacheUsage::Local {
             usage: PromptCacheUsage {
                 cache_creation_input_tokens: 4000,
-                cache_read_input_tokens: 1000,
+                cache_read_input_tokens: 1500,
                 cache_creation_5m_input_tokens: 4000,
                 cache_creation_1h_input_tokens: 0,
             },
@@ -1752,5 +1757,187 @@ mod tests {
             auto_without_upstream.fallback_usage,
             ScaledCacheUsage::Local { usage, local_total: 3000 } if usage == fallback
         ));
+    }
+
+    // ── #85 §3.5「1.5 段」旧尺基线快照 ────────────────────────────────────
+    //
+    // 下列 OLD_RULER_* 常量是旧字符启发式尺子（`prompt_cache.rs::estimate_tokens`
+    // = `((chars+3)/4).max(1)`，已在本 PR 删除）在删除前对同一批样本文本的最后
+    // 一次实测输出，仅作历史对照，**不是任何期望值**——新尺子(tiktoken)不必给出
+    // 相同数字，方向也不统一（代码样本上新尺反而更省，中英混合/纯中文样本上新
+    // 尺更贵）。目的只是让"换尺子改变了多少"留下可核对的证据，不是静默无痕迹地
+    // 漂移（§3.5 要求断言"变化被记录"，不是"必须不变"）。
+    const OLD_RULER_INPUT_MIXED: i32 = 70;
+    const OLD_RULER_INPUT_CODE: i32 = 138;
+    /// cn_sample_text(20)：旧尺下明确低于默认档 1024。
+    const OLD_RULER_INPUT_CN_1024_TIER: i32 = 340;
+    /// cn_sample_text(100)：旧尺下已过默认档 1024、仍明确低于 Opus 档 4096——
+    /// 专门孤立出"新尺让 Opus 档也越过"这一新增行为分野，不与默认档穿越混同。
+    const OLD_RULER_INPUT_CN_4096_TIER: i32 = 1700;
+
+    fn mixed_sample_text() -> String {
+        "Rust ownership 是 Rust 语言最独特的特性之一。The borrow checker enforces memory safety at compile time without a garbage collector. 每个值都有一个所有者（owner），当所有者离开作用域时，值会被自动释放。This design eliminates entire classes of bugs such as use-after-free and double-free errors that plague C and C++ programs.".to_string()
+    }
+
+    fn code_sample_text() -> String {
+        r#"
+pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile> {
+    let blocks = flatten_cache_blocks(req);
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut breakpoints = Vec::new();
+    let mut cumulative_tokens = 0;
+    for block in blocks {
+        write_hash_chunk(&mut hasher, block.canonical.as_bytes());
+        cumulative_tokens += block.tokens;
+    }
+    Some(PromptCacheProfile { breakpoints, local_total_tokens: cumulative_tokens.max(1), model: req.model.clone() })
+}
+"#
+        .to_string()
+    }
+
+    fn cn_sample_text(reps: usize) -> String {
+        "所有权系统是 Rust 语言在编译期保证内存安全的核心机制，它通过借用检查器在没有垃圾回收器的情况下追踪每一个值的生命周期与作用域边界。".repeat(reps)
+    }
+
+    /// [`make_cacheable_req`] 的泛化版：system 文本可自定义，供旧尺基线测试
+    /// 注入不同样本文本，复用同一条 build_profile 生产路径。
+    fn req_with_system_text(model: &str, text: String) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(long_text()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            temperature: None,
+            top_p: None,
+            metadata: None,
+        }
+    }
+
+    /// 换尺子后，`count_text`（新尺）对同一批样本文本的输出应与旧尺历史实测值
+    /// 不同——记录变化，不断言"必须不变"（§3.5 要求）。反事实验证：把
+    /// `count_text` 换回旧公式跑同一份样本文本，三个 assert_ne! 会全部撞上
+    /// 相同的历史常量而 panic（本测试与常量取自同一份原始文本，非经
+    /// canonical_json 包装，比较是精确同源的）。
+    #[test]
+    fn baseline_ruler_shift_recorded_for_sample_texts() {
+        assert_ne!(
+            crate::token::count_text(&mixed_sample_text()),
+            OLD_RULER_INPUT_MIXED,
+            "中英混合样本换尺后数值未变化，ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(&code_sample_text()),
+            OLD_RULER_INPUT_CODE,
+            "纯代码样本换尺后数值未变化，ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(&cn_sample_text(20)),
+            OLD_RULER_INPUT_CN_1024_TIER,
+            "纯中文样本换尺后数值未变化，ruler shift 未被记录"
+        );
+    }
+
+    /// input 面 `min_cacheable_tokens` 门槛穿越：同一份纯中文样本，旧尺
+    /// (char/4) 下不足默认档 1024 / Opus 族 4096 门槛，新尺(tiktoken)下越过——
+    /// 这不是数字游戏，`compute()` 会因此把 `cache_creation_input_tokens` 从 0
+    /// 变成正数（是否开始缓存这个内容块的实际行为分野）。两档都验证，Opus
+    /// 4096 档不能漏（生产主力模型是 opus-5）。
+    #[test]
+    fn baseline_input_min_cacheable_threshold_crossing_recorded() {
+        let tracker = PromptCacheTracker::default();
+
+        // 默认档 1024。
+        assert!(
+            OLD_RULER_INPUT_CN_1024_TIER < 1024,
+            "基线常量本身必须低于默认门槛，否则测不到穿越"
+        );
+        let req_1024 = req_with_system_text("claude-sonnet-4-5", cn_sample_text(20));
+        let profile_1024 = tracker.build_profile(&req_1024).unwrap();
+        assert!(
+            profile_1024.local_total_tokens() >= 1024,
+            "新尺下应越过默认门槛 1024，实际={}",
+            profile_1024.local_total_tokens()
+        );
+        let usage_1024 = tracker.compute("threshold-1024", Some(&profile_1024), 1024);
+        assert!(
+            usage_1024.cache_creation_input_tokens > 0,
+            "越过默认门槛后 compute() 应报正的 cache_creation，实际={}",
+            usage_1024.cache_creation_input_tokens
+        );
+
+        // Opus 族 4096 档：常量须落在「已过默认档、仍未过 Opus 档」区间，
+        // 才能孤立出 Opus 档专属的穿越（而非跟默认档穿越混为一谈）。
+        assert!(
+            (1024..4096).contains(&OLD_RULER_INPUT_CN_4096_TIER),
+            "基线常量必须落在[默认档,Opus档)区间，否则测不到 Opus 档专属穿越"
+        );
+        let req_4096 = req_with_system_text("claude-opus-5", cn_sample_text(100));
+        let profile_4096 = tracker.build_profile(&req_4096).unwrap();
+        assert!(
+            profile_4096.local_total_tokens() >= 4096,
+            "新尺下应越过 Opus 门槛 4096，实际={}",
+            profile_4096.local_total_tokens()
+        );
+        let usage_4096 = tracker.compute("threshold-4096", Some(&profile_4096), 4096);
+        assert!(
+            usage_4096.cache_creation_input_tokens > 0,
+            "越过 Opus 门槛后 compute() 应报正的 cache_creation，实际={}",
+            usage_4096.cache_creation_input_tokens
+        );
+    }
+
+    /// 守恒律必须是"构造性恒等"，不能靠 `uncached_input_tokens` 的 `.max(0)`
+    /// 兜底钳出假象——即便在 `into_real` 最激进的边界(local 侧用量远超
+    /// local_total，ratio 顶到 1.0 上限)下，`real_total - cc - cr` 本身就已经
+    /// 非负，`.max(0)` 全程不生效。用最激进输入直接验证：先独立算裸减法（不
+    /// 经过 `.max(0)`），断言它本身非负；再断言 `uncached_input_tokens` 的输出
+    /// 与裸减法完全相等——若二者不等，说明守恒律依赖了钳位而非构造性恒等。
+    #[test]
+    fn conservation_holds_without_relying_on_max_zero_floor() {
+        let scaled = ScaledCacheUsage::Local {
+            usage: PromptCacheUsage {
+                cache_creation_input_tokens: 900_000,
+                cache_read_input_tokens: 900_000,
+                cache_creation_5m_input_tokens: 900_000,
+                cache_creation_1h_input_tokens: 0,
+            },
+            local_total: 10_000, // 本地用量(1_800_000) 远超 local_total，ratio 顶满
+        };
+        let real_total = 5000;
+        let real = scaled.into_real(real_total);
+
+        let raw_subtraction =
+            real_total - real.cache_creation_input_tokens - real.cache_read_input_tokens;
+        assert!(
+            raw_subtraction >= 0,
+            "裸减法(未经 .max(0))本身就必须非负，否则守恒律是被 .max(0) 钳出来的假象：\
+             raw_subtraction={raw_subtraction} cc={} cr={}",
+            real.cache_creation_input_tokens,
+            real.cache_read_input_tokens
+        );
+
+        let reported = uncached_input_tokens(real_total, real);
+        assert_eq!(
+            reported, raw_subtraction,
+            ".max(0) 不该改变结果；若二者不等，说明守恒律依赖了钳位而非构造性恒等"
+        );
     }
 }
