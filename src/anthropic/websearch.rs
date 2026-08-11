@@ -16,7 +16,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::prompt_cache::{
-    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
+    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, ScaledCacheUsage, build_usage_value,
 };
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
@@ -226,7 +226,7 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
-    prompt_cache_usage: PromptCacheUsage,
+    prompt_cache_usage: ScaledCacheUsage,
     include_prompt_cache_fields: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let events = generate_websearch_events(
@@ -253,7 +253,7 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
-    prompt_cache_usage: PromptCacheUsage,
+    prompt_cache_usage: ScaledCacheUsage,
     include_prompt_cache_fields: bool,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
@@ -546,6 +546,19 @@ pub async fn handle_websearch_request(
         )
     } else {
         PromptCacheUsage::default()
+    };
+    // WebSearch 路径完全绕开上游 metering（合成的客户端 SSE），没有 decide_prompt_cache
+    // 可用；这里的 input_tokens 本身也只是另一把本地估算尺（非上游真实值），
+    // into_real 在该场景下退化为"近似恒等缩放"（#85 设计注记）。
+    let prompt_cache_usage = match prompt_cache_profile
+        .as_ref()
+        .map(|p| p.local_total_tokens())
+    {
+        Some(local_total) => ScaledCacheUsage::Local {
+            usage: prompt_cache_usage,
+            local_total,
+        },
+        None => ScaledCacheUsage::Real(prompt_cache_usage),
     };
     let include_prompt_cache_fields = prompt_cache_profile.is_some()
         && matches!(
@@ -840,5 +853,49 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    /// #85 调用点 #6（`generate_websearch_events` 的 `build_usage_value` 调用，
+    /// 团队约定"最容易漏改"的一处）：message_start 里的 usage 字段必须满足
+    /// `input_tokens + cc + cr == real_total`，且传入 `ScaledCacheUsage::Local`
+    /// 时必须真的按比例换算（而不是被当成 `PromptCacheUsage` 直接塞进去导致编译期
+    /// 类型不匹配——本测试同时充当"这个调用点确实吃了新类型"的编译期证据）。
+    #[test]
+    fn generate_websearch_events_message_start_usage_conserves_against_real_total() {
+        let scaled = ScaledCacheUsage::Local {
+            usage: PromptCacheUsage {
+                cache_creation_input_tokens: 4000,
+                cache_read_input_tokens: 1000,
+                cache_creation_5m_input_tokens: 4000,
+                cache_creation_1h_input_tokens: 0,
+            },
+            local_total: 10_000,
+        };
+        let real_total = 5000;
+
+        let events = generate_websearch_events(
+            "claude-sonnet-4-5",
+            "test query",
+            "tool_1",
+            None,
+            real_total,
+            scaled,
+            true,
+        );
+
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should emit message_start");
+        let usage = &message_start.data["message"]["usage"];
+        let reported_input = usage["input_tokens"].as_i64().unwrap() as i32;
+        let cc = usage["cache_creation_input_tokens"].as_i64().unwrap() as i32;
+        let cr = usage["cache_read_input_tokens"].as_i64().unwrap() as i32;
+
+        assert_eq!(
+            reported_input + cc + cr,
+            real_total,
+            "守恒律：message_start usage 的 input_tokens+cc+cr 必须恒等于 real_total"
+        );
     }
 }

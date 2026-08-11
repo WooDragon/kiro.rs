@@ -411,7 +411,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+        let cache_profile = build_prompt_cache_profile(&state, &payload);
         return websearch::handle_websearch_request(
             provider,
             &payload,
@@ -482,7 +482,7 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+    let cache_profile = build_prompt_cache_profile(&state, &payload);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -530,13 +530,12 @@ pub async fn post_messages(
 fn build_prompt_cache_profile(
     state: &AppState,
     payload: &MessagesRequest,
-    input_tokens: i32,
 ) -> Option<PromptCacheProfile> {
     if matches!(
         state.prompt_cache_mode,
         PromptCacheMode::Auto | PromptCacheMode::Emulated
     ) {
-        state.prompt_cache.build_profile(payload, input_tokens)
+        state.prompt_cache.build_profile(payload)
     } else {
         None
     }
@@ -1142,6 +1141,9 @@ async fn handle_non_stream_request(
         upstream_cache_usage,
         fallback_cache_usage,
         prompt_cache_profile.is_some(),
+        prompt_cache_profile
+            .as_ref()
+            .map(|p| p.local_total_tokens()),
     );
     if matches!(
         prompt_cache_mode,
@@ -1220,7 +1222,11 @@ fn override_thinking_from_model_name(
 
 /// POST /v1/messages/count_tokens
 ///
-/// 计算消息的 token 数量
+/// 计算消息的 token 数量。
+///
+/// 注意：这是本地估算值（统一走 `crate::token` 的 tiktoken cl100k 尺子，#85），
+/// 不等同于上游 Kiro 实际计费的 token 数——上游从不在本端点路径上暴露真实值，
+/// 该端点天然只能给出估算，不承诺与 `messages` 端点最终 usage 完全一致。
 pub async fn count_tokens(
     JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
@@ -1304,7 +1310,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+        let cache_profile = build_prompt_cache_profile(&state, &payload);
         return websearch::handle_websearch_request(
             provider,
             &payload,
@@ -1375,7 +1381,7 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_profile = build_prompt_cache_profile(&state, &payload, input_tokens);
+    let cache_profile = build_prompt_cache_profile(&state, &payload);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
