@@ -502,10 +502,44 @@ struct StatsEntry {
     last_used_at: Option<String>,
 }
 
+/// sticky 子系统时钟抽象（#86），仅用于 TTL / LRU 判定。
+///
+/// 返回值语义：**自某个固定进程内基准点起的单调递增毫秒数**。绝对时刻无意义，只有差值有意义。
+///
+/// 单调性是硬约束：**生产实现只允许基于 `Instant`**，代码内禁止出现
+/// `SystemTime` / `UNIX_EPOCH` / `chrono::Utc::now`。一旦生产 NTP 回退，回退超过
+/// sticky TTL（6 小时）会让全表瞬间"过期"被清空——等于把本 PR 修的"未到阈值误清"
+/// 缺陷以更狠的形式重新引入；回退期间新写入的 last_used_at 大于后续读到的 now_ms，
+/// entry 则永不过期也永不被 LRU 选中。所有时间差调用方必须 `saturating_sub`，
+/// 不做裸减法——即便实现被改坏也只退化成"不过期"，不会 underflow 成天文数字导致全表误清。
+pub(crate) trait Clock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
+/// 生产时钟实现：基于进程启动时捕获的 `Instant` 基准，天然单调不回退。
+struct ProcessClock {
+    base: Instant,
+}
+
+impl ProcessClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+        }
+    }
+}
+
+impl Clock for ProcessClock {
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+}
+
 /// 会话粘性映射条目
 struct StickySessionEntry {
     credential_id: u64,
-    last_used_at: Instant,
+    /// 相对 `Clock::now_ms()` 基准点的毫秒数，跨进程无意义，绝不进 `save_stats` 持久化载荷。
+    last_used_at: u64,
 }
 
 // ============================================================================
@@ -600,14 +634,17 @@ pub struct MultiTokenManager {
     last_sticky_prune_at: Mutex<Option<Instant>>,
     /// 模型注册表
     model_registry: Arc<ModelRegistry>,
+    /// sticky 子系统专用时钟（#86）。生产恒为 `ProcessClock`；测试通过
+    /// `set_clock_for_test` 替换为可手动推进的实现以驱动 TTL/LRU 判定。
+    clock: Mutex<Arc<dyn Clock>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
-/// 会话粘性保留时间，避免长期运行时无界增长
-const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
+/// 会话粘性保留时间（毫秒），避免长期运行时无界增长
+const STICKY_SESSION_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 /// 会话粘性映射最大容量
 const MAX_STICKY_SESSIONS: usize = 10_000;
 /// 会话粘性全量 TTL 清理的最小间隔
@@ -754,6 +791,7 @@ impl MultiTokenManager {
             sticky_sessions: Mutex::new(HashMap::new()),
             last_sticky_prune_at: Mutex::new(None),
             model_registry,
+            clock: Mutex::new(Arc::new(ProcessClock::new())),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -786,6 +824,17 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// sticky 子系统当前时钟读数（毫秒），生产恒经 `ProcessClock`。
+    fn now_ms(&self) -> u64 {
+        self.clock.lock().now_ms()
+    }
+
+    /// 测试专用：替换 sticky 子系统时钟，驱动 TTL / LRU 判定（#86）。
+    #[cfg(test)]
+    pub(crate) fn set_clock_for_test(&self, clock: Arc<dyn Clock>) {
+        *self.clock.lock() = clock;
+    }
+
     fn is_entry_available_for_model(&self, entry: &CredentialEntry, model: Option<&str>) -> bool {
         if entry.disabled {
             return false;
@@ -809,9 +858,11 @@ impl MultiTokenManager {
         !excluded_ids.contains(&entry.id) && self.is_entry_available_for_model(entry, model)
     }
 
-    fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>) {
-        let now = Instant::now();
-        sessions.retain(|_, entry| now.duration_since(entry.last_used_at) <= STICKY_SESSION_TTL);
+    /// 关联函数（不带 `&self`）：调用方须自行提供 `now_ms`（走 `Clock`），
+    /// 以便测试可脱离完整 `MultiTokenManager` 直接驱动 TTL / LRU 判定（#86）。
+    fn prune_sticky_sessions(sessions: &mut HashMap<String, StickySessionEntry>, now_ms: u64) {
+        sessions
+            .retain(|_, entry| now_ms.saturating_sub(entry.last_used_at) <= STICKY_SESSION_TTL_MS);
 
         if sessions.len() <= MAX_STICKY_SESSIONS {
             return;
@@ -837,7 +888,7 @@ impl MultiTokenManager {
         };
 
         if should_prune_by_time || sessions.len() > MAX_STICKY_SESSIONS {
-            Self::prune_sticky_sessions(sessions);
+            Self::prune_sticky_sessions(sessions, self.now_ms());
             if should_prune_by_time {
                 *self.last_sticky_prune_at.lock() = Some(Instant::now());
             }
@@ -852,6 +903,7 @@ impl MultiTokenManager {
         let mut sessions = self.sticky_sessions.lock();
         self.maybe_prune_sticky_sessions(&mut sessions);
 
+        let now_ms = self.now_ms();
         if let Some(entry) = sessions.get_mut(session_id) {
             // 已绑定，仅刷新 last_used_at 保活，绝不覆盖 credential_id。
             // 两种情形走此分支：①命中自己（正常保活）；②本次因 fallback 用了别的凭据
@@ -859,20 +911,20 @@ impl MultiTokenManager {
             // 不变量：bind 永不改写已存在 entry 的 credential_id；
             // credential_id 变更只能由"凭据真失效 → clear → 下次首绑"完成。
             // 热路径零 String 堆分配。
-            entry.last_used_at = Instant::now();
+            entry.last_used_at = now_ms;
         } else {
             // 首次绑定：写入新 entry
             sessions.insert(
                 session_id.to_string(),
                 StickySessionEntry {
                     credential_id,
-                    last_used_at: Instant::now(),
+                    last_used_at: now_ms,
                 },
             );
         }
 
         if sessions.len() > MAX_STICKY_SESSIONS {
-            Self::prune_sticky_sessions(&mut sessions);
+            Self::prune_sticky_sessions(&mut sessions, now_ms);
         }
     }
 
@@ -899,9 +951,10 @@ impl MultiTokenManager {
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         let credential_id = {
+            let now_ms = self.now_ms();
             let mut sessions = self.sticky_sessions.lock();
             let entry = sessions.get(session_id)?;
-            if entry.last_used_at.elapsed() > STICKY_SESSION_TTL {
+            if now_ms.saturating_sub(entry.last_used_at) > STICKY_SESSION_TTL_MS {
                 sessions.remove(session_id);
                 return None;
             }
@@ -1469,7 +1522,14 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                // 原子写入：tmp 文件必须与目标同目录，再 rename 落地。
+                // 生产环境跑 Docker，stats 目录可能是独立挂载卷，
+                // 若 tmp 落在 std::env::temp_dir()/tmp 会导致跨设备 rename 报 EXDEV，
+                // 把"偶发写坏"变成"永远落不了盘"，故禁止用系统临时目录。
+                let tmp_path = path.with_extension("json.tmp");
+                if let Err(e) =
+                    std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &path))
+                {
                     tracing::warn!(error = %e, "保存统计缓存失败");
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1545,6 +1605,9 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        // #86：只有本次调用导致凭据被禁用（跨越阈值）才清 sticky，且清的是整个
+        // 凭据下所有会话；未到阈值的失败一律不清任何绑定。
+        let mut just_disabled = false;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1573,6 +1636,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                just_disabled = true;
                 tracing::error!(
                     credential_id = id,
                     failure_count = failure_count,
@@ -1598,7 +1662,9 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
-        self.clear_sticky_sessions_for_credential(id);
+        if just_disabled {
+            self.clear_sticky_sessions_for_credential(id);
+        }
         self.save_stats_debounced();
         result
     }
@@ -1663,6 +1729,11 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        // #86：与 report_failure 同构——仅在本次调用导致禁用时才清 sticky。
+        // 控制流卫生（非语义修复）：原早 return 恰好跳过了清理（语义已经正确），
+        // 但同时也会绕过尾部 save_stats_debounced()；改用 just_disabled 标志位
+        // 落在统一返回路径上，避免后人往函数尾部加逻辑被这条分支静默绕过。
+        let mut just_disabled = false;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1688,37 +1759,38 @@ impl MultiTokenManager {
                 "Token 刷新失败"
             );
 
-            if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
-            }
+            if refresh_failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+                just_disabled = true;
 
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-
-            tracing::error!(
-                credential_id = id,
-                failure_count = refresh_failure_count,
-                "Token 已连续刷新失败，已被禁用"
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    credential_id = next.id,
-                    priority = next.credentials.priority,
-                    "已切换到新凭据"
+                tracing::error!(
+                    credential_id = id,
+                    failure_count = refresh_failure_count,
+                    "Token 已连续刷新失败，已被禁用"
                 );
-                true
-            } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        credential_id = next.id,
+                        priority = next.credentials.priority,
+                        "已切换到新凭据"
+                    );
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                }
             }
+
+            entries.iter().any(|e| !e.disabled)
         };
-        self.clear_sticky_sessions_for_credential(id);
+        if just_disabled {
+            self.clear_sticky_sessions_for_credential(id);
+        }
         self.save_stats_debounced();
         result
     }
@@ -2384,6 +2456,31 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// 测试专用时钟（#86）：AtomicU64 手动推进，只增不减，
+    /// 用于精确驱动 sticky TTL / LRU 的边界判定，避免真实 sleep 拖慢测试。
+    struct TestClock {
+        now_ms: AtomicU64,
+    }
+
+    impl TestClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now_ms: AtomicU64::new(0),
+            })
+        }
+
+        fn advance_ms(&self, delta_ms: u64) {
+            self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.load(Ordering::SeqCst)
+        }
+    }
 
     fn test_registry() -> Arc<ModelRegistry> {
         Arc::new(ModelRegistry::from_toml(include_str!("../../models.toml")).unwrap())
@@ -3834,5 +3931,459 @@ mod tests {
 
         // 补充：clear_sticky_session_if_matches 唯一调用方应为 select_sticky_credential
         // （acquire 路径已删除两处 clear 调用，grep 确认见交付报告）
+    }
+
+    // ----------------------------------------------------------------
+    // BDD: #86 —— sticky 清除时机可靠化
+    // ----------------------------------------------------------------
+
+    /// Scenario: 单次失败未达阈值时，绝不清任何 sticky 绑定（核心回归）
+    ///
+    /// Given  balanced 模式，凭据 1/2；session-A、session-B 均已绑定到凭据 1
+    /// When   对凭据 1 上报一次失败（MAX_FAILURES_PER_CREDENTIAL=3，1 < 3，未达阈值）
+    /// Then   两个 session 的 sticky 绑定原样保留，凭据 1 仍处于启用状态
+    #[test]
+    fn test_failure_below_threshold_clears_no_sticky() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-A", 1);
+        manager.bind_sticky_session("session-B", 1);
+
+        let has_available = manager.report_failure(1);
+
+        assert!(has_available, "未达阈值时仍应有可用凭据");
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-A")
+                .map(|e| e.credential_id),
+            Some(1),
+            "未达阈值的失败不应清除 session-A 的 sticky 绑定"
+        );
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-B")
+                .map(|e| e.credential_id),
+            Some(1),
+            "未达阈值的失败不应清除 session-B 的 sticky 绑定"
+        );
+        assert!(
+            !manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled,
+            "未达阈值时凭据不应被禁用"
+        );
+    }
+
+    /// Scenario: 累计失败达到阈值触发禁用时，批量清除该凭据下所有 session 的 sticky
+    ///
+    /// Given  balanced 模式，session-A、session-B 均已绑定到凭据 1
+    /// When   连续 3 次上报失败，第 3 次跨越 MAX_FAILURES_PER_CREDENTIAL 触发禁用
+    /// Then   凭据 1 被禁用，session-A、session-B 的 sticky 绑定均被清除
+    #[test]
+    fn test_failure_at_threshold_clears_all_sessions_on_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-A", 1);
+        manager.bind_sticky_session("session-B", 1);
+
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1); // 第 3 次达到阈值，触发禁用
+
+        assert!(
+            manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled,
+            "达到阈值后凭据应被禁用"
+        );
+        assert!(
+            !manager.sticky_sessions.lock().contains_key("session-A"),
+            "凭据被禁用后 session-A 的 sticky 绑定应被清除"
+        );
+        assert!(
+            !manager.sticky_sessions.lock().contains_key("session-B"),
+            "凭据被禁用后 session-B 的 sticky 绑定应被清除"
+        );
+    }
+
+    /// Scenario: 路径一端到端——excluded_ids 只是本次请求临时跳过，不代表凭据真失效
+    ///
+    /// Given  session-X 已绑定凭据 1，凭据 1、2 均启用
+    /// When   本次请求把凭据 1 放进 excluded_ids 后走完整 acquire 流程，回落到凭据 2 并成功
+    /// Then   sticky 仍指向凭据 1（不因临时排除而被重新绑定到凭据 2）
+    #[tokio::test]
+    async fn test_excluded_credential_falls_back_without_rebinding() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-X", 1);
+
+        let excluded = HashSet::from([1]);
+        let ctx = manager
+            .acquire_context_for_session_excluding(None, Some("session-X"), &excluded)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "凭据 1 被本次请求排除时应回落到凭据 2");
+
+        manager.report_success_for_session(ctx.id, Some("session-X"));
+
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-X")
+                .map(|e| e.credential_id),
+            Some(1),
+            "excluded 只是本次请求临时跳过，不代表凭据 1 真失效，sticky 不应被重新绑定到凭据 2"
+        );
+    }
+
+    /// Scenario: 路径二端到端——凭据真失效后，session 迁移并重新粘住新凭据
+    ///
+    /// Given  session-Y 已成功绑定凭据 1
+    /// When   凭据 1 连续失败到阈值被真实禁用（批量清 sticky），session-Y 再次请求
+    /// Then   请求迁移到凭据 2 并成功，sticky 重新粘住凭据 2（不漂回也不失败）
+    #[tokio::test]
+    async fn test_disabled_credential_migrates_and_sticks_to_new() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-Y"))
+            .await
+            .unwrap();
+        assert_eq!(first.id, 1);
+        manager.report_success_for_session(first.id, Some("session-Y"));
+
+        // 凭据 1 连续失败到阈值，触发真实禁用 + 批量清 sticky
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+        assert!(
+            manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled
+        );
+        assert!(!manager.sticky_sessions.lock().contains_key("session-Y"));
+
+        // 迁移：session-Y 再次请求应落到凭据 2 并重新首绑
+        let migrated = manager
+            .acquire_context_for_session(None, Some("session-Y"))
+            .await
+            .unwrap();
+        assert_eq!(migrated.id, 2, "凭据 1 已禁用，session 应迁移到凭据 2");
+        manager.report_success_for_session(migrated.id, Some("session-Y"));
+
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-Y")
+                .map(|e| e.credential_id),
+            Some(2),
+            "迁移后应重新粘住凭据 2，不漂回也不失败"
+        );
+    }
+
+    /// Scenario: report_refresh_failure 控制流整理后，未达阈值仍不清 sticky（对称覆盖）
+    ///
+    /// 证明 #86 的控制流卫生改动（早 return 改为落在统一返回路径）没有改变行为：
+    /// 未达阈值时 clear 与 save_stats_debounced() 是否被跳过，语义必须与整理前逐字节等价。
+    #[test]
+    fn test_refresh_failure_below_threshold_clears_no_sticky() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-A", 1);
+
+        let has_available = manager.report_refresh_failure(1);
+
+        assert!(has_available, "未达阈值时仍应有可用凭据");
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-A")
+                .map(|e| e.credential_id),
+            Some(1),
+            "未达阈值的刷新失败不应清除 sticky 绑定（控制流整理前后行为必须等价）"
+        );
+        assert!(
+            !manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled,
+            "未达阈值时凭据不应被禁用"
+        );
+    }
+
+    /// Scenario: 窄竞态——sticky 命中后 reserve 失败，acquire 路径不直接清 sticky
+    ///
+    /// Given  session-Z 已通过 select_sticky_credential 真实命中凭据 1（凭据此时仍启用）
+    /// When   命中与 reserve 之间凭据 1 被禁用（模拟并发窗口，不经过任何 report_*，
+    ///        故不会触发批量清理），再调用 reserve_existing_credential_excluding(1, ...)
+    ///        复现 acquire 路径紧接着的第二步
+    /// Then   reserve 返回 None（凭据已不可用），但 sticky_sessions 中 session-Z 的绑定
+    ///        原样保留——这条窄竞态分支不做自清理，交由触发禁用那次 report_* 的批量
+    ///        清理收尾（是"够用"而非遗漏）
+    #[test]
+    fn test_narrow_race_reserve_fail_does_not_clear_sticky_directly() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-Z", 1);
+
+        // 凭据仍启用时先真实命中，还原 acquire 路径的第一步
+        let hit = manager.select_sticky_credential("session-Z", None, &HashSet::new());
+        assert_eq!(hit.map(|(id, _)| id), Some(1), "命中时凭据 1 应仍启用");
+
+        // 模拟窄竞态窗口：命中后、reserve 前凭据被禁用。直接改 entries 里的
+        // disabled 标志，而不经过 set_disabled/report_failure/report_refresh_failure
+        // 这些会顺带调用 clear_sticky_sessions_for_credential 的入口——生产中所有
+        // 真实禁用路径都会触发批量清理，此处刻意绕开它们，才能精确复现
+        // "只禁用、不批量清理"这条窄竞态窗口，验证 acquire 路径自身不做自清理。
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 1).unwrap().disabled = true;
+        }
+
+        let reserved = manager.reserve_existing_credential_excluding(1, None, &HashSet::new());
+        assert!(reserved.is_none(), "凭据已禁用，reserve 应失败");
+
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-Z")
+                .map(|e| e.credential_id),
+            Some(1),
+            "reserve 失败的窄竞态分支不应自行清 sticky，交由禁用来源的批量清理负责"
+        );
+    }
+
+    /// Scenario: excluded_ids 命中时 select_sticky_credential 直接返回 None，不清 entry
+    ///
+    /// Given  session-W 已绑定凭据 1，凭据 1 仍启用
+    /// When   本次请求把凭据 1 放进 excluded_ids（临时跳过，非真失效）后调用
+    ///        select_sticky_credential
+    /// Then   返回 None，但 sticky_sessions 中的绑定原样保留
+    #[test]
+    fn test_excluded_ids_hit_does_not_clear_entry() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-W", 1);
+
+        let excluded = HashSet::from([1]);
+        let hit = manager.select_sticky_credential("session-W", None, &excluded);
+
+        assert!(hit.is_none(), "凭据 1 在 excluded_ids 中时应直接未命中");
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-W")
+                .map(|e| e.credential_id),
+            Some(1),
+            "excluded_ids 命中分支不应清除 entry（只是本次请求跳过，非凭据真失效）"
+        );
+    }
+
+    /// Scenario: sticky 绑定超过 TTL（6 小时）后应被判定过期并移除
+    #[test]
+    fn test_sticky_ttl_expiry_removes_entry() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![valid_access_credential("token-1", 0)],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        let clock = TestClock::new();
+        manager.set_clock_for_test(clock.clone());
+
+        manager.bind_sticky_session("session-TTL", 1);
+        assert_eq!(
+            manager
+                .sticky_sessions
+                .lock()
+                .get("session-TTL")
+                .map(|e| e.credential_id),
+            Some(1)
+        );
+
+        // 推进超过 TTL
+        clock.advance_ms(STICKY_SESSION_TTL_MS + 1);
+
+        let hit = manager.select_sticky_credential("session-TTL", None, &HashSet::new());
+        assert!(hit.is_none(), "超过 TTL 的绑定不应再被命中");
+        assert!(
+            !manager.sticky_sessions.lock().contains_key("session-TTL"),
+            "select_sticky_credential 判定过期时应顺带移除该 entry"
+        );
+    }
+
+    /// Scenario: 会话粘性映射超过 LRU 容量上限时，最久未使用的 entry 应最先被淘汰
+    ///
+    /// 用 TestClock 手动推进而非真实 sleep：真实时钟在同一测试内几乎同时完成，
+    /// 精度不足以让 last_used_at 彼此可区分，无法驱动确定性 LRU 断言，
+    /// 这正是引入 Clock 抽象要解决的问题。
+    #[test]
+    fn test_sticky_lru_eviction_removes_oldest_first() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![valid_access_credential("token-1", 0)],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        let clock = TestClock::new();
+        manager.set_clock_for_test(clock.clone());
+
+        // 逐个绑定 MAX_STICKY_SESSIONS + 1 个 session，每次推进 1ms，
+        // 保证 last_used_at 严格递增、彼此可区分。
+        for i in 0..=MAX_STICKY_SESSIONS {
+            manager.bind_sticky_session(&format!("session-{i}"), 1);
+            clock.advance_ms(1);
+        }
+
+        let sessions = manager.sticky_sessions.lock();
+        assert_eq!(
+            sessions.len(),
+            MAX_STICKY_SESSIONS,
+            "超出上限后应被裁剪回容量上限"
+        );
+        assert!(
+            !sessions.contains_key("session-0"),
+            "最久未使用（最早绑定）的 session-0 应被优先淘汰"
+        );
+        assert!(
+            sessions.contains_key(&format!("session-{MAX_STICKY_SESSIONS}")),
+            "最近绑定的 session 应保留"
+        );
     }
 }

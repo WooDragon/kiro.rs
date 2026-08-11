@@ -203,7 +203,7 @@ impl std::error::Error for ConversionError {}
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
 /// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(session_id) = json.get("session_id").and_then(|v| v.as_str())
@@ -212,9 +212,12 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         return Some(session_id.to_string());
     }
 
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
+    // 回退到字符串格式：从右向左匹配 "_session_"（带前导下划线）。
+    // 真实格式恒为 user_<hash>_account__session_<uuid>，而 <hash> 段来自外部输入
+    // （例如用户名恰好含 "_session_" 字面串），从左向右 find 会在伪匹配处提前截断，
+    // 拿到无效串后整体退化为随机 UUID、彻底丧失粘性（#86）。UUID 恒在字符串末尾，
+    // 用 rsplit_once 从右向左匹配才与真实格式契合。
+    if let Some((_, session_part)) = user_id.rsplit_once("_session_") {
         if session_part.len() >= 36 {
             let uuid_str = &session_part[..36];
             if is_valid_uuid(uuid_str) {
@@ -2538,6 +2541,21 @@ mod tests {
         let user_id = "user_xxx_session_zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz";
         let session_id = extract_session_id(user_id);
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_json_key_name_does_not_leak_into_substring_fallback() {
+        // Scenario: user_id 里的 hash 段来自外部输入（如用户名恰好含 "_session_" 字面串），
+        // Given 一个内嵌了伪 "_session_" 干扰串（my_session_bot）的 user_id，
+        // When 提取 session id，
+        // Then 必须命中末尾真实的 "_session_<UUID>"，而不是被中段的伪匹配提前截断。
+        let user_id = "user_my_session_bot_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id,
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string()),
+            "用户名内含 _session_ 干扰串时，仍应提取末尾真实 session UUID"
+        );
     }
 
     #[test]

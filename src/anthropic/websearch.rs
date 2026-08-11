@@ -514,8 +514,16 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
+    // 2.5 提取 session id，复用 converter.rs 的解析逻辑，使 WebSearch 请求
+    // 也能命中同一会话的粘性凭据绑定（#86），避免与主对话链路各绑各的。
+    let session_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| super::converter::extract_session_id(user_id));
+
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
+    let search_results = match call_mcp_api(&provider, &mcp_request, session_id.as_deref()).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
             tracing::warn!(error = %e, "MCP API 调用失败");
@@ -577,6 +585,7 @@ pub async fn handle_websearch_request(
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    session_id: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
@@ -587,7 +596,7 @@ async fn call_mcp_api(
         "MCP request"
     );
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = provider.call_mcp(&request_body, session_id).await?;
 
     let body = response.text().await?;
     tracing::debug!(
