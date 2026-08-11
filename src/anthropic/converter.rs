@@ -2572,6 +2572,11 @@ mod tests {
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
         );
+        // PR-0：session_id_extracted 的取值来源即 stable_conversation_id.is_some()。
+        assert!(
+            result.stable_conversation_id.is_some(),
+            "session_id_extracted 应为 true：客户端传入了有效 session_id"
+        );
     }
 
     #[test]
@@ -2608,6 +2613,11 @@ mod tests {
                 .filter(|c| *c == '-')
                 .count(),
             4
+        );
+        // PR-0：无 metadata 时退回随机 UUID 兜底，session_id_extracted 应为 false。
+        assert!(
+            result.stable_conversation_id.is_none(),
+            "session_id_extracted 应为 false：无 metadata 时退回随机 UUID 兜底"
         );
     }
 

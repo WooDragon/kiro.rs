@@ -61,6 +61,79 @@ pub(crate) fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, st
     }
 }
 
+/// PR-0（可观测性，零行为变更）：在既有 `request outcome` 事件上补充 4 个结构化字段
+/// （credential_id / sticky_hit / session_id_extracted / cache_bucket_kind），
+/// 供 jq 交叉聚合"哪个凭据处理了多少请求、sticky 命中率、session_id 提取成功率、
+/// 缓存分桶方式"。事件名与 `req_outcome` 语义逐字不变，只是集中成一个函数以免
+/// 12 处调用点各自手写字段名时写歪。
+///
+/// PR-0 返工（redteam MUST FIX 1）：上一版这里写"凭据获取阶段本身失败时这 4 个
+/// 字段无从谈起"，对 `handle_non_stream_request` 里 body 中途断连（#64 场景）那个
+/// 调用点是错的——那里凭据早已成功获取（`api_response` 在作用域内），只是读
+/// 响应体这一步失败。真正"字段无从谈起"的是 `map_provider_error` 另外 4 个
+/// 调用点（凭据获取阶段本身失败的 `Err` 分支，压根没有 `api_response`）：
+/// 这批失败绝对量小、且请求压根没到达上游，缓存分桶讨论意义有限，故维持裸
+/// `tracing::info!` 不接入本函数。#71 的 `status × req_outcome` 四态交叉表本就
+/// 设计为容忍字段稀疏，不要求每条 `request outcome` 都带满 4 个字段。
+///
+/// `credential_id`/`sticky_hit` 用 `Option` 而非裸值：前者是 redteam 采纳建议 2
+/// （`0` 是凭据文件里合法可手写的 id，不能当"未回填"哨兵）；后者是 MUST FIX 2
+/// 的三态语义（`None` = 会话粘性机制未启用 / priority 模式，不是"未命中"）。
+/// MUST FIX 2 的三态语义落地：`sticky_hit` 是 `Option<bool>` 而非裸 `bool`，
+/// `None` 表示"会话粘性机制未启用 / priority 模式"，不是"未命中"——两者混淆
+/// 会让 sticky 命中率统计把"压根没跑这个机制"的请求错记成失败样本。抽成独立
+/// 纯函数（而非留在 `tracing::info!` 宏调用内联 `match`），是为了让 `n_a` 这一支
+/// 能被单测直接断言到：不然这条防复发线只能靠"起 subscriber 抓事件字段"这种
+/// 重量级验证，MUST FIX 2 真正修的语义反而没有一个轻量断言钉住它。
+fn sticky_hit_label(sticky_hit: Option<bool>) -> &'static str {
+    match sticky_hit {
+        Some(true) => "hit",
+        Some(false) => "miss",
+        None => "n_a",
+    }
+}
+
+fn log_request_outcome(
+    req_outcome: &str,
+    credential_id: Option<u64>,
+    sticky_hit: Option<bool>,
+    session_id_extracted: bool,
+    cache_bucket_kind: &str,
+) {
+    tracing::info!(
+        req_outcome = req_outcome,
+        credential_id,
+        sticky_hit = sticky_hit_label(sticky_hit),
+        session_id_extracted,
+        cache_bucket_kind,
+        "request outcome"
+    );
+}
+
+/// PR-0 返工（redteam 采纳建议 1）：`cache_bucket_kind` 从实际构造出的
+/// `account_key` 字符串取前缀，而不是重新判断一次 `stable_conversation_id`
+/// 分支——避免这个字段沦为分桶逻辑的复制品：`account_key` 的构造规则将来变了，
+/// 这个字段自动跟着变，不会有旁路判断悄悄脱节。
+///
+/// 第二轮返工（redteam 二次纠正）：不做"未识别前缀 → 兜底成已知值"的映射。
+/// 第一版把不认识的前缀兜底成 `"cred"`，是同一个"字段脱离真相"的毛病换了个
+/// 位置——将来真加了第三种桶，字段会言之凿凿地报一个看起来正常、实际错误
+/// 的 `"cred"`，比报一个没见过的新前缀更危险（后者一眼看出有新东西，前者会
+/// 安静污染聚合结果），还需要有人记得同步维护这张前缀白名单，多一处必然腐化
+/// 的耦合。改为直接返回 `account_key` 里 `':'` 之前的实际前缀，不映射、不兜底
+/// 重写；没有 `':'`（如 `websearch.rs:528` 的裸 `"websearch"`）就返回整串，
+/// 不 panic、不 unwrap。返回类型放宽成 `String`——前缀是从运行时字符串切出来的
+/// 借用，而调用点普遍要跨越 `account_key` 被移动（如 `.with_prompt_cache(...,
+/// Some(account_key), ...)`）之后继续使用，无法维持 `&'static str` 或对
+/// `account_key` 的借用，遂用小额堆分配换掉映射表这个持续腐化点。
+fn cache_bucket_kind_from_account_key(account_key: &str) -> String {
+    account_key
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(account_key)
+        .to_string()
+}
+
 /// 构建并序列化 KiroRequest。
 ///
 /// # 参数
@@ -84,6 +157,26 @@ fn finalize_request_body(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
+    map_provider_error_with_outcome(err, None)
+}
+
+/// PR-0 返工（redteam MUST FIX 1）：`map_provider_error` 的可观测性增强版本。
+///
+/// `handle_non_stream_request` 里 body 中途断连（#64 场景）那个调用点，凭据早已
+/// 成功获取，`api_response` 的 4 个可观测性字段都是现成的、不该在走这条错误
+/// 路径时凭空丢失——但也不能给 `map_provider_error` 本身加参数，那会牵动全部
+/// ~13 个既有测试调用点。拆成"核心逻辑 + 可选字段"两层：`outcome_fields` 为
+/// `None` 时走原有裸 `tracing::info!(req_outcome = ..)`，逐字不变；为 `Some(..)`
+/// 时改走 `log_request_outcome` 补齐 4 个字段。两个分支共用同一个 `tracing::info!`
+/// 调用点（`match` 内部条件分叉，不是并列的两条语句），因此对任意一次调用，
+/// 结局事件只会被发出恰好一次——不可能是 0 次（函数内没有能跳过发射的提前
+/// return）,也不可能是 2 次（`Some`/`None` 分支互斥，同一次调用只落进其中一支）。
+/// `map_provider_error(err)` 保留原公开签名，作为 `None` 转发的薄包装，公开行为
+/// 与既有测试期望逐字不变。
+fn map_provider_error_with_outcome(
+    err: Error,
+    outcome_fields: Option<(Option<u64>, Option<bool>, bool, &str)>,
+) -> Response {
     use crate::kiro::provider::ProviderError;
 
     if let Some(pe) = err.downcast_ref::<ProviderError>() {
@@ -192,7 +285,18 @@ fn map_provider_error(err: Error) -> Response {
         // req_outcome 统一以字符串字段记录（不加 %）：`%` 走 Display→record_debug，
         // 与其余发射点的 record_str 提取路径不一致，会让捕获层/JSON 里同一字段
         // 时而带引号时而不带，污染 jq 聚合。error_type 是 &str 可直接传。
-        tracing::info!(req_outcome = error_type, "request outcome");
+        match outcome_fields {
+            Some((credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)) => {
+                log_request_outcome(
+                    error_type,
+                    credential_id,
+                    sticky_hit,
+                    session_id_extracted,
+                    cache_bucket_kind,
+                );
+            }
+            None => tracing::info!(req_outcome = error_type, "request outcome"),
+        }
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
@@ -205,7 +309,18 @@ fn map_provider_error(err: Error) -> Response {
         response
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败（未分类错误）");
-        tracing::info!(req_outcome = "api_error", "request outcome");
+        match outcome_fields {
+            Some((credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)) => {
+                log_request_outcome(
+                    "api_error",
+                    credential_id,
+                    sticky_hit,
+                    session_id_extracted,
+                    cache_bucket_kind,
+                );
+            }
+            None => tracing::info!(req_outcome = "api_error", "request outcome"),
+        }
         (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -451,10 +566,16 @@ async fn handle_stream_request(
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
+    // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
+    let session_id_extracted = stable_conversation_id.is_some();
     let account_key = match stable_conversation_id {
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let fallback_cache_usage = prompt_cache.compute(
         &account_key,
@@ -478,6 +599,12 @@ async fn handle_stream_request(
         Some(account_key),
         prompt_cache_profile,
         fallback_cache_usage,
+    )
+    .with_observability(
+        api_response.credential_id,
+        api_response.sticky_hit,
+        session_id_extracted,
+        cache_bucket_kind,
     );
 
     // 生成初始事件
@@ -627,9 +754,12 @@ fn create_sse_stream(
                                     elapsed_secs = elapsed.as_secs(),
                                     "读取响应流失败"
                                 );
-                                tracing::info!(
-                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
-                                    "request outcome"
+                                log_request_outcome(
+                                    if transient { "overloaded_error" } else { "api_error" },
+                                    ctx.credential_id,
+                                    ctx.sticky_hit,
+                                    ctx.session_id_extracted,
+                                    &ctx.cache_bucket_kind,
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
                                     super::stream::error_sse_event(failure).to_sse_string(),
@@ -643,10 +773,22 @@ fn create_sse_stream(
                                 // 与非流式路径（handlers.rs 空响应分支）措辞对齐。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
-                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
+                                    log_request_outcome(
+                                        "overloaded_error",
+                                        ctx.credential_id,
+                                        ctx.sticky_hit,
+                                        ctx.session_id_extracted,
+                                        &ctx.cache_bucket_kind,
+                                    );
                                     vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
-                                    tracing::info!(req_outcome = "success", "request outcome");
+                                    log_request_outcome(
+                                        "success",
+                                        ctx.credential_id,
+                                        ctx.sticky_hit,
+                                        ctx.session_id_extracted,
+                                        &ctx.cache_bucket_kind,
+                                    );
                                     ctx.generate_final_events()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -697,10 +839,16 @@ async fn handle_non_stream_request(
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
+    // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
+    let session_id_extracted = stable_conversation_id.is_some();
     let account_key = match stable_conversation_id {
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let fallback_cache_usage = prompt_cache.compute(
         &account_key,
@@ -726,10 +874,30 @@ async fn handle_non_stream_request(
                     detail: format!("上游响应体读取中断: {}", e),
                 }
                 .into();
-                return map_provider_error(provider_err);
+                // PR-0 返工（redteam MUST FIX 1）：这里凭据早已成功获取
+                // （`api_response` 在作用域内），走 map_provider_error 不该白白
+                // 丢掉 4 个可观测性字段——尤其这正是 #64 记录的真实故障场景
+                // （上游 HTTP/2 RST 中途冲断），是最该定位到具体凭据的一类失败，
+                // 漏记还会拉低 sticky 命中率分母。改走
+                // map_provider_error_with_outcome 带上字段，机制见该函数文档。
+                return map_provider_error_with_outcome(
+                    provider_err,
+                    Some((
+                        Some(api_response.credential_id),
+                        api_response.sticky_hit,
+                        session_id_extracted,
+                        &cache_bucket_kind,
+                    )),
+                );
             }
             // 非瞬态分支绕过 map_provider_error，结局事件在此单独补发。
-            tracing::info!(req_outcome = "api_error", "request outcome");
+            log_request_outcome(
+                "api_error",
+                Some(api_response.credential_id),
+                api_response.sticky_hit,
+                session_id_extracted,
+                &cache_bucket_kind,
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -944,7 +1112,13 @@ async fn handle_non_stream_request(
             model = model,
             "上游响应为空（无内容且无显式终止信号），返回可重试错误以触发客户端重试"
         );
-        tracing::info!(req_outcome = "overloaded_error", "request outcome");
+        log_request_outcome(
+            "overloaded_error",
+            Some(api_response.credential_id),
+            api_response.sticky_hit,
+            session_id_extracted,
+            &cache_bucket_kind,
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -980,7 +1154,13 @@ async fn handle_non_stream_request(
         );
     }
 
-    tracing::info!(req_outcome = "success", "request outcome");
+    log_request_outcome(
+        "success",
+        Some(api_response.credential_id),
+        api_response.sticky_hit,
+        session_id_extracted,
+        &cache_bucket_kind,
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1295,6 +1475,9 @@ async fn handle_stream_request_prefix_buffered(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
+    // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
+    let session_id_extracted = stable_conversation_id.is_some();
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
@@ -1302,6 +1485,9 @@ async fn handle_stream_request_prefix_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let context_window = model_registry.context_window(model);
     let fallback_cache_usage = prompt_cache.compute(
@@ -1324,6 +1510,12 @@ async fn handle_stream_request_prefix_buffered(
         Some(account_key),
         prompt_cache_profile,
         fallback_cache_usage,
+    )
+    .with_observability(
+        api_response.credential_id,
+        api_response.sticky_hit,
+        session_id_extracted,
+        cache_bucket_kind,
     );
 
     // 在 handler 仍处于 req span 上下文中时捕获当前 span。
@@ -1427,10 +1619,17 @@ fn create_prefix_buffered_sse_stream(
                                     elapsed_secs = elapsed.as_secs(),
                                     "读取响应流失败"
                                 );
-                                tracing::info!(
-                                    req_outcome = if transient { "overloaded_error" } else { "api_error" },
-                                    "request outcome"
-                                );
+                                {
+                                    let (credential_id, sticky_hit, session_id_extracted, cache_bucket_kind) =
+                                        ctx.observability();
+                                    log_request_outcome(
+                                        if transient { "overloaded_error" } else { "api_error" },
+                                        credential_id,
+                                        sticky_hit,
+                                        session_id_extracted,
+                                        &cache_bucket_kind,
+                                    );
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
                                     super::stream::error_sse_event(failure).to_sse_string(),
                                 ))];
@@ -1449,10 +1648,26 @@ fn create_prefix_buffered_sse_stream(
                                 // #83：干净结束零产出改用 EmptyResponse 变体，与非流式路径对齐措辞。
                                 let final_events = if ctx.is_empty_response() {
                                     tracing::error!("上游响应为空（无内容），返回 error 事件以触发客户端重试");
-                                    tracing::info!(req_outcome = "overloaded_error", "request outcome");
+                                    let (credential_id, sticky_hit, session_id_extracted, cache_bucket_kind) =
+                                        ctx.observability();
+                                    log_request_outcome(
+                                        "overloaded_error",
+                                        credential_id,
+                                        sticky_hit,
+                                        session_id_extracted,
+                                        &cache_bucket_kind,
+                                    );
                                     vec![super::stream::error_sse_event(super::stream::StreamFailure::EmptyResponse)]
                                 } else {
-                                    tracing::info!(req_outcome = "success", "request outcome");
+                                    let (credential_id, sticky_hit, session_id_extracted, cache_bucket_kind) =
+                                        ctx.observability();
+                                    log_request_outcome(
+                                        "success",
+                                        credential_id,
+                                        sticky_hit,
+                                        session_id_extracted,
+                                        &cache_bucket_kind,
+                                    );
                                     ctx.finish()
                                 };
                                 let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1500,6 +1715,9 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
+    // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
+    let session_id_extracted = stable_conversation_id.is_some();
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
@@ -1507,6 +1725,9 @@ async fn handle_stream_request_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let context_window = model_registry.context_window(model);
     let fallback_cache_usage = prompt_cache.compute(
@@ -1530,6 +1751,12 @@ async fn handle_stream_request_buffered(
         Some(account_key),
         prompt_cache_profile,
         fallback_cache_usage,
+    )
+    .with_observability(
+        api_response.credential_id,
+        api_response.sticky_hit,
+        session_id_extracted,
+        cache_bucket_kind,
     );
 
     // 在 handler 仍处于 req span 上下文中时捕获当前 span。
@@ -1616,14 +1843,25 @@ fn create_buffered_sse_stream(
                                 elapsed_secs = elapsed.as_secs(),
                                 "读取响应流失败"
                             );
-                            tracing::info!(
-                                req_outcome = if transient {
-                                    "overloaded_error"
-                                } else {
-                                    "api_error"
-                                },
-                                "request outcome"
-                            );
+                            {
+                                let (
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    cache_bucket_kind,
+                                ) = ctx.observability();
+                                log_request_outcome(
+                                    if transient {
+                                        "overloaded_error"
+                                    } else {
+                                        "api_error"
+                                    },
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    &cache_bucket_kind,
+                                );
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
                                 super::stream::error_sse_event(failure).to_sse_string(),
                             ))];
@@ -1637,12 +1875,36 @@ fn create_buffered_sse_stream(
                                 tracing::error!(
                                     "上游响应为空（无内容），返回 error 事件以触发客户端重试"
                                 );
-                                tracing::info!(req_outcome = "overloaded_error", "request outcome");
+                                let (
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    cache_bucket_kind,
+                                ) = ctx.observability();
+                                log_request_outcome(
+                                    "overloaded_error",
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    &cache_bucket_kind,
+                                );
                                 vec![super::stream::error_sse_event(
                                     super::stream::StreamFailure::EmptyResponse,
                                 )]
                             } else {
-                                tracing::info!(req_outcome = "success", "request outcome");
+                                let (
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    cache_bucket_kind,
+                                ) = ctx.observability();
+                                log_request_outcome(
+                                    "success",
+                                    credential_id,
+                                    sticky_hit,
+                                    session_id_extracted,
+                                    &cache_bucket_kind,
+                                );
                                 ctx.finish_and_get_all_events()
                             };
                             let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -2511,6 +2773,86 @@ mod tests {
         );
     }
 
+    /// BDD（PR-0 返工，redteam 采纳建议 2）：`credential_id: Option<u64>` 为
+    /// `None` 时字段必须从事件里彻底缺席，而不是以 `null` 或任何其他形式出现——
+    /// 这是"用 `Option` 让未回填字段在日志里缺席，而不是伪造 `0` 当哨兵值"这一
+    /// 设计选择的可运行背书，不满足黑盒实测背书就凭推断落笔的仓库纪律。
+    ///
+    /// 验证手段：`tracing_core::Value for Option<T>` 的行为发生在
+    /// `Value::record` 这一层——`None` 时该实现直接不调用 visitor 的任何
+    /// `record_*` 方法，这比"序列化成 JSON 后拿 jq 校验字段缺席"更贴近断言对象
+    /// 本身（JSON 输出只是这一行为的下游表现，不是它的定义处）。用一个只认
+    /// `credential_id` 字段名的 Visitor，比较"字段名是否曾被访问过"而非其值。
+    #[test]
+    fn test_none_credential_id_omitted_from_event_fields() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        /// 只关心 "credential_id" 这一个字段名是否被 visitor 访问过——
+        /// 不关心值本身，因为本测试要证的是"访问与否"而非"访问到什么"。
+        struct FieldPresenceVisitor {
+            seen: Vec<&'static str>,
+        }
+
+        impl tracing::field::Visit for FieldPresenceVisitor {
+            fn record_u64(&mut self, field: &tracing::field::Field, _value: u64) {
+                if field.name() == "credential_id" {
+                    self.seen.push("credential_id");
+                }
+            }
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "credential_id" {
+                    self.seen.push("credential_id");
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct PresenceFlags(Arc<Mutex<Vec<bool>>>);
+
+        struct PresenceLayer(PresenceFlags);
+
+        impl<S> Layer<S> for PresenceLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldPresenceVisitor { seen: Vec::new() };
+                event.record(&mut visitor);
+                self.0.0.lock().unwrap().push(!visitor.seen.is_empty());
+            }
+        }
+
+        let flags = PresenceFlags::default();
+        let layer = PresenceLayer(flags.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // 第一条：credential_id = Some(7) —— 字段必须被访问到。
+            log_request_outcome("success", Some(7), Some(true), true, "conv");
+            // 第二条：credential_id = None —— 字段必须彻底缺席，不调用任何
+            // record_* 方法（不是"调用了但值是空"，是压根没调用）。
+            log_request_outcome("api_error", None, None, false, "cred");
+        });
+
+        let flags = flags.0.lock().unwrap();
+        assert_eq!(flags.len(), 2, "应捕获 2 条 request outcome 事件");
+        assert!(
+            flags[0],
+            "credential_id = Some(7) 时字段应被 visitor 访问到，实际未访问"
+        );
+        assert!(
+            !flags[1],
+            "credential_id = None 时字段应从事件中彻底缺席，实际仍被 visitor 访问到"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #64 BDD S1/S1b/S2 — create_sse_stream 端到端收尾语义
     //
@@ -3007,4 +3349,40 @@ mod tests {
     // 也是与 test_map_all_credentials_disabled_gives_503 等测试相同的
     // ErrorResponse::new 构造路径，无需再搭一套 provider 才能验证格式正确性。
     // -----------------------------------------------------------------------
+
+    /// BDD（redteam SUGGESTION-2）：`sticky_hit_label` 三态映射的纯函数级钉子。
+    ///
+    /// 重点是 `None → "n_a"` 这一支——它是 MUST FIX 2 的全部内容（`Option<bool>`
+    /// 而非裸 `bool`，`None` 语义是"会话粘性未启用/priority 模式"而非"未命中"）。
+    /// 之前这个函数没有独立单测，`test_none_credential_id_omitted_from_event_fields`
+    /// 只验证了 `credential_id` 字段的缺席行为，从未断言过 `sticky_hit` 的三态取
+    /// 值本身——把 `None => "n_a"` 悄悄改回 `"miss"`，或把 `Option<bool>` 塌回
+    /// `bool`，415 个既有测试全绿，MUST FIX 2 修的缺陷会原样复活。
+    #[test]
+    fn test_sticky_hit_label_maps_all_three_states() {
+        assert_eq!(sticky_hit_label(Some(true)), "hit");
+        assert_eq!(sticky_hit_label(Some(false)), "miss");
+        assert_eq!(sticky_hit_label(None), "n_a");
+    }
+
+    /// BDD（redteam 二次纠正后的 SUGGESTION-2）：`cache_bucket_kind_from_account_key`
+    /// 直接透传前缀、不映射不兜底的纯函数级钉子。
+    ///
+    /// 第三条分支（无 `':'` 的裸串）当前在生产代码里没有调用点会走到——
+    /// `account_key` 只由 `format!("conv:{}", id)` 或 `format!("cred:{}", ..)`
+    /// 两种形态构造——但正因为它不可达，才更需要被断言到：一条既无调用点、
+    /// 又无测试覆盖的分支，将来被改坏（比如误加 `.expect()` 或改错 `unwrap_or`
+    /// 的默认值）不会有任何信号。断言的是"`unwrap_or(account_key)` 兜底返回
+    /// 整串"这个具体行为，不是猜测将来会不会用到。
+    #[test]
+    fn test_cache_bucket_kind_from_account_key_passthrough() {
+        assert_eq!(
+            cache_bucket_kind_from_account_key("conv:550e8400-e29b-41d4-a716-446655440000"),
+            "conv"
+        );
+        assert_eq!(cache_bucket_kind_from_account_key("cred:123"), "cred");
+        // 无 ':' 的裸串（如 websearch.rs:528 的 "websearch"）：split_once 返回
+        // None，unwrap_or 兜底成整串原样返回，不映射不重写。
+        assert_eq!(cache_bucket_kind_from_account_key("websearch"), "websearch");
+    }
 }
