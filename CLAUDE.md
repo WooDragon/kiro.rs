@@ -64,7 +64,7 @@ repo 内不保留 `docs/` 目录，所有设计文档、实现细节归私有侧
 
 - 模型映射由 `models.toml` 配置驱动（`ModelRegistry`），新增模型只改配置文件重启生效，无需改代码；文件不存在时 fallback 内嵌默认，文件存在但语法错误时 fail-fast 退出
 - 请求转换流程：Anthropic 格式 → build_history → validate_tool_pairing / remove_orphaned（配对校验）→ 发送
-- prompt cache 是纯本地模拟（进程内 HashMap），从不向 Kiro 透传 cache_control
+- prompt cache 是纯本地模拟（进程内 HashMap），从不向 Kiro 透传 cache_control；cache identity 必须基于完整 canonical payload，token ruler 只可归一化已知 content-block 中的媒体，二者不得共用同一视图（细节见私有 docs/issue92-multimodal-prompt-cache-ruler.md，#92）
 - 空 tool_result 统一替换为占位文本，不发空串
 - 空 tool description 在 `convert_tools` 出口兜底填 `Tool: {name}` 占位——Anthropic 原生 description 对自定义工具是 optional（空串合法），但上游 Kiro/Bedrock `toolSpecification.description` 硬约束 length>=1，空串 400 拒整个请求；不删字段（缺失=length 0 同样拒）、不删工具（历史 tool_use 落单撞 validate_tool_pairing）；占位非空白避免诱导退化（退化行为见 #26）（#46）
 - 历史保留结构化 toolUses/toolResults，纯 tool_use 轮 content 留空串——绝不注入空格占位空壳轮（会诱导模型只回空格/句号，CC 长会话死循环根因，#26）

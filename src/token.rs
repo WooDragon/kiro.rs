@@ -188,12 +188,67 @@ fn count_value_recursive(value: &Value) -> u64 {
     }
 }
 
+/// 返回媒体块的固定 token 估算。
+///
+/// image 不区分 source 类型；document 仅在 base64 source 时屏蔽其二进制载荷。
+/// 这个判断同时服务真实计数和 prompt cache 的 ruler，避免两个路径再度漂移。
+fn fixed_media_token_estimate(item: &Value) -> Option<u64> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("image") => Some(IMAGE_BLOCK_TOKEN_ESTIMATE),
+        Some("document")
+            if item
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str)
+                == Some("base64") =>
+        {
+            Some(DOCUMENT_BLOCK_TOKEN_ESTIMATE)
+        }
+        _ => None,
+    }
+}
+
+/// 构造 content block 的 prompt-cache ruler 视图及媒体固定估算。
+///
+/// 只识别直接 image、base64 document，以及 tool_result.content 数组中的同类块；
+/// tool input/schema 与普通 object 不递归，防止把用户数据误当媒体协议块。
+/// 返回 None 表示原值必须逐字保留给普通 `count_text` 路径。
+pub(crate) fn content_block_token_view(item: &Value) -> Option<(Value, u64)> {
+    if let Some(estimate) = fixed_media_token_estimate(item) {
+        return Some((Value::Null, estimate));
+    }
+
+    if item.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+    let Value::Array(content) = item.get("content")? else {
+        return None;
+    };
+
+    let mut total_estimate = 0_u64;
+    let mut has_replacement = false;
+    let mut view = item.clone();
+    let view_content = view.get_mut("content").and_then(Value::as_array_mut)?;
+    for (index, block) in content.iter().enumerate() {
+        if let Some((replacement, estimate)) = content_block_token_view(block) {
+            view_content[index] = replacement;
+            total_estimate = total_estimate.saturating_add(estimate);
+            has_replacement = true;
+        }
+    }
+    has_replacement.then_some((view, total_estimate))
+}
+
 /// 统计单个 content block（`{"type": ..., ...}`）的 token。
 ///
 /// 覆盖 text / tool_use（name + input JSON）/ tool_result（content 可以是
-/// string 或 array，array 分支递归复用本函数）/ image（固定占位常量）；
+/// string 或 array，array 分支递归复用本函数）/ media（固定占位常量）；
 /// 未识别的块类型兜底走 [`count_value_recursive`] 扫描全部字段值。
 fn count_content_block(item: &Value) -> u64 {
+    if let Some(estimate) = fixed_media_token_estimate(item) {
+        return estimate;
+    }
+
     match item.get("type").and_then(|v| v.as_str()) {
         Some("text") => item
             .get("text")
@@ -216,20 +271,6 @@ fn count_content_block(item: &Value) -> u64 {
             Some(Value::Array(arr)) => arr.iter().map(count_content_block).sum(),
             _ => 0,
         },
-        Some("image") => IMAGE_BLOCK_TOKEN_ESTIMATE,
-        // #85 B3：document 块（如 PDF）source.type == "base64" 时，data 字段是
-        // base64 payload 而非正文，绝不能落进 count_value_recursive 兜底当文本数
-        // （见 DOCUMENT_BLOCK_TOKEN_ESTIMATE 文档）。text/url 等非 base64 来源
-        // 没有这个顾虑，仍走下面的通用兜底递归正常计数。
-        Some("document")
-            if item
-                .get("source")
-                .and_then(|s| s.get("type"))
-                .and_then(|v| v.as_str())
-                == Some("base64") =>
-        {
-            DOCUMENT_BLOCK_TOKEN_ESTIMATE
-        }
         _ => count_value_recursive(item),
     }
 }
@@ -499,6 +540,56 @@ mod tests {
     }
 
     /// 纯文本消息回归：确保重构没有破坏最基本的 string content 路径。
+    #[test]
+    fn content_block_token_view_normalizes_direct_image_sources() {
+        for source in [
+            json!({"type": "base64", "media_type": "image/png", "data": "AQID"}),
+            json!({"type": "url", "url": "https://example.test/very/long/image.png"}),
+        ] {
+            assert_eq!(
+                content_block_token_view(&json!({"type": "image", "source": source})),
+                Some((Value::Null, IMAGE_BLOCK_TOKEN_ESTIMATE))
+            );
+        }
+    }
+
+    #[test]
+    fn content_block_token_view_normalizes_only_base64_documents() {
+        let base64 = json!({"type": "document", "source": {"type": "base64", "data": "AQID"}});
+        assert_eq!(
+            content_block_token_view(&base64),
+            Some((Value::Null, DOCUMENT_BLOCK_TOKEN_ESTIMATE))
+        );
+        for source_type in ["text", "url"] {
+            let document = json!({"type": "document", "source": {"type": source_type, "data": "ordinary content"}});
+            assert_eq!(content_block_token_view(&document), None);
+        }
+    }
+
+    #[test]
+    fn content_block_token_view_recurses_only_through_tool_result_content() {
+        let tool_result = json!({
+            "type": "tool_result",
+            "content": [
+                {"type": "text", "text": "keep this text"},
+                {"type": "image", "source": {"type": "base64", "data": "AQID"}}
+            ]
+        });
+        let (view, estimate) = content_block_token_view(&tool_result).unwrap();
+        assert_eq!(estimate, IMAGE_BLOCK_TOKEN_ESTIMATE);
+        assert_eq!(
+            view["content"][0],
+            json!({"type": "text", "text": "keep this text"})
+        );
+        assert_eq!(view["content"][1], Value::Null);
+
+        let tool_use = json!({
+            "type": "tool_use",
+            "input": {"type": "image", "source": {"type": "base64", "data": "AQID"}}
+        });
+        assert_eq!(content_block_token_view(&tool_use), None);
+    }
+
     #[test]
     fn counts_plain_string_message_content() {
         let messages = vec![Message {
