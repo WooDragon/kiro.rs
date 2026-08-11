@@ -726,20 +726,20 @@ fn append_cache_block(
     // Identity and ruler deliberately diverge only for recognized media blocks:
     // canonical remains the complete request payload for hashing, while the ruler view
     // replaces media bytes with null and restores their fixed estimate separately.
-    let canonical_value = strip_position_keys(value);
+    let mut canonical_value = strip_position_keys(value);
     let canonical = canonical_json(&canonical_value);
-    let tokens = canonical_value
+    let ruler = canonical_value
         .get("block")
-        .and_then(crate::token::content_block_token_view)
-        .map(|(ruler_block, fixed_estimate)| {
-            let mut ruler_value = canonical_value.clone();
-            *ruler_value
-                .get_mut("block")
-                .expect("cache wrapper block exists after billing-header filter") = ruler_block;
+        .and_then(crate::token::content_block_token_view);
+    let tokens = match (canonical_value.get_mut("block"), ruler) {
+        (Some(block), Some((ruler_block, fixed_estimate))) => {
+            *block = ruler_block;
             let fixed_estimate = fixed_estimate.min(i32::MAX as u64) as i32;
-            crate::token::count_text(&canonical_json(&ruler_value)).saturating_add(fixed_estimate)
-        })
-        .unwrap_or_else(|| crate::token::count_text(&canonical));
+            crate::token::count_text(&canonical_json(&canonical_value))
+                .saturating_add(fixed_estimate)
+        }
+        _ => crate::token::count_text(&canonical),
+    };
     blocks.push(CacheBlock {
         tokens,
         canonical,
@@ -1995,12 +1995,6 @@ pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile>
         );
     }
 
-    /// 守恒律必须是"构造性恒等"，不能靠 `uncached_input_tokens` 的 `.max(0)`
-    /// 兜底钳出假象——即便在 `into_real` 最激进的边界(local 侧用量远超
-    /// local_total，ratio 顶到 1.0 上限)下，`real_total - cc - cr` 本身就已经
-    /// 非负，`.max(0)` 全程不生效。用最激进输入直接验证：先独立算裸减法（不
-    /// 经过 `.max(0)`），断言它本身非负；再断言 `uncached_input_tokens` 的输出
-    /// 与裸减法完全相等——若二者不等，说明守恒律依赖了钳位而非构造性恒等。
     fn req_with_cached_system_and_content(content: Value) -> MessagesRequest {
         MessagesRequest {
             model: "claude-opus-5".to_string(),
@@ -2113,7 +2107,54 @@ pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile>
         );
     }
 
-    /// #92 BDD：相同可缓存前缀之后的长短多模态 suffix 应给出同样的命中比例。
+    /// #92 BDD：`tool_result.content[]` 内的文本按实际内容计量，base64 媒体按固定
+    /// 估算计量。媒体字节变化不得改变总量，但完整 canonical 仍须改变 fingerprint。
+    #[test]
+    fn tool_result_content_uses_media_ruler_without_discarding_text() {
+        let media = |data: Value, text: &str| {
+            req_with_cached_system_and_content(json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_test",
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": data,
+                    }},
+                ],
+            }]))
+        };
+        let short = media(json!("AQID"), "tool output");
+        let long = media(
+            json!(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(20_000)
+            ),
+            "tool output",
+        );
+        let text_growth = media(json!("AQID"), "tool output with additional text");
+        let tracker = PromptCacheTracker::default();
+        let short_profile = tracker.build_profile(&short).unwrap();
+        let long_profile = tracker.build_profile(&long).unwrap();
+        let text_growth_profile = tracker.build_profile(&text_growth).unwrap();
+
+        assert_eq!(
+            short_profile.local_total_tokens(),
+            long_profile.local_total_tokens(),
+            "base64 media inside tool_result.content must use a fixed ruler"
+        );
+        assert_ne!(
+            short_profile.breakpoints.last().unwrap().fingerprint,
+            long_profile.breakpoints.last().unwrap().fingerprint,
+            "complete canonical tool_result payload must keep media bytes in its identity"
+        );
+        assert!(
+            text_growth_profile.local_total_tokens() > short_profile.local_total_tokens(),
+            "text inside tool_result.content must increase the local token total"
+        );
+    }
+
+    /// #92 BDD：相同可缓存前缀之后的长短多模态 suffix 应给出相同的精确命中 token 数。
     #[test]
     fn multimodal_suffix_length_does_not_dilute_matched_cache_ratio() {
         let short = req_with_cached_system_and_content(json!([{
@@ -2147,15 +2188,14 @@ pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile>
             "long suffix must hit the seeded prefix"
         );
         assert_eq!(
-            short_usage.cache_read_input_tokens, long_usage.cache_read_input_tokens,
-            "both profiles must hit the same prefix token count"
+            short_usage.cache_read_input_tokens,
+            prefix_profile.local_total_tokens(),
+            "short suffix must report the seeded prefix's exact token count"
         );
         assert_eq!(
-            i64::from(short_usage.cache_read_input_tokens)
-                * i64::from(long_profile.local_total_tokens()),
-            i64::from(long_usage.cache_read_input_tokens)
-                * i64::from(short_profile.local_total_tokens()),
-            "same prefix must keep the matched/local ratio despite suffix payload length"
+            long_usage.cache_read_input_tokens,
+            prefix_profile.local_total_tokens(),
+            "long suffix must report the seeded prefix's exact token count"
         );
     }
 
@@ -2190,6 +2230,12 @@ pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile>
         }
     }
 
+    /// 守恒律必须是"构造性恒等"，不能靠 `uncached_input_tokens` 的 `.max(0)`
+    /// 兜底钳出假象——即便在 `into_real` 最激进的边界(local 侧用量远超
+    /// local_total，ratio 顶到 1.0 上限)下，`real_total - cc - cr` 本身就已经
+    /// 非负，`.max(0)` 全程不生效。用最激进输入直接验证：先独立算裸减法（不
+    /// 经过 `.max(0)`），断言它本身非负；再断言 `uncached_input_tokens` 的输出
+    /// 与裸减法完全相等——若二者不等，说明守恒律依赖了钳位而非构造性恒等。
     #[test]
     fn conservation_holds_without_relying_on_max_zero_floor() {
         let scaled = ScaledCacheUsage::Local {
