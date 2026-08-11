@@ -1665,6 +1665,17 @@ impl MultiTokenManager {
     /// 的 `{ let mut entries = self.entries.lock(); ... }` 块内，块结束、锁释放
     /// 之后才分别调用 `persist_credentials()` / `save_stats()`，作用域已关闭，
     /// 本轮改动未触碰这两个函数、未破坏这个前提。
+    ///
+    /// **适用边界**：以上论证覆盖的是*已打版本标记*的变更。仓里还存在不打标记
+    /// 却直接修改持久化字段的路径——`reserve_credential` 每次取凭据都改
+    /// `entry.last_used_at`，全程不调 `save_stats_debounced`；`add_credential` /
+    /// `delete_credential` 改完 entries 后自己也从不打标记，直接调这里。这些
+    /// 修改不在脏门控的视野内：它们只会"落盘晚"（下次任意标记方触发落盘时随
+    /// 快照一起带出去），不会"未落盘却被清脏"（清脏只推进到
+    /// `version_at_snapshot`，与未标记的修改无关），但也就此得不到 `Drop` 兜底
+    /// 重试的保障——若进程在它们修改之后、下一次成功落盘之前退出，这些未标记
+    /// 的改动会连同 `Drop` 一起被跳过而丢失。这是存量行为（旧 `AtomicBool`
+    /// 实现下同样如此），PR-1 范围不含改它们的调用时机。
     fn save_stats(&self) {
         let _guard = self.stats_save_lock.lock();
         self.save_stats_locked();
