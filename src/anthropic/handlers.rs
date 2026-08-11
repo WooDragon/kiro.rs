@@ -67,24 +67,50 @@ pub(crate) fn truncate_for_log(s: &str, limit: usize) -> std::borrow::Cow<'_, st
 /// 缓存分桶方式"。事件名与 `req_outcome` 语义逐字不变，只是集中成一个函数以免
 /// 12 处调用点各自手写字段名时写歪。
 ///
-/// 仅在凭据已成功获取（`KiroApiResponse`/`CallContext` 已建立）的路径上调用；
-/// 凭据获取阶段本身失败（见 `map_provider_error`）时这 4 个字段无从谈起，
-/// 那些调用点继续使用裸 `tracing::info!` 不经过此函数。
+/// PR-0 返工（redteam MUST FIX 1）：上一版这里写"凭据获取阶段本身失败时这 4 个
+/// 字段无从谈起"，对 `handle_non_stream_request` 里 body 中途断连（#64 场景）那个
+/// 调用点是错的——那里凭据早已成功获取（`api_response` 在作用域内），只是读
+/// 响应体这一步失败。真正"字段无从谈起"的是 `map_provider_error` 另外 4 个
+/// 调用点（凭据获取阶段本身失败的 `Err` 分支，压根没有 `api_response`）：
+/// 这批失败绝对量小、且请求压根没到达上游，缓存分桶讨论意义有限，故维持裸
+/// `tracing::info!` 不接入本函数。#71 的 `status × req_outcome` 四态交叉表本就
+/// 设计为容忍字段稀疏，不要求每条 `request outcome` 都带满 4 个字段。
+///
+/// `credential_id`/`sticky_hit` 用 `Option` 而非裸值：前者是 redteam 采纳建议 2
+/// （`0` 是凭据文件里合法可手写的 id，不能当"未回填"哨兵）；后者是 MUST FIX 2
+/// 的三态语义（`None` = 会话粘性机制未启用 / priority 模式，不是"未命中"）。
 fn log_request_outcome(
     req_outcome: &str,
-    credential_id: u64,
-    sticky_hit: bool,
+    credential_id: Option<u64>,
+    sticky_hit: Option<bool>,
     session_id_extracted: bool,
     cache_bucket_kind: &str,
 ) {
     tracing::info!(
         req_outcome = req_outcome,
         credential_id,
-        sticky_hit = if sticky_hit { "hit" } else { "miss" },
+        sticky_hit = match sticky_hit {
+            Some(true) => "hit",
+            Some(false) => "miss",
+            None => "n_a",
+        },
         session_id_extracted,
         cache_bucket_kind,
         "request outcome"
     );
+}
+
+/// PR-0 返工（redteam 采纳建议 1）：`cache_bucket_kind` 从实际构造出的
+/// `account_key` 字符串取前缀，而不是重新判断一次 `stable_conversation_id`
+/// 分支——避免这个字段沦为分桶逻辑的复制品：`account_key` 的构造规则将来变了，
+/// 这个字段自动跟着变，不会有旁路判断悄悄脱节。未识别前缀（如 websearch.rs
+/// 固定桶 `"websearch"`，本次未接入 `request outcome` 日志）落 `"cred"` 兜底，
+/// 维持字段现有的二值语义。
+fn cache_bucket_kind_from_account_key(account_key: &str) -> &'static str {
+    match account_key.split_once(':').map(|(prefix, _)| prefix) {
+        Some("conv") => "conv",
+        _ => "cred",
+    }
 }
 
 /// 构建并序列化 KiroRequest。
@@ -110,6 +136,26 @@ fn finalize_request_body(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
+    map_provider_error_with_outcome(err, None)
+}
+
+/// PR-0 返工（redteam MUST FIX 1）：`map_provider_error` 的可观测性增强版本。
+///
+/// `handle_non_stream_request` 里 body 中途断连（#64 场景）那个调用点，凭据早已
+/// 成功获取，`api_response` 的 4 个可观测性字段都是现成的、不该在走这条错误
+/// 路径时凭空丢失——但也不能给 `map_provider_error` 本身加参数，那会牵动全部
+/// ~13 个既有测试调用点。拆成"核心逻辑 + 可选字段"两层：`outcome_fields` 为
+/// `None` 时走原有裸 `tracing::info!(req_outcome = ..)`，逐字不变；为 `Some(..)`
+/// 时改走 `log_request_outcome` 补齐 4 个字段。两个分支共用同一个 `tracing::info!`
+/// 调用点（`match` 内部条件分叉，不是并列的两条语句），因此对任意一次调用，
+/// 结局事件只会被发出恰好一次——不可能是 0 次（函数内没有能跳过发射的提前
+/// return）,也不可能是 2 次（`Some`/`None` 分支互斥，同一次调用只落进其中一支）。
+/// `map_provider_error(err)` 保留原公开签名，作为 `None` 转发的薄包装，公开行为
+/// 与既有测试期望逐字不变。
+fn map_provider_error_with_outcome(
+    err: Error,
+    outcome_fields: Option<(Option<u64>, Option<bool>, bool, &str)>,
+) -> Response {
     use crate::kiro::provider::ProviderError;
 
     if let Some(pe) = err.downcast_ref::<ProviderError>() {
@@ -218,7 +264,18 @@ fn map_provider_error(err: Error) -> Response {
         // req_outcome 统一以字符串字段记录（不加 %）：`%` 走 Display→record_debug，
         // 与其余发射点的 record_str 提取路径不一致，会让捕获层/JSON 里同一字段
         // 时而带引号时而不带，污染 jq 聚合。error_type 是 &str 可直接传。
-        tracing::info!(req_outcome = error_type, "request outcome");
+        match outcome_fields {
+            Some((credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)) => {
+                log_request_outcome(
+                    error_type,
+                    credential_id,
+                    sticky_hit,
+                    session_id_extracted,
+                    cache_bucket_kind,
+                );
+            }
+            None => tracing::info!(req_outcome = error_type, "request outcome"),
+        }
 
         let mut response = (status, Json(ErrorResponse::new(error_type, message))).into_response();
 
@@ -231,7 +288,18 @@ fn map_provider_error(err: Error) -> Response {
         response
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败（未分类错误）");
-        tracing::info!(req_outcome = "api_error", "request outcome");
+        match outcome_fields {
+            Some((credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)) => {
+                log_request_outcome(
+                    "api_error",
+                    credential_id,
+                    sticky_hit,
+                    session_id_extracted,
+                    cache_bucket_kind,
+                );
+            }
+            None => tracing::info!(req_outcome = "api_error", "request outcome"),
+        }
         (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -477,14 +545,16 @@ async fn handle_stream_request(
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
-    // PR-0：session_id_extracted / cache_bucket_kind 是 account_key 分支判断的副产物，
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
     // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
     let session_id_extracted = stable_conversation_id.is_some();
-    let cache_bucket_kind: &'static str = if session_id_extracted { "conv" } else { "cred" };
     let account_key = match stable_conversation_id {
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let fallback_cache_usage = prompt_cache.compute(
         &account_key,
@@ -748,14 +818,16 @@ async fn handle_non_stream_request(
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
-    // PR-0：session_id_extracted / cache_bucket_kind 是 account_key 分支判断的副产物，
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
     // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
     let session_id_extracted = stable_conversation_id.is_some();
-    let cache_bucket_kind: &'static str = if session_id_extracted { "conv" } else { "cred" };
     let account_key = match stable_conversation_id {
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let fallback_cache_usage = prompt_cache.compute(
         &account_key,
@@ -781,12 +853,26 @@ async fn handle_non_stream_request(
                     detail: format!("上游响应体读取中断: {}", e),
                 }
                 .into();
-                return map_provider_error(provider_err);
+                // PR-0 返工（redteam MUST FIX 1）：这里凭据早已成功获取
+                // （`api_response` 在作用域内），走 map_provider_error 不该白白
+                // 丢掉 4 个可观测性字段——尤其这正是 #64 记录的真实故障场景
+                // （上游 HTTP/2 RST 中途冲断），是最该定位到具体凭据的一类失败，
+                // 漏记还会拉低 sticky 命中率分母。改走
+                // map_provider_error_with_outcome 带上字段，机制见该函数文档。
+                return map_provider_error_with_outcome(
+                    provider_err,
+                    Some((
+                        Some(api_response.credential_id),
+                        api_response.sticky_hit,
+                        session_id_extracted,
+                        cache_bucket_kind,
+                    )),
+                );
             }
             // 非瞬态分支绕过 map_provider_error，结局事件在此单独补发。
             log_request_outcome(
                 "api_error",
-                api_response.credential_id,
+                Some(api_response.credential_id),
                 api_response.sticky_hit,
                 session_id_extracted,
                 cache_bucket_kind,
@@ -1007,7 +1093,7 @@ async fn handle_non_stream_request(
         );
         log_request_outcome(
             "overloaded_error",
-            api_response.credential_id,
+            Some(api_response.credential_id),
             api_response.sticky_hit,
             session_id_extracted,
             cache_bucket_kind,
@@ -1049,7 +1135,7 @@ async fn handle_non_stream_request(
 
     log_request_outcome(
         "success",
-        api_response.credential_id,
+        Some(api_response.credential_id),
         api_response.sticky_hit,
         session_id_extracted,
         cache_bucket_kind,
@@ -1368,10 +1454,9 @@ async fn handle_stream_request_prefix_buffered(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    // PR-0：session_id_extracted / cache_bucket_kind 是 account_key 分支判断的副产物，
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
     // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
     let session_id_extracted = stable_conversation_id.is_some();
-    let cache_bucket_kind: &'static str = if session_id_extracted { "conv" } else { "cred" };
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
@@ -1379,6 +1464,9 @@ async fn handle_stream_request_prefix_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let context_window = model_registry.context_window(model);
     let fallback_cache_usage = prompt_cache.compute(
@@ -1606,10 +1694,9 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
     let response = api_response.response;
-    // PR-0：session_id_extracted / cache_bucket_kind 是 account_key 分支判断的副产物，
+    // PR-0：session_id_extracted 是 account_key 分支判断的副产物，
     // 提前读一次 is_some()（借用，不消费 stable_conversation_id），供下方 request outcome 日志用。
     let session_id_extracted = stable_conversation_id.is_some();
-    let cache_bucket_kind: &'static str = if session_id_extracted { "conv" } else { "cred" };
     // conv: / cred: 前缀隔离两类实体命名空间，防止客户端 session_id 恰好等于 credential_id 时串缓存。
     // Some(id) = 客户端传了稳定 session_id，按会话分桶，跨凭据 fallback 不丢缓存；
     // None = 无稳定 ID，退回 credential_id 分桶（不比现状差）。
@@ -1617,6 +1704,9 @@ async fn handle_stream_request_buffered(
         Some(ref id) => format!("conv:{}", id),
         None => format!("cred:{}", api_response.credential_id),
     };
+    // PR-0 返工（redteam 采纳建议 1）：cache_bucket_kind 从上面已构造好的 account_key
+    // 取前缀，而不是重新判断一次 session_id_extracted 分支，避免两处判断脱节。
+    let cache_bucket_kind = cache_bucket_kind_from_account_key(&account_key);
     let min_cacheable_tokens = model_registry.min_cacheable_tokens(model);
     let context_window = model_registry.context_window(model);
     let fallback_cache_usage = prompt_cache.compute(
@@ -2659,6 +2749,86 @@ mod tests {
                 .all(|e| e.request_id.as_deref() == Some("test_req_xyz")),
             "结局事件未继承 request_id — span 传递失效: {:?}",
             &*events
+        );
+    }
+
+    /// BDD（PR-0 返工，redteam 采纳建议 2）：`credential_id: Option<u64>` 为
+    /// `None` 时字段必须从事件里彻底缺席，而不是以 `null` 或任何其他形式出现——
+    /// 这是"用 `Option` 让未回填字段在日志里缺席，而不是伪造 `0` 当哨兵值"这一
+    /// 设计选择的可运行背书，不满足黑盒实测背书就凭推断落笔的仓库纪律。
+    ///
+    /// 验证手段：`tracing_core::Value for Option<T>` 的行为发生在
+    /// `Value::record` 这一层——`None` 时该实现直接不调用 visitor 的任何
+    /// `record_*` 方法，这比"序列化成 JSON 后拿 jq 校验字段缺席"更贴近断言对象
+    /// 本身（JSON 输出只是这一行为的下游表现，不是它的定义处）。用一个只认
+    /// `credential_id` 字段名的 Visitor，比较"字段名是否曾被访问过"而非其值。
+    #[test]
+    fn test_none_credential_id_omitted_from_event_fields() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        /// 只关心 "credential_id" 这一个字段名是否被 visitor 访问过——
+        /// 不关心值本身，因为本测试要证的是"访问与否"而非"访问到什么"。
+        struct FieldPresenceVisitor {
+            seen: Vec<&'static str>,
+        }
+
+        impl tracing::field::Visit for FieldPresenceVisitor {
+            fn record_u64(&mut self, field: &tracing::field::Field, _value: u64) {
+                if field.name() == "credential_id" {
+                    self.seen.push("credential_id");
+                }
+            }
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "credential_id" {
+                    self.seen.push("credential_id");
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct PresenceFlags(Arc<Mutex<Vec<bool>>>);
+
+        struct PresenceLayer(PresenceFlags);
+
+        impl<S> Layer<S> for PresenceLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldPresenceVisitor { seen: Vec::new() };
+                event.record(&mut visitor);
+                self.0.0.lock().unwrap().push(!visitor.seen.is_empty());
+            }
+        }
+
+        let flags = PresenceFlags::default();
+        let layer = PresenceLayer(flags.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // 第一条：credential_id = Some(7) —— 字段必须被访问到。
+            log_request_outcome("success", Some(7), Some(true), true, "conv");
+            // 第二条：credential_id = None —— 字段必须彻底缺席，不调用任何
+            // record_* 方法（不是"调用了但值是空"，是压根没调用）。
+            log_request_outcome("api_error", None, None, false, "cred");
+        });
+
+        let flags = flags.0.lock().unwrap();
+        assert_eq!(flags.len(), 2, "应捕获 2 条 request outcome 事件");
+        assert!(
+            flags[0],
+            "credential_id = Some(7) 时字段应被 visitor 访问到，实际未访问"
+        );
+        assert!(
+            !flags[1],
+            "credential_id = None 时字段应从事件中彻底缺席，实际仍被 visitor 访问到"
         );
     }
 

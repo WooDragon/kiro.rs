@@ -627,9 +627,16 @@ pub struct CallContext {
     pub token: String,
     /// PR-0（可观测性，零行为变更）：本次凭据是否命中 balanced 模式的会话粘性表。
     /// 由 `acquire_context_for_session_excluding` 在返回前回填，`try_ensure_token`
-    /// 构造时不知道调用来源，先占位 `false`。仅供 `request outcome` 日志聚合，
+    /// 构造时不知道调用来源，先占位 `None`。仅供 `request outcome` 日志聚合，
     /// 不参与任何凭据选择或故障转移判断。
-    pub sticky_hit: bool,
+    ///
+    /// PR-0 返工（redteam MUST FIX 2）：三态而非二值——`priority` 模式下会话粘性
+    /// 机制根本未启用，若仍用 `bool` 会被日志读者误读成"测量出的命中/未命中"，
+    /// 实际是"这个维度压根不适用"。`None` = 粘性机制未启用（priority 模式）；
+    /// `Some(true)` = balanced 模式下命中会话粘性表；`Some(false)` = balanced 模式下
+    /// 未命中（含"表里有记录但窄竞态 reserve 失败"，见 `acquire_context_for_session_excluding`
+    /// 内 sticky 命中但 reserve 返回 `None` 的分支）。
+    pub sticky_hit: Option<bool>,
 }
 
 impl MultiTokenManager {
@@ -1075,7 +1082,7 @@ impl MultiTokenManager {
                 if let Some((hit_id, _hit_credentials)) = sticky_hit {
                     match self.reserve_existing_credential_excluding(hit_id, model, excluded_ids) {
                         Some((reserved_id, reserved_credentials)) => {
-                            (reserved_id, reserved_credentials, true)
+                            (reserved_id, reserved_credentials, Some(true))
                         }
                         None => {
                             // sticky 命中但 reserve 失败（窄竞态：选择到 reserve 之间凭据被禁用）。
@@ -1110,7 +1117,10 @@ impl MultiTokenManager {
                             if let Some((new_id, new_creds)) = best {
                                 let mut current_id = self.current_id.lock();
                                 *current_id = new_id;
-                                (new_id, new_creds, false)
+                                // 窄竞态分支恒在 is_balanced==true 下触发（外层 `if let Some(...) =
+                                // sticky_hit` 只在 balanced 模式才可能是 Some），故此处必为 balanced
+                                // 下的真实"表里有记录但抢占失败"未命中，不是 N/A。
+                                (new_id, new_creds, Some(false))
                             } else {
                                 let entries = self.entries.lock();
                                 let available = entries.iter().filter(|e| !e.disabled).count();
@@ -1119,7 +1129,10 @@ impl MultiTokenManager {
                         }
                     }
                 } else if let Some((hit_id, hit_credentials)) = current_hit {
-                    (hit_id, hit_credentials, false)
+                    // current_hit 只在 is_balanced==false 时才可能非 None（见上方
+                    // `let current_hit = if sticky_hit.is_some() || is_balanced { None } else {...}`），
+                    // 即此分支恒为 priority 模式，粘性机制未启用，语义是 N/A 不是"未命中"。
+                    (hit_id, hit_credentials, None)
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential_excluding(model, excluded_ids);
@@ -1149,7 +1162,14 @@ impl MultiTokenManager {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds, false)
+                        // 这个分支在 balanced 模式（sticky 桶查无记录，真实未命中）和 priority
+                        // 模式（粘性机制未启用，current_hit 落空只是常规选择）都会走到，
+                        // 必须靠 is_balanced 区分，不能像其余分支那样从路径本身唯一推出结论。
+                        (
+                            new_id,
+                            new_creds,
+                            if is_balanced { Some(false) } else { None },
+                        )
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -1250,7 +1270,7 @@ impl MultiTokenManager {
                 credentials: credentials.clone(),
                 token,
                 // 由调用方（acquire_context_for_session_excluding）回填真实值。
-                sticky_hit: false,
+                sticky_hit: None,
             });
         }
 
@@ -1321,7 +1341,7 @@ impl MultiTokenManager {
             credentials: creds,
             token,
             // 由调用方（acquire_context_for_session_excluding）回填真实值。
-            sticky_hit: false,
+            sticky_hit: None,
         })
     }
 

@@ -703,9 +703,20 @@ pub struct StreamContext {
     tool_call_leak_marker: Option<&'static str>,
     /// PR-0（可观测性，零行为变更）：本次请求实际使用的凭据 ID。
     /// 供 `request outcome` 日志聚合"哪个凭据处理了多少请求"，不参与任何业务判断。
-    pub credential_id: u64,
+    ///
+    /// PR-0 返工（redteam 采纳建议 2）：`0` 曾用作"未回填"占位，但凭据文件里 `0`
+    /// 是合法可手写的凭据 id（见 `cred.id.unwrap_or_else` 只在 `None` 时才自动分配），
+    /// 不是安全哨兵值。改 `Option<u64>`，未回填时在日志里直接缺席而不是伪装成
+    /// "凭据 0 处理了这个请求"。构造函数占位 `None`，`with_observability` 单一
+    /// 回填点保证真正处理请求时必为 `Some`。
+    pub credential_id: Option<u64>,
     /// PR-0：本次凭据是否命中 balanced 模式的会话粘性表。
-    pub sticky_hit: bool,
+    ///
+    /// PR-0 返工（redteam MUST FIX 2）：三态而非二值，语义与
+    /// [`crate::kiro::token_manager::CallContext::sticky_hit`] 一致——`None` = 会话
+    /// 粘性机制未启用（priority 模式，字段本身不适用）；`Some(true)`/`Some(false)`
+    /// = balanced 模式下的真实命中/未命中。
+    pub sticky_hit: Option<bool>,
     /// PR-0：客户端 metadata.user_id 是否成功提取出稳定 session_id
     /// （对应 [`super::converter::ConversionResult::stable_conversation_id`] 是否为 `Some`）。
     pub session_id_extracted: bool,
@@ -756,8 +767,8 @@ impl StreamContext {
             tool_call_leak_marker: None,
             // 占位值：真正取值由 with_observability 在 handler 侧回填，
             // 构造函数本身不知道凭据/分桶信息。
-            credential_id: 0,
-            sticky_hit: false,
+            credential_id: None,
+            sticky_hit: None,
             session_id_extracted: false,
             cache_bucket_kind: "cred",
         }
@@ -766,14 +777,20 @@ impl StreamContext {
     /// PR-0（可观测性，零行为变更）：回填 `credential_id`/`sticky_hit`/
     /// `session_id_extracted`/`cache_bucket_kind`，供 `request outcome` 日志读取。
     /// 纯数据搬运，不影响任何流式处理逻辑。
+    ///
+    /// `credential_id` 参数保持 `u64`（非 `Option`）：调用方在能调用本方法的时点
+    /// 已经拿到真实凭据 id（唯一调用点见 handlers.rs），不存在"调用了但未回填"的
+    /// 中间态；`Option` 语义只用于表达字段本身"从未被回填"，这里在方法体内包一层
+    /// `Some(..)` 即可。`sticky_hit` 参数则必须是 `Option<bool>`——调用方传入的
+    /// `api_response.sticky_hit` 本身就是三态值，不是"是否设置过"的问题。
     pub fn with_observability(
         mut self,
         credential_id: u64,
-        sticky_hit: bool,
+        sticky_hit: Option<bool>,
         session_id_extracted: bool,
         cache_bucket_kind: &'static str,
     ) -> Self {
-        self.credential_id = credential_id;
+        self.credential_id = Some(credential_id);
         self.sticky_hit = sticky_hit;
         self.session_id_extracted = session_id_extracted;
         self.cache_bucket_kind = cache_bucket_kind;
@@ -1562,7 +1579,7 @@ impl BufferedStreamContext {
     pub fn with_observability(
         mut self,
         credential_id: u64,
-        sticky_hit: bool,
+        sticky_hit: Option<bool>,
         session_id_extracted: bool,
         cache_bucket_kind: &'static str,
     ) -> Self {
@@ -1577,7 +1594,7 @@ impl BufferedStreamContext {
 
     /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
     /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
-    pub fn observability(&self) -> (u64, bool, bool, &'static str) {
+    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, &'static str) {
         (
             self.inner.credential_id,
             self.inner.sticky_hit,
@@ -1703,7 +1720,7 @@ impl PrefixBufferedStreamContext {
     pub fn with_observability(
         mut self,
         credential_id: u64,
-        sticky_hit: bool,
+        sticky_hit: Option<bool>,
         session_id_extracted: bool,
         cache_bucket_kind: &'static str,
     ) -> Self {
@@ -1718,7 +1735,7 @@ impl PrefixBufferedStreamContext {
 
     /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
     /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
-    pub fn observability(&self) -> (u64, bool, bool, &'static str) {
+    pub fn observability(&self) -> (Option<u64>, Option<bool>, bool, &'static str) {
         (
             self.inner.credential_id,
             self.inner.sticky_hit,

@@ -130,7 +130,11 @@ pub struct KiroApiResponse {
     pub credential_id: u64,
     /// PR-0（可观测性，零行为变更）：本次凭据是否命中 balanced 模式的会话粘性表。
     /// 直接透传自 [`CallContext::sticky_hit`]，仅供日志聚合，不驱动任何决策。
-    pub sticky_hit: bool,
+    ///
+    /// PR-0 返工（redteam MUST FIX 2）：三态而非二值，随 `CallContext::sticky_hit`
+    /// 同步改为 `Option<bool>`——`None` 表示会话粘性机制根本未启用（priority 模式），
+    /// 不是"测量出的未命中"。语义定义见 `CallContext::sticky_hit` 文档。
+    pub sticky_hit: Option<bool>,
 }
 
 impl KiroProvider {
