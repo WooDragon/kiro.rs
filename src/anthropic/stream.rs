@@ -701,6 +701,17 @@ pub struct StreamContext {
     tool_call_leak_tail: String,
     /// 命中的工具调用明文标记字面（命中后置位，后续 chunk 短路跳过检测）。
     tool_call_leak_marker: Option<&'static str>,
+    /// PR-0（可观测性，零行为变更）：本次请求实际使用的凭据 ID。
+    /// 供 `request outcome` 日志聚合"哪个凭据处理了多少请求"，不参与任何业务判断。
+    pub credential_id: u64,
+    /// PR-0：本次凭据是否命中 balanced 模式的会话粘性表。
+    pub sticky_hit: bool,
+    /// PR-0：客户端 metadata.user_id 是否成功提取出稳定 session_id
+    /// （对应 [`super::converter::ConversionResult::stable_conversation_id`] 是否为 `Some`）。
+    pub session_id_extracted: bool,
+    /// PR-0：prompt cache 分桶键前缀——`"conv"`（按会话稳定分桶）或 `"cred"`
+    /// （退化按凭据分桶）。取值恒为二者之一，构造时未显式设置则用 `"cred"` 占位。
+    pub cache_bucket_kind: &'static str,
 }
 
 impl StreamContext {
@@ -743,7 +754,30 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             tool_call_leak_tail: String::new(),
             tool_call_leak_marker: None,
+            // 占位值：真正取值由 with_observability 在 handler 侧回填，
+            // 构造函数本身不知道凭据/分桶信息。
+            credential_id: 0,
+            sticky_hit: false,
+            session_id_extracted: false,
+            cache_bucket_kind: "cred",
         }
+    }
+
+    /// PR-0（可观测性，零行为变更）：回填 `credential_id`/`sticky_hit`/
+    /// `session_id_extracted`/`cache_bucket_kind`，供 `request outcome` 日志读取。
+    /// 纯数据搬运，不影响任何流式处理逻辑。
+    pub fn with_observability(
+        mut self,
+        credential_id: u64,
+        sticky_hit: bool,
+        session_id_extracted: bool,
+        cache_bucket_kind: &'static str,
+    ) -> Self {
+        self.credential_id = credential_id;
+        self.sticky_hit = sticky_hit;
+        self.session_id_extracted = session_id_extracted;
+        self.cache_bucket_kind = cache_bucket_kind;
+        self
     }
 
     pub fn with_prompt_cache(
@@ -1524,6 +1558,34 @@ impl BufferedStreamContext {
         self
     }
 
+    /// PR-0（可观测性，零行为变更）：委托内部 `StreamContext`。
+    pub fn with_observability(
+        mut self,
+        credential_id: u64,
+        sticky_hit: bool,
+        session_id_extracted: bool,
+        cache_bucket_kind: &'static str,
+    ) -> Self {
+        self.inner = self.inner.with_observability(
+            credential_id,
+            sticky_hit,
+            session_id_extracted,
+            cache_bucket_kind,
+        );
+        self
+    }
+
+    /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
+    /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
+    pub fn observability(&self) -> (u64, bool, bool, &'static str) {
+        (
+            self.inner.credential_id,
+            self.inner.sticky_hit,
+            self.inner.session_id_extracted,
+            self.inner.cache_bucket_kind,
+        )
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1635,6 +1697,34 @@ impl PrefixBufferedStreamContext {
             .inner
             .with_prompt_cache(mode, tracker, account, profile, fallback_usage);
         self
+    }
+
+    /// PR-0（可观测性，零行为变更）：委托内部 `StreamContext`。
+    pub fn with_observability(
+        mut self,
+        credential_id: u64,
+        sticky_hit: bool,
+        session_id_extracted: bool,
+        cache_bucket_kind: &'static str,
+    ) -> Self {
+        self.inner = self.inner.with_observability(
+            credential_id,
+            sticky_hit,
+            session_id_extracted,
+            cache_bucket_kind,
+        );
+        self
+    }
+
+    /// PR-0：`request outcome` 日志用的可观测性字段快照，委托内部 `StreamContext`。
+    /// 返回 `(credential_id, sticky_hit, session_id_extracted, cache_bucket_kind)`。
+    pub fn observability(&self) -> (u64, bool, bool, &'static str) {
+        (
+            self.inner.credential_id,
+            self.inner.sticky_hit,
+            self.inner.session_id_extracted,
+            self.inner.cache_bucket_kind,
+        )
     }
 
     pub fn is_released(&self) -> bool {

@@ -128,6 +128,9 @@ pub struct KiroProvider {
 pub struct KiroApiResponse {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// PR-0（可观测性，零行为变更）：本次凭据是否命中 balanced 模式的会话粘性表。
+    /// 直接透传自 [`CallContext::sticky_hit`]，仅供日志聚合，不驱动任何决策。
+    pub sticky_hit: bool,
 }
 
 impl KiroProvider {
@@ -583,6 +586,7 @@ impl KiroProvider {
                 return Ok(KiroApiResponse {
                     response,
                     credential_id: ctx.id,
+                    sticky_hit: ctx.sticky_hit,
                 });
             }
 

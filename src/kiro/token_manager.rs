@@ -625,6 +625,11 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// PR-0（可观测性，零行为变更）：本次凭据是否命中 balanced 模式的会话粘性表。
+    /// 由 `acquire_context_for_session_excluding` 在返回前回填，`try_ensure_token`
+    /// 构造时不知道调用来源，先占位 `false`。仅供 `request outcome` 日志聚合，
+    /// 不参与任何凭据选择或故障转移判断。
+    pub sticky_hit: bool,
 }
 
 impl MultiTokenManager {
@@ -1048,7 +1053,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, _sticky_hit) = {
+            let (id, credentials, sticky_hit) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 let sticky_hit = if is_balanced {
@@ -1158,7 +1163,11 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => return Ok(ctx),
+                Ok(mut ctx) => {
+                    // PR-0：try_ensure_token 不知道调用来源，真实 sticky_hit 由本层回填。
+                    ctx.sticky_hit = sticky_hit;
+                    return Ok(ctx);
+                }
                 Err(e) => {
                     self.report_no_result(id);
                     // token 瞬态刷新失败 ≠ 凭据真失效，不清 sticky。
@@ -1240,6 +1249,8 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                // 由调用方（acquire_context_for_session_excluding）回填真实值。
+                sticky_hit: false,
             });
         }
 
@@ -1309,6 +1320,8 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            // 由调用方（acquire_context_for_session_excluding）回填真实值。
+            sticky_hit: false,
         })
     }
 
