@@ -12,7 +12,7 @@ use crate::kiro::model::events::Event;
 use crate::model::config::PromptCacheMode;
 
 use super::prompt_cache::{
-    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, build_usage_value,
+    PromptCacheProfile, PromptCacheTracker, PromptCacheUsage, ScaledCacheUsage, build_usage_value,
     decide_prompt_cache, extract_usage_snapshot_from_metering,
 };
 use super::tool_call_leak::{TOOL_CALL_LEAK_TAIL_CHARS, detect_text_tool_call_leak};
@@ -597,7 +597,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
-        prompt_cache_usage: PromptCacheUsage,
+        prompt_cache_usage: ScaledCacheUsage,
         include_prompt_cache_fields: bool,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -671,7 +671,7 @@ pub struct StreamContext {
     pub prompt_cache_account: Option<String>,
     pub prompt_cache_profile: Option<PromptCacheProfile>,
     pub min_cacheable_tokens: i32,
-    pub prompt_cache_usage: PromptCacheUsage,
+    pub prompt_cache_usage: ScaledCacheUsage,
     pub include_prompt_cache_fields: bool,
     pub upstream_prompt_cache_usage: Option<PromptCacheUsage>,
     pub upstream_input_tokens: Option<i32>,
@@ -755,7 +755,10 @@ impl StreamContext {
             prompt_cache_account: None,
             prompt_cache_profile: None,
             min_cacheable_tokens,
-            prompt_cache_usage: PromptCacheUsage::default(),
+            // 中性初始占位：`with_prompt_cache` 调用前不存在任何"本地尺子"，
+            // 用 `Real` 包裹 default() 值语义上等价于旧行为（全零 usage），
+            // 且不会被误当作需要缩放的本地估算值。
+            prompt_cache_usage: ScaledCacheUsage::Real(PromptCacheUsage::default()),
             include_prompt_cache_fields: false,
             upstream_prompt_cache_usage: None,
             upstream_input_tokens: None,
@@ -812,13 +815,22 @@ impl StreamContext {
         profile: Option<PromptCacheProfile>,
         fallback_usage: PromptCacheUsage,
     ) -> Self {
+        // 必须在 profile 被移入 self.prompt_cache_profile 之前取出 local_total——
+        // 这是 fallback_usage 的本地尺子分母，缺了它就没法在后续 into_real 时换算。
+        let local_total = profile.as_ref().map(|p| p.local_total_tokens());
         self.prompt_cache_mode = mode;
         self.prompt_cache = tracker;
         self.prompt_cache_account = account;
         self.include_prompt_cache_fields = profile.is_some()
             && !matches!(mode, PromptCacheMode::Off | PromptCacheMode::Passthrough);
         self.prompt_cache_profile = profile;
-        self.prompt_cache_usage = fallback_usage;
+        self.prompt_cache_usage = match local_total {
+            Some(local_total) => ScaledCacheUsage::Local {
+                usage: fallback_usage,
+                local_total,
+            },
+            None => ScaledCacheUsage::Real(fallback_usage),
+        };
         self
     }
 
@@ -924,8 +936,11 @@ impl StreamContext {
                     let decision = decide_prompt_cache(
                         self.prompt_cache_mode,
                         self.upstream_prompt_cache_usage,
-                        self.prompt_cache_usage,
+                        self.prompt_cache_usage.raw(),
                         self.prompt_cache_profile.is_some(),
+                        self.prompt_cache_profile
+                            .as_ref()
+                            .map(|p| p.local_total_tokens()),
                     );
                     self.prompt_cache_usage = decision.fallback_usage;
                     self.include_prompt_cache_fields = decision.include_cache_fields;
@@ -971,8 +986,8 @@ impl StreamContext {
         // #43 文本化工具调用泄漏检测（O(1) 滑动窗口，纯可观测，不改透传）
         self.scan_tool_call_leak(content);
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        // 估算 tokens（统一走 tiktoken cl100k 尺子，见 crate::token，#85）
+        self.output_tokens += crate::token::count_text(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1328,7 +1343,9 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            // 原 `(len() + 3) / 4` 按 UTF-8 *字节数* 估算，CJK 字符占 3 字节/字符，
+            // 对中文输入约 3 倍高估（#85）。改走统一 tiktoken 尺子，按字符/子词计数。
+            self.output_tokens += crate::token::count_text(&tool_use.input);
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1840,27 +1857,6 @@ impl PrefixBufferedStreamContext {
     }
 }
 
-/// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,11 +2263,93 @@ mod tests {
         );
     }
 
+    /// 回归守卫（#85）：`process_tool_use` 的 output_tokens 累计原先按
+    /// `(input.len() as i32 + 3) / 4` 估算——`len()` 是 UTF-8 *字节数*，CJK 字符
+    /// 占 3 字节/字符，对中文输入约 3 倍高估。改走 `crate::token::count_text`
+    /// （tiktoken cl100k）后，累计值应与其保持一致，且明显小于字节长度。
+    ///
+    /// `OLD_RULER_TOOL_INPUT_BYTES` 是旧字节公式对本测试同一份 `cjk_input` 的
+    /// 历史实测值（#85 §3.5「1.5 段」，删除旧公式前反事实回退实测得出），仅作
+    /// 历史对照——这是"内联 3 倍高估"发作点专门喂含中文 tool_use.input 的基线。
+    ///
+    /// 反例验证：临时把计数还原成 `(input.len() as i32 + 3) / 4` 会让
+    /// `ctx.output_tokens` 撞回 `OLD_RULER_TOOL_INPUT_BYTES`（13），使
+    /// `assert_ne!`/`assert_eq!(ctx.output_tokens, expected)` 直接失败。
+    const OLD_RULER_TOOL_INPUT_BYTES: i32 = 13;
+
     #[test]
-    fn test_estimate_tokens() {
-        assert!(estimate_tokens("Hello") > 0);
-        assert!(estimate_tokens("你好") > 0);
-        assert!(estimate_tokens("Hello 你好") > 0);
+    fn process_tool_use_counts_input_tokens_via_tiktoken_not_utf8_bytes() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 200_000, 1, false, HashMap::new(), 1024);
+        let cjk_input = "\"你好世界你好世界你好世界你好世界\"".to_string();
+        let byte_len = cjk_input.len() as i32;
+
+        ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: cjk_input.clone(),
+            stop: false,
+        });
+
+        let expected = crate::token::count_text(&cjk_input);
+        assert_eq!(ctx.output_tokens, expected);
+        assert!(
+            ctx.output_tokens < byte_len,
+            "tiktoken 计数应明显小于 UTF-8 字节长度：output_tokens={} byte_len={}",
+            ctx.output_tokens,
+            byte_len
+        );
+        assert_ne!(
+            ctx.output_tokens, OLD_RULER_TOOL_INPUT_BYTES,
+            "换尺后应与旧字节公式的历史实测值不同，ruler shift 未被记录"
+        );
+    }
+
+    /// #85 §3.5「1.5 段」旧尺基线快照（output 面）：`stream.rs::estimate_tokens`
+    /// （已删除，CJK 加权字符启发式：中文 `(count*2+2)/3`、其余 `(count+3)/4`）
+    /// 在删除前对同一批样本文本（与 `prompt_cache.rs` 同族）的最后一次实测输出，
+    /// 仅作历史对照，不是期望值。换尺(tiktoken)后数值应有变化，方向不统一。
+    const OLD_RULER_OUTPUT_MIXED: i32 = 87;
+    const OLD_RULER_OUTPUT_CODE: i32 = 138;
+    /// 与 `prompt_cache.rs::cn_sample_text(20)` 同一句中文样本 ×20 遍的历史实测值。
+    const OLD_RULER_OUTPUT_CN: i32 = 840;
+
+    #[test]
+    fn baseline_output_ruler_shift_recorded() {
+        let mixed = "Rust ownership 是 Rust 语言最独特的特性之一。The borrow checker enforces memory safety at compile time without a garbage collector. 每个值都有一个所有者（owner），当所有者离开作用域时，值会被自动释放。This design eliminates entire classes of bugs such as use-after-free and double-free errors that plague C and C++ programs.";
+        let code = r#"
+pub fn build_profile(&self, req: &MessagesRequest) -> Option<PromptCacheProfile> {
+    let blocks = flatten_cache_blocks(req);
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut breakpoints = Vec::new();
+    let mut cumulative_tokens = 0;
+    for block in blocks {
+        write_hash_chunk(&mut hasher, block.canonical.as_bytes());
+        cumulative_tokens += block.tokens;
+    }
+    Some(PromptCacheProfile { breakpoints, local_total_tokens: cumulative_tokens.max(1), model: req.model.clone() })
+}
+"#;
+        let cn = "所有权系统是 Rust 语言在编译期保证内存安全的核心机制，它通过借用检查器在没有垃圾回收器的情况下追踪每一个值的生命周期与作用域边界。".repeat(20);
+
+        assert_ne!(
+            crate::token::count_text(mixed),
+            OLD_RULER_OUTPUT_MIXED,
+            "中英混合样本换尺后数值未变化，output 面 ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(code),
+            OLD_RULER_OUTPUT_CODE,
+            "纯代码样本换尺后数值未变化，output 面 ruler shift 未被记录"
+        );
+        assert_ne!(
+            crate::token::count_text(&cn),
+            OLD_RULER_OUTPUT_CN,
+            "纯中文样本换尺后数值未变化，output 面 ruler shift 未被记录"
+        );
     }
 
     #[test]
