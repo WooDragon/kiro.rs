@@ -156,6 +156,16 @@ async fn call_remote_count_tokens(
 /// 粗略估计常量，不是精确计费口径——只求「不再静默计 0」，不承诺准确。
 const IMAGE_BLOCK_TOKEN_ESTIMATE: u64 = 1500;
 
+/// document 内容块（`source.type == "base64"`，如 PDF）的 token 占位估算常量。
+///
+/// 与 image 同一顾虑但方向相反：不是"静默计 0"而是"数出天文数字"——base64
+/// payload 若落进 [`count_value_recursive`] 兜底会被当纯文本数，1MB PDF ≈133 万
+/// 字符 ≈40 万 token，直接暴露给 `/v1/messages/count_tokens` 调用方（#85 B3）。
+/// 同 `IMAGE_BLOCK_TOKEN_ESTIMATE` 一样只求「不再离谱」，不承诺精确计费口径
+/// （官方/上游均未提供 PDF 逐页 token 计价公式）。仅对 `source.type == "base64"`
+/// 生效；`text`/`url` 等非 base64 来源不携带大体积无意义载荷，仍走正常递归计数。
+const DOCUMENT_BLOCK_TOKEN_ESTIMATE: u64 = 1500;
+
 /// 递归统计任意 JSON 值里的文本 token（兜底路径）：
 /// 字符串直接计数，数组/对象递归遍历所有元素/字段值，其余类型（数字/bool/null）计 0。
 ///
@@ -199,6 +209,19 @@ fn count_content_block(item: &Value) -> u64 {
             _ => 0,
         },
         Some("image") => IMAGE_BLOCK_TOKEN_ESTIMATE,
+        // #85 B3：document 块（如 PDF）source.type == "base64" 时，data 字段是
+        // base64 payload 而非正文，绝不能落进 count_value_recursive 兜底当文本数
+        // （见 DOCUMENT_BLOCK_TOKEN_ESTIMATE 文档）。text/url 等非 base64 来源
+        // 没有这个顾虑，仍走下面的通用兜底递归正常计数。
+        Some("document")
+            if item
+                .get("source")
+                .and_then(|s| s.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("base64") =>
+        {
+            DOCUMENT_BLOCK_TOKEN_ESTIMATE
+        }
         _ => count_value_recursive(item),
     }
 }
@@ -357,6 +380,76 @@ mod tests {
         assert!(
             total >= IMAGE_BLOCK_TOKEN_ESTIMATE,
             "expected array tool_result content to be recursively counted, got total={total}"
+        );
+    }
+
+    /// #85 B3 回归测试：`document` 块 `source.type == "base64"`（如 PDF）时，
+    /// `data` 字段是 base64 payload 不是正文——若落进 `count_value_recursive`
+    /// 兜底会被当纯文本数，制造出天文数字的 token 计数（1MB PDF ≈133 万字符
+    /// ≈40 万 token，直接暴露给 `/v1/messages/count_tokens` 调用方）。
+    ///
+    /// 反事实验证：临时把 `count_content_block` 的 document 特判分支还原成裸
+    /// `_ => count_value_recursive(item)`，重跑得到：
+    ///   thread 'token::tests::document_base64_block_uses_fixed_estimate_not_payload_text'
+    ///   panicked at src/token.rs:410:9:
+    ///   expected fixed placeholder estimate for base64 document payload,
+    ///   got total=10941（远超占位常量 1500 的 2 倍上限，证明 100KB base64
+    ///   payload 确实被当正文数了）
+    /// ——证明本测试在修复前确实为红，已复原修复代码并确认无残留污染。
+    #[test]
+    fn document_base64_block_uses_fixed_estimate_not_payload_text() {
+        // 模拟 100KB 的 base64 PDF payload：用完整 base64 字符集循环填充，
+        // 避免单字符重复被 BPE 高效合并、掩盖"payload 被当正文数"的问题。
+        const BASE64_CHARSET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let fake_pdf_base64: String = (0..100_000)
+            .map(|i| BASE64_CHARSET[i % BASE64_CHARSET.len()] as char)
+            .collect();
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": fake_pdf_base64
+                    }
+                }
+            ]),
+        }];
+
+        let total = count_all_tokens_local(None, messages, None);
+        assert!(
+            total <= DOCUMENT_BLOCK_TOKEN_ESTIMATE * 2,
+            "expected fixed placeholder estimate for base64 document payload, got total={total}\
+             （怀疑 base64 payload 被 count_value_recursive 当正文数）"
+        );
+    }
+
+    /// document 块 `source.type == "text"`（非 base64）时，`data` 字段是真实正文，
+    /// 仍应走正常递归计数，不能因为新增的 base64 特判而误伤非 base64 来源。
+    #[test]
+    fn document_text_source_still_counts_content_normally() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": "this is a genuine plain text document body that should be counted normally"
+                    }
+                }
+            ]),
+        }];
+
+        let total = count_all_tokens_local(None, messages, None);
+        assert!(
+            total > 1,
+            "非 base64 document 来源应正常计数正文，got total={total}"
         );
     }
 

@@ -81,7 +81,7 @@ pub struct McpContent {
 }
 
 /// WebSearch 搜索结果
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
     pub results: Vec<WebSearchResult>,
@@ -430,7 +430,9 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    // 统一走 tiktoken 尺子（#85）——曾用 `(summary.len()+3)/4` 按 UTF-8 字节数估算，
+    // CJK 摘要文本会明显低报（约 2 倍，字节数/4 而非按字符/BPE token 计）。
+    let output_tokens = crate::token::count_text(&summary);
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -900,6 +902,68 @@ mod tests {
             reported_input + cc + cr,
             real_total,
             "守恒律：message_start usage 的 input_tokens+cc+cr 必须恒等于 real_total"
+        );
+    }
+
+    /// #85 第六把尺子回归：`generate_websearch_events` 的
+    /// `message_delta.usage.output_tokens` 曾用 `(summary.len()+3)/4` 按 UTF-8
+    /// *字节数* 估算——与 `stream.rs:1348` 修过的那处是同一类 bug 的逐字复制品，
+    /// 只是方向相反（这里对 CJK 摘要是**低报**约 2 倍：字节数/4 用"4 字节/token"
+    /// 假设，中文实际约 1.5~2 token/字，远小于字节数/4 得出的量级）。
+    ///
+    /// 用喂含中文 title/snippet 的 `WebSearchResults` 构造出 CJK 占比高的
+    /// summary，断言 `output_tokens` 不再撞回旧字节公式、且与 `count_text`
+    /// 直接计算的值一致（同一份 summary 文本，函数内部与测试各自独立调用
+    /// `count_text`/`generate_search_summary`，两者必须吻合）。
+    #[test]
+    fn generate_websearch_events_message_delta_output_tokens_uses_tiktoken_not_utf8_bytes() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "所有权系统是 Rust 语言在编译期保证内存安全的核心机制".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some(
+                    "它通过借用检查器在没有垃圾回收器的情况下追踪每一个值的生命周期与作用域边界，这是一段专门用来验证 token 计数不再退化为字节计数的中文摘要文本".to_string(),
+                ),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("所有权".to_string()),
+            error: None,
+        };
+
+        let summary = generate_search_summary("所有权", &Some(results.clone()));
+        let byte_len_estimate = (summary.len() as i32 + 3) / 4;
+
+        let events = generate_websearch_events(
+            "claude-sonnet-4-5",
+            "所有权",
+            "toolu_test",
+            Some(results),
+            5000,
+            ScaledCacheUsage::Real(PromptCacheUsage::default()),
+            false,
+        );
+
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should emit message_delta");
+        let output_tokens = message_delta.data["usage"]["output_tokens"]
+            .as_i64()
+            .unwrap() as i32;
+
+        assert_ne!(
+            output_tokens, byte_len_estimate,
+            "output_tokens 撞回旧字节估算公式 (summary.len()+3)/4，怀疑第六把尺子未修"
+        );
+        assert_eq!(
+            output_tokens,
+            crate::token::count_text(&summary),
+            "output_tokens 应与 tiktoken 尺子直接计算的值一致"
         );
     }
 }

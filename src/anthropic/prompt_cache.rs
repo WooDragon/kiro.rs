@@ -43,15 +43,17 @@ impl PromptCacheUsage {
 ///
 /// 根因：`cc`/`cr`（cache_creation/cache_read）与 `input_tokens` 曾用不同的尺子
 /// 度量——`cc`/`cr` 出自本地 `PromptCacheTracker::compute()`（章程见
-/// `flatten_cache_blocks` + `estimate_tokens`/`count_text` 的本地估算），
-/// `input_tokens` 出自上游真实值或另一把估算尺（`contextUsagePercentage ×
-/// context_window`）。两者相减（`uncached_input_tokens`）没有守恒保证，因为被减数
-/// 和减数根本不在同一刻度上。
+/// `flatten_cache_blocks` + `count_text` 的本地估算），`input_tokens` 出自上游
+/// 真实值或另一把估算尺（`contextUsagePercentage × context_window`）。两者相减
+/// （`uncached_input_tokens`）没有守恒保证，因为被减数和减数根本不在同一刻度上。
 ///
 /// 本类型把"这份 usage 是哪把尺子量出来的"显式带在类型里，强制调用方在真正拼
 /// 响应 JSON 之前，把本地尺度换算成与 `input_tokens` 同源的真实尺度
-/// （[`into_real`](Self::into_real)），从而让 `cc + cr <= real_total` 由构造保证，
-/// 而不是靠 `uncached_input_tokens` 里的 `.max(0)` 兜底。
+/// （[`into_real`](Self::into_real)）。这条构造保证只覆盖 `Local` 变体——
+/// `Real` 变体是"信任上游原值"的显式取舍（原样透传、不重新缩放，见
+/// [`into_real`](Self::into_real) 文档），上游值与 `input_tokens` 可以互不相容，
+/// 此时 `cc + cr <= real_total` 不由构造保证，`uncached_input_tokens` 里的
+/// `.max(0)` 兜底仍承重。
 #[derive(Debug, Clone, Copy)]
 pub enum ScaledCacheUsage {
     /// 上游/真实值，直接使用，不做任何重新缩放。
@@ -159,7 +161,7 @@ struct PromptCacheBreakpoint {
 #[derive(Debug, Clone)]
 pub struct PromptCacheProfile {
     breakpoints: Vec<PromptCacheBreakpoint>,
-    /// 本地尺子（`flatten_cache_blocks` + `estimate_tokens`）估算的输入 token 总量。
+    /// 本地尺子（`flatten_cache_blocks` + `count_text`）估算的输入 token 总量。
     ///
     /// 命名刻意避开 `total_input_tokens`——防后人把它误当上游真实值使用。它只是
     /// [`ScaledCacheUsage::Local`] 做比例换算时的分母，本身不是任何"真值"（#85）。
@@ -1430,13 +1432,37 @@ mod tests {
 
     // ---- #85 token 守恒律：ScaledCacheUsage::into_real 系列测试 ----
 
-    /// 守恒律核心断言：任意 `Local` 输入，换算后 `cc + cr <= real_total` 恒成立。
+    /// 守恒律核心断言：任意 `Local` 输入，换算后 `uncached + cc + cr == real_total`
+    /// 恒成立（不只是 `<=`）。
+    ///
+    /// `<=` 在 `uncached_input_tokens` 的 `.max(0)` 兜底触发时同样成立——对"守恒律
+    /// 是构造性成立还是被兜底掩盖"零覆盖，故补三条更强断言（#85 B2）：
+    /// 1. 守恒等式 `uncached + cc + cr == real_total`；
+    /// 2. `uncached` 精确等于裸减法 `real_total - cc - cr`，不是被 `.max(0)` 钳出的值；
+    /// 3. ratio 被 clamp 到 1.0 的饱和场景精确打满 `real_total`（不能只满足 `<=`）。
     ///
     /// 用固定种子的一组边界/常规值代替 proptest（仓库无此依赖，不新增），
     /// 覆盖：cc/cr 均为 0、cc 独大、cr 独大、cc=cr、local_total 远大于 real_total、
-    /// local_total 远小于 real_total（即 last_tokens > local_total 的越界输入）。
+    /// local_total 远小于 real_total（即 last_tokens > local_total 的越界输入，
+    /// 恰好是 ratio 饱和场景）。
+    ///
+    /// 反事实验证（两条断言各自独立验证，均已复原正确实现）：
+    /// - 断言 1/2：临时打断 `uncached_input_tokens`（去掉 `cache_read_input_tokens`
+    ///   的减项），重跑得到 `left: 5000 right: 0`（case cc=0 cr=3000 local_total=3000
+    ///   real_total=5000）——证明"精确等于裸减法"确实在测东西，不是摆设。
+    ///   注：起初按"打断 `into_real` 内部独立取整公式"的思路试过，但经严格证明
+    ///   （取整单调性 + `ratio_matched<=ratio_cached` 的结构不变量）在非负输入下
+    ///   该改法数学上不可能产生负 `cc` 或破坏 `<=`，实测也确实是 `ok` 不是
+    ///   `FAILED`；换成打断 `uncached_input_tokens` 本身才是真正命中新增断言
+    ///   覆盖面的改法（新断言验证的正是 `into_real` 输出与 `uncached_input_tokens`
+    ///   的集成关系，旧测试只单独查 `PromptCacheUsage` 字段、从未调用过
+    ///   `uncached_input_tokens`）。
+    /// - 断言 3：临时在饱和场景注入丢 1 个 token 的"差一"回归（`cr -= 1`，仅当
+    ///   `ratio_cached>=1.0 && cc+cr==real_total`），重跑得到 `left: 4999
+    ///   right: 5000`——证明饱和场景的 `==` 确实比旧测试的 `<=` 更能抓问题
+    ///   （`<=` 对 4999<=5000 会照样放行）。
     #[test]
-    fn into_real_conserves_cc_plus_cr_le_real_total() {
+    fn into_real_conserves_cc_plus_cr_uncached_identity() {
         let cases = [
             // (cache_creation, cache_read, local_total, real_total)
             (0, 0, 3000, 5000),
@@ -1444,7 +1470,7 @@ mod tests {
             (0, 3000, 3000, 5000),
             (1500, 1500, 3000, 5000),
             (100, 50, 200_000, 5000),
-            (100_000, 50_000, 10_000, 5000), // 越界输入：last_tokens > local_total
+            (100_000, 50_000, 10_000, 5000), // 越界输入：last_tokens > local_total，ratio 饱和 clamp 到 1.0
             (1, 1, 3000, 1),                 // real_total 极小
             (3000, 0, 3000, 0),              // real_total 为 0
         ];
@@ -1479,6 +1505,38 @@ mod tests {
                 cr,
                 local_total
             );
+
+            // #85 B2 断言 1+2：守恒等式必须是构造性恒等，而非被 `.max(0)` 钳出的假象。
+            let uncached = uncached_input_tokens(real_total, real);
+            let raw_subtraction =
+                real_total - real.cache_creation_input_tokens - real.cache_read_input_tokens;
+            assert_eq!(
+                uncached, raw_subtraction,
+                "uncached_input_tokens 的返回值应精确等于裸减法 real_total-cc-cr，\
+                 不应被 `.max(0)` 钳到 0（输入 cc={} cr={} local_total={} real_total={}）",
+                cc, cr, local_total, real_total
+            );
+            assert_eq!(
+                uncached + real.cache_creation_input_tokens + real.cache_read_input_tokens,
+                real_total,
+                "守恒等式 uncached+cc+cr 必须恒等于 real_total（输入 cc={} cr={} local_total={} real_total={}）",
+                cc,
+                cr,
+                local_total,
+                real_total
+            );
+
+            // #85 B2 断言 3：ratio 饱和(clamp 到 1.0)场景须精确打满 real_total——
+            // last_tokens(150_000) 远超 local_total(10_000)，ratio_cached 被 clamp
+            // 到 1.0，实算 cc=0/cr=5000，和恰好 == real_total。此前只有 `<=`，
+            // 饱和场景被悄悄放过。
+            if (cc, cr, local_total, real_total) == (100_000, 50_000, 10_000, 5000) {
+                assert_eq!(
+                    real.cache_creation_input_tokens + real.cache_read_input_tokens,
+                    real_total,
+                    "ratio 饱和场景应精确打满 real_total，不能只满足 <="
+                );
+            }
         }
     }
 
