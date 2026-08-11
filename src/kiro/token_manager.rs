@@ -628,15 +628,28 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 统计落盘专用锁（#86 返工 MUST FIX 1）：序列化 `save_stats_locked` 的所有
+    /// 调用方（`save_stats_debounced` 的惊群路径 + Admin API 直接调用 + `Drop`
+    /// 兜底落盘），避免并发 truncate+write 同一个 tmp 路径产生 torn write。
+    /// 锁序：`stats_save_lock → entries`，不得反向持锁。
+    stats_save_lock: Mutex<()>,
     /// balanced 模式下的会话粘性映射：session_id -> credential_id
     sticky_sessions: Mutex<HashMap<String, StickySessionEntry>>,
-    /// 最近一次会话粘性全量清理时间
-    last_sticky_prune_at: Mutex<Option<Instant>>,
+    /// 最近一次会话粘性全量清理时间（Clock 相对毫秒数，#86 返工 S3：与 sticky
+    /// 子系统其余时间量一致地经 Clock 取时，测试才能靠 TestClock 推进确定性
+    /// 触发周期清扫分支，不必再靠撑爆 MAX_STICKY_SESSIONS 间接触发）
+    last_sticky_prune_at: Mutex<Option<u64>>,
     /// 模型注册表
     model_registry: Arc<ModelRegistry>,
-    /// sticky 子系统专用时钟（#86）。生产恒为 `ProcessClock`；测试通过
-    /// `set_clock_for_test` 替换为可手动推进的实现以驱动 TTL/LRU 判定。
-    clock: Mutex<Arc<dyn Clock>>,
+    /// sticky 子系统专用时钟（#86）。生产恒为 `ProcessClock`，经 `new()` 构造时注入；
+    /// 测试通过 `new_with_clock` 在构造期传入可手动推进的实现以驱动 TTL/LRU 判定。
+    ///
+    /// 构造后从不更换（#86 返工 S2）：生产唯一构造入口 `main.rs` 只调用 `new()`，
+    /// 故不需要运行期互斥保护，退化为普通 `Arc`。若改为运行期可换钟的 setter，
+    /// 在已有 sticky entry 写入之后换钟，新钟读数可能小于既有 `last_used_at`，
+    /// `saturating_sub` 恒为 0 会导致该 entry 永不过期——构造期一次性注入从设计上
+    /// 排除了这个形态，不是"暂时没坑"而是"结构上不存在这条路径"。
+    clock: Arc<dyn Clock>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -648,7 +661,7 @@ const STICKY_SESSION_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 /// 会话粘性映射最大容量
 const MAX_STICKY_SESSIONS: usize = 10_000;
 /// 会话粘性全量 TTL 清理的最小间隔
-const STICKY_SESSION_PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const STICKY_SESSION_PRUNE_INTERVAL_MS: u64 = 60_000;
 
 /// API 调用上下文
 ///
@@ -693,6 +706,31 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
         model_registry: Arc<ModelRegistry>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_clock(
+            config,
+            credentials,
+            proxy,
+            credentials_path,
+            is_multiple_format,
+            model_registry,
+            Arc::new(ProcessClock::new()),
+        )
+    }
+
+    /// 与 `new` 等价，额外接受一个显式 `Clock` 实现（#86 返工 S2）。
+    ///
+    /// 唯一存在理由是让测试在构造期注入可手动推进的时钟——`new()` 就是
+    /// `new_with_clock(..., Arc::new(ProcessClock::new()))` 的薄包装，两者共享
+    /// 全部构造逻辑，不重复。生产代码只应调用 `new()`。
+    fn new_with_clock(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        credentials_path: Option<PathBuf>,
+        is_multiple_format: bool,
+        model_registry: Arc<ModelRegistry>,
+        clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
@@ -788,10 +826,11 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            stats_save_lock: Mutex::new(()),
             sticky_sessions: Mutex::new(HashMap::new()),
             last_sticky_prune_at: Mutex::new(None),
             model_registry,
-            clock: Mutex::new(Arc::new(ProcessClock::new())),
+            clock,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -826,13 +865,7 @@ impl MultiTokenManager {
 
     /// sticky 子系统当前时钟读数（毫秒），生产恒经 `ProcessClock`。
     fn now_ms(&self) -> u64 {
-        self.clock.lock().now_ms()
-    }
-
-    /// 测试专用：替换 sticky 子系统时钟，驱动 TTL / LRU 判定（#86）。
-    #[cfg(test)]
-    pub(crate) fn set_clock_for_test(&self, clock: Arc<dyn Clock>) {
-        *self.clock.lock() = clock;
+        self.clock.now_ms()
     }
 
     fn is_entry_available_for_model(&self, entry: &CredentialEntry, model: Option<&str>) -> bool {
@@ -881,16 +914,17 @@ impl MultiTokenManager {
     }
 
     fn maybe_prune_sticky_sessions(&self, sessions: &mut HashMap<String, StickySessionEntry>) {
+        let now_ms = self.now_ms();
         let should_prune_by_time = {
             let last = *self.last_sticky_prune_at.lock();
-            last.map(|instant| instant.elapsed() >= STICKY_SESSION_PRUNE_INTERVAL)
+            last.map(|last_ms| now_ms.saturating_sub(last_ms) >= STICKY_SESSION_PRUNE_INTERVAL_MS)
                 .unwrap_or(true)
         };
 
         if should_prune_by_time || sessions.len() > MAX_STICKY_SESSIONS {
-            Self::prune_sticky_sessions(sessions, self.now_ms());
+            Self::prune_sticky_sessions(sessions, now_ms);
             if should_prune_by_time {
-                *self.last_sticky_prune_at.lock() = Some(Instant::now());
+                *self.last_sticky_prune_at.lock() = Some(now_ms);
             }
         }
     }
@@ -1496,8 +1530,12 @@ impl MultiTokenManager {
         tracing::info!(count = stats.len(), "已从缓存加载统计数据");
     }
 
-    /// 将当前统计数据持久化到磁盘
-    fn save_stats(&self) {
+    /// 实际执行统计数据落盘的写入逻辑。
+    ///
+    /// **调用方必须已持有 `stats_save_lock`**（#86 返工 MUST FIX 1）：本函数不
+    /// 自行加锁，是给 `save_stats` / `save_stats_debounced` 复用的内部构件，
+    /// 避免同一把 `parking_lot::Mutex`（不可重入）被同一线程二次获取而死锁。
+    fn save_stats_locked(&self) {
         let path = match self.stats_path() {
             Some(p) => p,
             None => return,
@@ -1526,6 +1564,10 @@ impl MultiTokenManager {
                 // 生产环境跑 Docker，stats 目录可能是独立挂载卷，
                 // 若 tmp 落在 std::env::temp_dir()/tmp 会导致跨设备 rename 报 EXDEV，
                 // 把"偶发写坏"变成"永远落不了盘"，故禁止用系统临时目录。
+                //
+                // tmp 文件名是硬编码的固定路径（非唯一名），单靠它本身不足以防并发写坏
+                // ——真正的原子性保证来自调用方持有的 stats_save_lock，把并发调用序列化
+                // 成串行的 truncate+write+rename，任意时刻只有一个线程在操作这个 tmp 路径。
                 let tmp_path = path.with_extension("json.tmp");
                 if let Err(e) =
                     std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &path))
@@ -1540,10 +1582,44 @@ impl MultiTokenManager {
         }
     }
 
-    /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
+    /// 将当前统计数据持久化到磁盘（无条件立即写，供 Admin API 直接调用点 /
+    /// `Drop` 使用）。
+    fn save_stats(&self) {
+        let _guard = self.stats_save_lock.lock();
+        self.save_stats_locked();
+    }
+
+    /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘。
+    ///
+    /// #86 返工 MUST FIX 1：原实现是无互斥的 check-then-act——读时间戳、判断、
+    /// 直到写完成后才更新时间戳。多线程 runtime 下防抖窗口一到，所有在飞线程会
+    /// 惊群式同时判定 should_flush 为真，并发调用 save_stats 对同一路径做
+    /// truncate+write，产生 torn write（两份快照长度不同即可拼出非法 JSON，
+    /// rename 又把这份垃圾"原子地"发布成 stats.json）。
+    ///
+    /// 修法是双重检查锁定：热路径（每次 report_success/report_failure 都会经过
+    /// 这里）先做一次无锁快速判断，避免不需要刷新时也去抢锁；只有快速判断为真
+    /// 才进锁，进锁后重读一次时间戳做第二次判定——惊群里若已有别的线程抢先刷新
+    /// 完，这里会直接放弃，最终只有一个线程真写，冗余写入和并发写坏一起消除。
+    ///
+    /// 锁序钉死：`stats_save_lock → entries`（`save_stats_locked` 内部会取
+    /// `entries` 锁构造载荷），全仓其余路径不得反向持锁。
     fn save_stats_debounced(&self) {
         self.stats_dirty.store(true, Ordering::Relaxed);
 
+        let maybe_should_flush = {
+            let last = *self.last_stats_save_at.lock();
+            match last {
+                Some(last_saved_at) => last_saved_at.elapsed() >= STATS_SAVE_DEBOUNCE,
+                None => true,
+            }
+        };
+
+        if !maybe_should_flush {
+            return;
+        }
+
+        let _guard = self.stats_save_lock.lock();
         let should_flush = {
             let last = *self.last_stats_save_at.lock();
             match last {
@@ -1553,7 +1629,7 @@ impl MultiTokenManager {
         };
 
         if should_flush {
-            self.save_stats();
+            self.save_stats_locked();
         }
     }
 
@@ -4157,8 +4233,14 @@ mod tests {
 
     /// Scenario: report_refresh_failure 控制流整理后，未达阈值仍不清 sticky（对称覆盖）
     ///
-    /// 证明 #86 的控制流卫生改动（早 return 改为落在统一返回路径）没有改变行为：
-    /// 未达阈值时 clear 与 save_stats_debounced() 是否被跳过，语义必须与整理前逐字节等价。
+    /// 证明 #86 的控制流卫生改动（早 return 改为落在统一返回路径）没有改变清除语义：
+    /// 未达阈值时 clear 这一步与整理前逐字节等价。
+    ///
+    /// 有意的行为差异（S1 更正，非等价声明）：整理前的早 return 会顺带跳过尾部
+    /// `save_stats_debounced()`；整理后统一落到尾部，`save_stats_debounced()` 由
+    /// "被跳过"变为"会执行"。这一变化本身无害（与 report_failure 未达阈值分支的
+    /// 既有行为对齐），但属于有意收敛，不是"整理前后逐字节等价"——不应被后人当作
+    /// 等价性证明来引用。
     #[test]
     fn test_refresh_failure_below_threshold_clears_no_sticky() {
         let mut config = Config::default();
@@ -4189,7 +4271,7 @@ mod tests {
                 .get("session-A")
                 .map(|e| e.credential_id),
             Some(1),
-            "未达阈值的刷新失败不应清除 sticky 绑定（控制流整理前后行为必须等价）"
+            "未达阈值的刷新失败不应清除 sticky 绑定（clear 语义整理前后等价）"
         );
         assert!(
             !manager
@@ -4307,18 +4389,17 @@ mod tests {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
-        let manager = MultiTokenManager::new(
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
             config,
             vec![valid_access_credential("token-1", 0)],
             None,
             None,
             false,
             test_registry(),
+            clock.clone(),
         )
         .unwrap();
-
-        let clock = TestClock::new();
-        manager.set_clock_for_test(clock.clone());
 
         manager.bind_sticky_session("session-TTL", 1);
         assert_eq!(
@@ -4351,18 +4432,17 @@ mod tests {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
-        let manager = MultiTokenManager::new(
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
             config,
             vec![valid_access_credential("token-1", 0)],
             None,
             None,
             false,
             test_registry(),
+            clock.clone(),
         )
         .unwrap();
-
-        let clock = TestClock::new();
-        manager.set_clock_for_test(clock.clone());
 
         // 逐个绑定 MAX_STICKY_SESSIONS + 1 个 session，每次推进 1ms，
         // 保证 last_used_at 严格递增、彼此可区分。
@@ -4384,6 +4464,59 @@ mod tests {
         assert!(
             sessions.contains_key(&format!("session-{MAX_STICKY_SESSIONS}")),
             "最近绑定的 session 应保留"
+        );
+    }
+
+    /// Scenario: 周期清扫节流闸经 Clock 取时，能被 TestClock 精确驱动触发（#86 返工 S3）
+    ///
+    /// 背景：`maybe_prune_sticky_sessions` 的 60s 节流闸此前基于真实 `Instant`，
+    /// TestClock 推进不触发它，只能靠撑爆 MAX_STICKY_SESSIONS 间接触发清扫，
+    /// 周期性清扫这条路径本身零覆盖——半迁移的抽象。
+    ///
+    /// Given  session-old 在 t=0 绑定凭据 1，容量远未达上限（只有 1 个 entry）
+    /// When   时钟推进超过 TTL（同时超过 60s 清扫节流间隔），随后绑定 session-new
+    ///        触发 `maybe_prune_sticky_sessions` 的按时清扫分支（非容量触发）
+    /// Then   session-old 应被这次周期清扫直接从底层 map 移除——断言直接读
+    ///        `sticky_sessions` 原始 map，不经由 `select_sticky_credential`（它自己
+    ///        对被查询 session 有独立的按需 TTL 检查，会掩盖周期清扫是否真的生效）
+    #[test]
+    fn test_periodic_sweep_driven_by_clock_not_wallclock() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        manager.bind_sticky_session("session-old", 1);
+
+        // 推进超过 TTL（远大于 60s 清扫节流间隔，两个条件同时满足）
+        clock.advance_ms(STICKY_SESSION_TTL_MS + 1);
+
+        // 绑定 session-new 触发 maybe_prune_sticky_sessions；prune 发生在
+        // bind_sticky_session 内部插入新 entry 之前，故此刻 map 里只有 session-old
+        // 可能被清扫，不存在"新 entry 混进被扫描集合"的干扰。
+        manager.bind_sticky_session("session-new", 2);
+
+        let sessions = manager.sticky_sessions.lock();
+        assert!(
+            !sessions.contains_key("session-old"),
+            "按时触发的周期清扫应把过期的 session-old 一并清掉，证明清扫节流闸已切换到 Clock 驱动"
+        );
+        assert!(
+            sessions.contains_key("session-new"),
+            "本次刚绑定的 session-new 不应被清扫误伤"
         );
     }
 }

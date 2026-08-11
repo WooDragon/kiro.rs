@@ -218,11 +218,17 @@ pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 拿到无效串后整体退化为随机 UUID、彻底丧失粘性（#86）。UUID 恒在字符串末尾，
     // 用 rsplit_once 从右向左匹配才与真实格式契合。
     if let Some((_, session_part)) = user_id.rsplit_once("_session_") {
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
+        // #86 返工 MUST FIX 2：user_id 完全由客户端提供，session_part.len() 是
+        // 字节数而非字符数，非 ASCII 输入（例如分隔符后紧跟 emoji）按字节 [..36]
+        // 切片可能落在非字符边界，直接 panic（"byte index N is not a char
+        // boundary"）。改用 get(..36) 返回 Option<&str>：非法边界时得到 None，
+        // 落到下面的 None 兜底（既有的随机 UUID 兜底逻辑在调用方），从"客户端
+        // 输入即可让服务端 panic"退化为"提取失败"。UUID 恒为 36 个 ASCII 字符，
+        // 合法输入下 get 与切片等价，行为不变。
+        if let Some(uuid_str) = session_part.get(..36)
+            && is_valid_uuid(uuid_str)
+        {
+            return Some(uuid_str.to_string());
         }
     }
     None
@@ -2555,6 +2561,23 @@ mod tests {
             session_id,
             Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string()),
             "用户名内含 _session_ 干扰串时，仍应提取末尾真实 session UUID"
+        );
+    }
+
+    /// Scenario: 分隔符后紧跟非 ASCII 字符（emoji）时不 panic（#86 返工 MUST FIX 2）
+    ///
+    /// Given user_id 完全由客户端提供，"_session_" 分隔符后紧跟 10 个 4 字节 emoji
+    ///       （40 字节 >= 36，但字节偏移 36 落在某个 emoji 内部、非字符边界）
+    /// When  提取 session id
+    /// Then  不应 panic（原按字节 [..36] 切片会 "byte index 36 is not a char
+    ///       boundary"），应安全返回 None（提取失败，落到调用方既有的随机 UUID 兜底）
+    #[test]
+    fn test_extract_session_id_non_char_boundary_does_not_panic() {
+        let user_id = "a_session_😀😀😀😀😀😀😀😀😀😀";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id, None,
+            "非字符边界的伪 UUID 段应安全返回 None，而不是 panic"
         );
     }
 

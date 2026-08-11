@@ -354,9 +354,18 @@ impl KiroProvider {
             let status = response.status();
 
             // 成功响应
+            //
+            // #86 返工 S4：只读不写——只把 session_id 传给上面的
+            // acquire_context_for_session_excluding 让 MCP 请求也能命中主链路已建立的
+            // 粘性绑定，但成功后用 report_success（不绑定新粘性），不用
+            // report_success_for_session。原因：MCP 调用不带模型名（第一个参数传
+            // None），is_entry_available_for_model 因此不做 premium tier 过滤，可能
+            // 选中并首绑一张不支持 opus 的凭据；若这次绑定恰好插在"主请求清掉
+            // entry"与"主请求成功后首绑"之间，会把 session 重新绑回不支持 opus 的
+            // 凭据，主请求 bind 被不变量拒绝，下一轮又清一次——来回抖动。读 sticky
+            // 已能拿到全部缓存收益，写绑定对本 PR 目标零增量贡献。
             if status.is_success() {
-                self.token_manager
-                    .report_success_for_session(ctx.id, session_id);
+                self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }
 
