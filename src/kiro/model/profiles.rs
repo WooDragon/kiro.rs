@@ -10,6 +10,7 @@ pub struct ListAvailableProfilesResponse {
     #[serde(default)]
     pub profiles: Vec<AvailableProfile>,
     /// 分页游标；当前 discovery 只需要首批结果。
+    #[allow(dead_code)]
     pub next_token: Option<String>,
 }
 

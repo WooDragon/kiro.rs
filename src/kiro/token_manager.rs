@@ -1608,10 +1608,9 @@ impl MultiTokenManager {
                     refresh_token_identity.as_deref(),
                     refreshed,
                 )
+                && let Err(error) = self.persist_credentials()
             {
-                if let Err(error) = self.persist_credentials() {
-                    tracing::warn!(error = %error, "Token 刷新后持久化失败（不影响本次请求）");
-                }
+                tracing::warn!(error = %error, "Token 刷新后持久化失败（不影响本次请求）");
             }
         }
 
