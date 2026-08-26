@@ -161,7 +161,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    "1.0.337".to_string()
 }
 
 fn default_system_version() -> String {
@@ -283,6 +283,11 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_kiro_version_is_currently_accepted() {
+        assert_eq!(Config::default().kiro_version, "1.0.337");
+    }
 
     #[test]
     fn cc_streaming_mode_defaults_to_prefix() {
