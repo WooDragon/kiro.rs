@@ -1557,6 +1557,21 @@ impl MultiTokenManager {
             .await
     }
 
+    /// Remove an invalid OAuth profile ARN from a request-only credentials snapshot.
+    ///
+    /// Discovery failure must preserve the operator-provided entry for a later retry, but callers
+    /// must never emit malformed profile ARN values into business or usage requests.
+    fn request_credentials_snapshot(mut credentials: KiroCredentials) -> KiroCredentials {
+        if !credentials
+            .profile_arn
+            .as_deref()
+            .is_some_and(is_valid_profile_arn)
+        {
+            credentials.profile_arn = None;
+        }
+        credentials
+    }
+
     /// Acquire the newest credentials and token for one ID, then best-effort discover its profile ARN.
     async fn acquire_latest_credentials_and_token(
         &self,
@@ -1614,7 +1629,7 @@ impl MultiTokenManager {
                 .as_deref()
                 .is_some_and(is_valid_profile_arn)
             {
-                return Ok((current, token));
+                return Ok((Self::request_credentials_snapshot(current), token));
             }
 
             let identity = ProfileLookupIdentity::from_credentials(&current);
@@ -1625,7 +1640,7 @@ impl MultiTokenManager {
                         .access_token
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
-                    return Ok((latest, latest_token));
+                    return Ok((Self::request_credentials_snapshot(latest), latest_token));
                 }
                 ProfileLookupOutcome::IdentityChanged => continue,
             }
@@ -5345,6 +5360,7 @@ mod tests {
             vec![KiroCredentials {
                 kiro_api_key: Some("unit-api-key".into()),
                 auth_method: Some("api_key".into()),
+                profile_arn: Some(" ".into()),
                 ..Default::default()
             }],
             None,
@@ -5366,6 +5382,11 @@ mod tests {
         );
         assert_eq!(token, "unit-api-key");
         assert_eq!(credentials.kiro_api_key.as_deref(), Some("unit-api-key"));
+        assert_eq!(
+            credentials.profile_arn.as_deref(),
+            Some(" "),
+            "API-key credentials must not be rewritten by OAuth profile validation"
+        );
     }
 
     #[tokio::test]
@@ -5392,6 +5413,86 @@ mod tests {
             0,
             "a structurally valid explicit ARN must skip lookup regardless of region"
         );
+    }
+
+    #[tokio::test]
+    async fn b07_invalid_oauth_arn_failure_returns_none_without_mutating_source() {
+        for invalid_arn in [
+            "   ",
+            "arn::codewhisperer:us-east-1:111111111111:profile/name",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "kiro-profile-invalid-snapshot-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let _cleanup = TempDirGuard(directory.clone());
+            let path = directory.join("credentials.json");
+            let original = format!(r#"[{{"profileArn":"{invalid_arn}"}}]"#);
+
+            let clock = TestClock::new();
+            let mut credential = valid_access_credential("token", 0);
+            credential.profile_arn = Some(invalid_arn.into());
+            let manager =
+                profile_test_manager(clock.clone(), vec![credential], Some(path.clone()), true);
+            *manager.test_profile_lookup_url.lock() =
+                Some("http://127.0.0.1:1/ListAvailableProfiles".into());
+            std::fs::write(&path, &original).unwrap();
+
+            let before = lookup_counts(&manager, 1);
+            let (first, _) = manager
+                .acquire_latest_credentials_and_token(1)
+                .await
+                .unwrap();
+            assert!(
+                first.profile_arn.is_none(),
+                "{invalid_arn:?}: failed discovery must suppress the invalid request snapshot"
+            );
+            assert_eq!(lookup_counts(&manager, 1), before);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{invalid_arn:?}: failed discovery must not rewrite the source file"
+            );
+            assert_eq!(
+                manager.entries.lock()[0].credentials.profile_arn.as_deref(),
+                Some(invalid_arn),
+                "{invalid_arn:?}: entry must retain the operator-provided value for retry"
+            );
+            assert_eq!(
+                manager
+                    .test_profile_lookup_request_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+
+            let (cooling, _) = manager
+                .acquire_latest_credentials_and_token(1)
+                .await
+                .unwrap();
+            assert!(cooling.profile_arn.is_none());
+            assert_eq!(
+                manager
+                    .test_profile_lookup_request_count
+                    .load(Ordering::SeqCst),
+                1,
+                "{invalid_arn:?}: cooldown must skip lookup"
+            );
+
+            clock.advance_ms(PROFILE_LOOKUP_COOLDOWN_MS);
+            let (retried, _) = manager
+                .acquire_latest_credentials_and_token(1)
+                .await
+                .unwrap();
+            assert!(retried.profile_arn.is_none());
+            assert_eq!(
+                manager
+                    .test_profile_lookup_request_count
+                    .load(Ordering::SeqCst),
+                2,
+                "{invalid_arn:?}: retry must resume at the cooldown boundary"
+            );
+        }
     }
 
     #[tokio::test]
