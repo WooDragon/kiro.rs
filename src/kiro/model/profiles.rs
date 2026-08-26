@@ -25,35 +25,33 @@ pub struct AvailableProfile {
 
 /// 从上游候选中确定一个 profile ARN。
 ///
-/// 先选择 ARN region 与 `effective_api_region` 相同的候选；每个集合均以字典序
-/// 打破平局。畸形 ARN 和缺 ARN 的元素被忽略，绝不让上游数据触发 panic。
+/// 仅选择 ARN region 与 `effective_api_region` 相同的候选，并以字典序打破平局。
+/// 首页没有同区候选即返回 `None`；当前不猜测 `nextToken` 的分页契约。畸形 ARN 和
+/// 缺 ARN 的元素被忽略，绝不让上游数据触发 panic。
 pub fn select_profile_arn(
     profiles: impl IntoIterator<Item = AvailableProfile>,
     effective_api_region: &str,
 ) -> Option<String> {
     let mut matching = Vec::new();
-    let mut fallback = Vec::new();
 
     for profile in profiles {
         let Some(arn) = profile.arn else {
             continue;
         };
-        let Some(region) = profile_arn_region(&arn) else {
-            continue;
-        };
-        if region == effective_api_region {
+        if profile_arn_region(&arn) == Some(effective_api_region) {
             matching.push(arn);
-        } else {
-            fallback.push(arn);
         }
     }
 
     matching.sort();
-    fallback.sort();
-    matching
-        .into_iter()
-        .next()
-        .or_else(|| fallback.into_iter().next())
+    matching.into_iter().next()
+}
+
+/// 判断 ARN 是否具备可用于 CodeWhisperer profile 的最小结构。
+///
+/// 该校验只验证 ARN 结构，不限制 region，以保留用户显式配置的跨区 ARN。
+pub fn is_valid_profile_arn(arn: &str) -> bool {
+    profile_arn_region(arn).is_some()
 }
 
 /// Extract the region from a CodeWhisperer profile ARN without accepting malformed input.
@@ -122,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_lexical_arn_when_no_candidate_matches_region() {
+    fn rejects_other_regions_when_no_candidate_matches_region() {
         let selected = select_profile_arn(
             vec![
                 profile("arn:aws:codewhisperer:eu-west-1:111111111111:profile/z"),
@@ -130,10 +128,25 @@ mod tests {
             ],
             "us-east-1",
         );
-        assert_eq!(
-            selected.as_deref(),
-            Some("arn:aws:codewhisperer:ap-southeast-1:111111111111:profile/a")
-        );
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn validates_only_well_formed_profile_arns() {
+        assert!(is_valid_profile_arn(
+            "arn:aws:codewhisperer:eu-west-1:111111111111:profile/explicit-cross-region"
+        ));
+        assert!(!is_valid_profile_arn(""));
+        assert!(!is_valid_profile_arn("   "));
+        assert!(!is_valid_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:111111111111:profile/"
+        ));
+        assert!(!is_valid_profile_arn(
+            "arn::codewhisperer:us-east-1:111111111111:profile/name"
+        ));
+        assert!(!is_valid_profile_arn(
+            "arn:aws:codewhisperer:us-east-1::profile/name"
+        ));
     }
 
     #[test]

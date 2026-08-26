@@ -22,7 +22,9 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::model::profiles::{ListAvailableProfilesResponse, select_profile_arn};
+use crate::kiro::model::profiles::{
+    ListAvailableProfilesResponse, is_valid_profile_arn, select_profile_arn,
+};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -1516,12 +1518,17 @@ impl MultiTokenManager {
             .json(&serde_json::json!({}))
             .send()
             .await?;
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "ListAvailableProfiles failed: {} ({})",
-                response.status(),
-                region
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                target: "kiro_rs::payload",
+                status = %status,
+                region,
+                upstream_body = %truncate_for_log(&body, LOG_PAYLOAD_LIMIT),
+                "ListAvailableProfiles returned a non-success status"
             );
+            anyhow::bail!("ListAvailableProfiles failed: {} ({})", status, region);
         }
         Ok(response.json().await?)
     }
@@ -1602,7 +1609,11 @@ impl MultiTokenManager {
                 .access_token
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
-            if current.profile_arn.is_some() {
+            if current
+                .profile_arn
+                .as_deref()
+                .is_some_and(is_valid_profile_arn)
+            {
                 return Ok((current, token));
             }
 
@@ -1653,7 +1664,11 @@ impl MultiTokenManager {
             if !expected_identity.matches(&current) {
                 return ProfileLookupOutcome::IdentityChanged;
             }
-            if current.profile_arn.is_some() {
+            if current
+                .profile_arn
+                .as_deref()
+                .is_some_and(is_valid_profile_arn)
+            {
                 return ProfileLookupOutcome::Ready;
             }
             let cooling = {
@@ -5149,6 +5164,29 @@ mod tests {
         assert!(request.ends_with("\r\n\r\n{}"), "请求体必须为空对象");
     }
 
+    #[tokio::test]
+    async fn b04_non_success_profile_response_keeps_body_out_of_error() {
+        let body = r#"{"error":"fixed-safe-profile-error"}"#;
+        let (url, server) = profile_server("403 Forbidden", body).await;
+        let credentials = valid_access_credential("unit-access-token", 0);
+        let error = MultiTokenManager::list_available_profiles_at(
+            &url,
+            &credentials,
+            &Config::default(),
+            "unit-access-token",
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        server.await.unwrap();
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("403 Forbidden"));
+        assert!(error_text.contains("us-east-1"));
+        assert!(!error_text.contains(body));
+        assert!(!error_text.contains("unit-access-token"));
+    }
+
     async fn assert_profile_lookup_failure_case(
         manager: &MultiTokenManager,
         url: String,
@@ -5265,6 +5303,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn b05_outer_region_only_first_page_cools_down_without_persisting() {
+        let directory = std::env::temp_dir().join(format!(
+            "kiro-profile-other-region-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let _cleanup = TempDirGuard(directory.clone());
+        let path = directory.join("credentials.json");
+        let original = b"[{\n  \"accessToken\": \"fixture\"\n}]\n";
+        std::fs::write(&path, original).unwrap();
+        let mut credential = valid_access_credential("token", 0);
+        credential.id = Some(1);
+        credential.machine_id = Some("test-machine-id".into());
+        let manager =
+            profile_test_manager(TestClock::new(), vec![credential], Some(path.clone()), true);
+        let (url, server) = profile_server(
+            "200 OK",
+            r#"{"profiles":[{"arn":"arn:aws:codewhisperer:eu-west-1:111111111111:profile/other-region"}],"nextToken":"unverified-page"}"#,
+        )
+        .await;
+
+        assert_profile_lookup_failure_case(
+            &manager,
+            url,
+            Some(server),
+            "200 with only other-region profiles on first page",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "failed first-page selection must not persist an other-region ARN"
+        );
+    }
+
+    #[tokio::test]
     async fn b06_api_key_skips_profile_lookup() {
         let manager = profile_test_manager(
             Arc::new(ProcessClock::new()),
@@ -5295,10 +5369,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b07_existing_profile_arn_skips_profile_lookup() {
+    async fn b07_valid_existing_profile_arn_skips_profile_lookup_even_cross_region() {
         let mut credential = valid_access_credential("token", 0);
         credential.profile_arn =
-            Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/existing".into());
+            Some("arn:aws:codewhisperer:eu-west-1:111111111111:profile/explicit".into());
         let manager =
             profile_test_manager(Arc::new(ProcessClock::new()), vec![credential], None, false);
         *manager.test_profile_lookup_url.lock() =
@@ -5309,15 +5383,55 @@ mod tests {
             .unwrap();
         assert_eq!(
             credentials.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/existing")
+            Some("arn:aws:codewhisperer:eu-west-1:111111111111:profile/explicit")
         );
         assert_eq!(
             manager
                 .test_profile_lookup_request_count
                 .load(Ordering::SeqCst),
             0,
-            "existing ARN must skip the lookup HTTP path"
+            "a structurally valid explicit ARN must skip lookup regardless of region"
         );
+    }
+
+    #[tokio::test]
+    async fn b07_empty_or_malformed_existing_profile_arn_reenters_lookup() {
+        for existing_arn in [
+            "",
+            "   ",
+            "arn:aws:codewhisperer:us-east-1:111111111111:profile/",
+            "arn::codewhisperer:us-east-1:111111111111:profile/name",
+            "arn:aws:codewhisperer:us-east-1::profile/name",
+        ] {
+            let mut credential = valid_access_credential("token", 0);
+            credential.profile_arn = Some(existing_arn.into());
+            let manager =
+                profile_test_manager(Arc::new(ProcessClock::new()), vec![credential], None, false);
+            let (url, server) = profile_server(
+                "200 OK",
+                r#"{"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:111111111111:profile/discovered"}]}"#,
+            )
+            .await;
+            *manager.test_profile_lookup_url.lock() = Some(url);
+
+            let (credentials, _) = manager
+                .acquire_latest_credentials_and_token(1)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(
+                credentials.profile_arn.as_deref(),
+                Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/discovered"),
+                "{existing_arn:?} must be treated as missing"
+            );
+            assert_eq!(
+                manager
+                    .test_profile_lookup_request_count
+                    .load(Ordering::SeqCst),
+                1,
+                "{existing_arn:?} must enter lookup exactly once"
+            );
+        }
     }
 
     #[tokio::test]
