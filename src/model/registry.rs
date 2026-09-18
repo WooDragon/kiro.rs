@@ -641,26 +641,38 @@ credit_weight = 2.5
             ("gpt-5.6-luna", 1.1),
         ];
 
-        // 前提断言：防止在空集合/漏项上恒真通过——上表必须恰好覆盖
-        // models.toml 里全部 12 条目，一个不多一个不少。
+        // 前提断言：长度相等推不出集合相等——若 expected 里把某一条误写成
+        // 另一条已有的 kiro_id（重复），同时漏掉了 toml 里的另一条，两个
+        // "12" 依然成立，而被漏掉的那条完全没有任何断言。改用
+        // HashMap<kiro_id, weight> 承担「全表覆盖」：重复 key 会让 map 变
+        // 短，`map.len() == registry.entries.len()` 随即失败，抓住的正是
+        // 这个形态；expected 与 registry.entries 集合相等（非仅同长度）
+        // 由此断言承担。
+        let expected_by_id: std::collections::HashMap<&str, f64> =
+            expected.iter().copied().collect();
         assert_eq!(
-            expected.len(),
-            12,
-            "前提：官方权重表应恰好覆盖 12 个 kiro_id（9 claude + 3 GPT-5.6）"
-        );
-        assert_eq!(
+            expected_by_id.len(),
             registry.entries.len(),
-            12,
-            "前提：models.toml 应恰好有 12 条模型条目，与官方权重表逐一对应；\
-             实际 {} 条，说明表内条目增减但本测试未同步",
+            "前提：官方权重表去重后的 kiro_id 数量应与 models.toml 条目数一致；\
+             expected_by_id={}, registry.entries={}，说明存在重复 kiro_id 或漏项",
+            expected_by_id.len(),
             registry.entries.len()
         );
 
-        for (kiro_id, weight) in expected {
+        for entry in &registry.entries {
+            let expected_weight = expected_by_id
+                .get(entry.kiro_id.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} 出现在 models.toml 但不在官方权重表 expected 中，本测试未同步",
+                        entry.kiro_id
+                    )
+                });
             assert_eq!(
-                registry.credit_weight_by_kiro_id(Some(kiro_id)),
-                *weight,
-                "{kiro_id} credit_weight 应为 {weight}（Kiro 官方倍率，基准 1.0x = Auto）"
+                registry.credit_weight_by_kiro_id(Some(&entry.kiro_id)),
+                *expected_weight,
+                "{} credit_weight 应为 {expected_weight}（Kiro 官方倍率，基准 1.0x = Auto）",
+                entry.kiro_id
             );
         }
     }
