@@ -4044,6 +4044,89 @@ mod tests {
         manager.report_no_result(retry.id);
     }
 
+    /// `#101` 回归测试：pin 落空必须回落到正常选路，不 bail、不返回 None。
+    ///
+    /// pin 落空共有三条入口，都走 `reserve_existing_credential_excluding` 里
+    /// 同一套谓词（顶部 `excluded_ids.contains(&id)` 早退 + 随后的
+    /// `is_entry_available_for_model` 检查 `entry.disabled` 与 tier 过滤）；本测试
+    /// 覆盖构造成本最低的一条——"pin 的 id 已经在本次调用的 `excluded_ids`
+    /// 里"，直接命中顶部早退分支。另外两条（`entry.disabled` / tier 过滤）走的
+    /// 是紧随其后同一个 `is_entry_available_for_model` 调用，与本条同源，不重复
+    /// 覆盖。
+    ///
+    /// 反事实（已现场验证，见 handoff `TEST_A_COUNTERFACTUAL`）：临时删掉
+    /// `reserve_existing_credential_excluding` 顶部的
+    /// `if excluded_ids.contains(&id) { return None; }` 早退检查，会让 pin 命中
+    /// 本该被否决的凭据 1，本测试真红。
+    #[tokio::test]
+    async fn test_balanced_pin_miss_falls_back_to_normal_selection() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        // 凭据 1 本身健康，但已经进了本次调用的 excluded_ids——同一个 id 既被
+        // pin 又被排除，`reserve_existing_credential_excluding` 必须否决它。
+        let excluded = HashSet::from([1u64]);
+        let ctx = manager
+            .acquire_context_for_session_excluding_pinned(None, None, &excluded, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.id, 2,
+            "pin 落空应回落到另一张健康凭据，而不是 bail 或空转"
+        );
+        manager.report_no_result(ctx.id);
+    }
+
+    /// `#101` 回归测试：priority 模式必须完全忽略 `pinned_id`——`pin_hit` 只在
+    /// `is_balanced` 分支才会被求值为 `Some`（`token_manager.rs` 约 1448 行
+    /// `let pin_hit = if is_balanced { ... } else { None };`），priority 模式下
+    /// 恒为 `None`，选路退回本来就靠 `current_id` 驱动的 `current_hit` 分支。
+    ///
+    /// 反事实（已现场验证，见 handoff `TEST_B_COUNTERFACTUAL`）：把
+    /// `let pin_hit = if is_balanced { ... } else { None };` 临时改成无条件求值
+    /// （去掉 `is_balanced` 守卫），priority 模式下 pin 也会生效，本测试真红。
+    #[tokio::test]
+    async fn test_priority_mode_ignores_pinned_id() {
+        let config = Config::default(); // 默认即 priority 模式
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        // 初始 current_id 指向优先级最高（priority 最小）的凭据 1；pin 指向凭据 2。
+        let ctx = manager
+            .acquire_context_for_session_excluding_pinned(None, None, &HashSet::new(), Some(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.id, 1,
+            "priority 模式必须忽略 pinned_id，仍走 current_id 选路"
+        );
+        manager.report_no_result(ctx.id);
+    }
+
     #[tokio::test]
     async fn test_balanced_session_sticky_reuses_successful_credential() {
         let mut config = Config::default();
