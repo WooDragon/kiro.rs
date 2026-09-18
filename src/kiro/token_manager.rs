@@ -1284,7 +1284,9 @@ impl MultiTokenManager {
                         .then_with(|| ea.credentials.priority.cmp(&eb.credentials.priority))
                         // 第三级 tiebreak：load 完全相等只发生在全 0 场景，而那
                         // 正是启动后第一批请求。无 id 兜底则结果依赖 Vec 迭代
-                        // 顺序，测试会变成薛定谔的绿。
+                        // 顺序，测试会变成薛定谔的绿。独立覆盖见
+                        // test_balanced_tiebreak_picks_smaller_id_regardless_of_insertion_order
+                        // （构造插入序与 id 大小顺序相反的凭据）。
                         .then_with(|| ea.id.cmp(&eb.id))
                 })?;
 
@@ -4084,9 +4086,13 @@ mod tests {
         assert_eq!(third.id, 3);
 
         // `#98`：此刻三张凭据 in_flight 均为 1、load 均为 0，新排序键完全打平，
-        // 决胜链落到 priority→id。三张凭据 priority 递增（0/1/2），所以第四次
-        // 选择必须仍是 priority 最高（数字最小）的 id 1——把 tiebreak 从隐含
-        // 行为变成显式断言。
+        // 决胜落到 priority 一级即可分出胜负。
+        // 注意：本夹具三张凭据的 priority(0/1/2) 恰好与 id 顺序重合，priority
+        // 一级就已决出胜者，故本断言在新旧排序键下表现相同，**不是**针对新键
+        // 的独立回归防护。区分新旧键的职责由 N1/N2/N3 承担；id 这一级
+        // tiebreak 的独立覆盖由 N15
+        // （test_balanced_tiebreak_picks_smaller_id_regardless_of_insertion_order）
+        // 承担。
         let fourth = manager.acquire_context(None).await.unwrap();
         assert_eq!(fourth.id, 1);
         manager.report_no_result(fourth.id);
@@ -4230,6 +4236,44 @@ mod tests {
         assert_eq!(
             next.id, 2,
             "凭据1 连续 5xx 应计入负载，不能因 success_count 仍是 0 而继续被选中"
+        );
+    }
+
+    /// N15：新排序键第三级 tiebreak（`id`）的独立覆盖。
+    ///
+    /// `CredentialEntry.id` 可由调用方通过 `KiroCredentials.id` 显式指定，与
+    /// `entries` 向量的插入顺序无必然关系（`new_with_clock`：`cred.id.unwrap_or_else(...)`
+    /// 只在未指定时才按插入序自动分配）。本测试利用这一点，构造插入顺序与
+    /// id 大小顺序**相反**的两张凭据——priority 相同、load 均 0、in_flight
+    /// 均 0，前两级 tiebreak 全部打平，只有 id 这一级能决出胜者，从而把
+    /// "选 id 较小者" 与 "选 Vec 迭代序中的第一个" 这两种可能行为区分开。
+    #[tokio::test]
+    async fn test_balanced_tiebreak_picks_smaller_id_regardless_of_insertion_order() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred_id2 = valid_access_credential("token-a", 0);
+        cred_id2.id = Some(2);
+        let mut cred_id1 = valid_access_credential("token-b", 0);
+        cred_id1.id = Some(1);
+
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
+            config,
+            // 插入顺序：id 2 在前、id 1 在后——与 id 大小顺序相反。
+            vec![cred_id2, cred_id1],
+            None,
+            None,
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        let selected = manager.acquire_context(None).await.unwrap();
+        assert_eq!(
+            selected.id, 1,
+            "priority/load/in_flight 全部打平时应选 id 较小者，而非插入序中的第一个"
         );
     }
 
