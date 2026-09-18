@@ -531,6 +531,15 @@ struct StatsEntry {
 /// 不做裸减法——即便实现被改坏也只退化成"不过期"，不会 underflow 成天文数字导致全表误清。
 pub(crate) trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+
+    /// `#98`：balanced 负载衰减用的**墙钟** Unix 毫秒。与上面的 `now_ms()`
+    /// 是两条互不相通的时间轴——`now_ms()` 是进程内单调相对毫秒，重启后基准
+    /// 归零；衰减需要跨进程重启仍能解释"停机了多久"，只能用墙钟。
+    ///
+    /// **sticky 子系统禁止调用这个方法**：sticky 的 TTL/LRU 判定必须留在
+    /// `now_ms()` 的单调轴上（见上方 trait 文档的 NTP 回退论证），混用会把
+    /// 两套时间语义绞在一起，NTP 回退时行为不再可预测。
+    fn now_unix_ms(&self) -> u64;
 }
 
 /// 生产时钟实现：基于进程启动时捕获的 `Instant` 基准，天然单调不回退。
@@ -549,6 +558,10 @@ impl ProcessClock {
 impl Clock for ProcessClock {
     fn now_ms(&self) -> u64 {
         self.base.elapsed().as_millis() as u64
+    }
+
+    fn now_unix_ms(&self) -> u64 {
+        Utc::now().timestamp_millis().max(0) as u64
     }
 }
 
@@ -985,6 +998,12 @@ impl MultiTokenManager {
     /// sticky 子系统当前时钟读数（毫秒），生产恒经 `ProcessClock`。
     fn now_ms(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// `#98`：balanced 负载衰减当前墙钟读数（Unix 毫秒），生产恒经 `ProcessClock`。
+    /// 不用于 sticky（见 `Clock::now_unix_ms` doc）。
+    fn now_unix_ms(&self) -> u64 {
+        self.clock.now_unix_ms()
     }
 
     fn is_entry_available_for_model(&self, entry: &CredentialEntry, model: Option<&str>) -> bool {
@@ -2985,27 +3004,48 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
 
-    /// 测试专用时钟（#86）：AtomicU64 手动推进，只增不减，
-    /// 用于精确驱动 sticky TTL / LRU 的边界判定，避免真实 sleep 拖慢测试。
+    /// 测试专用时钟（#86 + #98）：双 `AtomicU64`，`now_ms` 是 sticky 用的单调相对
+    /// 毫秒（起点 0），`now_unix_ms` 是 balanced 负载衰减用的墙钟毫秒。
+    ///
+    /// `now_unix_ms` 起点故意取非 0（`1_700_000_000_000`，约 2023-11）：`0` 是
+    /// `load_updated_at_ms` 的哨兵值（"无时间基准"），从 0 起步会让测试永远
+    /// 落在哨兵分支、测不到真实的衰减路径。
     struct TestClock {
         now_ms: AtomicU64,
+        now_unix_ms: AtomicU64,
     }
 
     impl TestClock {
+        const INITIAL_WALL_MS: u64 = 1_700_000_000_000;
+
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 now_ms: AtomicU64::new(0),
+                now_unix_ms: AtomicU64::new(Self::INITIAL_WALL_MS),
             })
         }
 
+        /// 两条时间轴一起推进——既有 sticky 测试只读 `now_ms`，行为不变；
+        /// 新增的负载衰减测试读 `now_unix_ms`。
         fn advance_ms(&self, delta_ms: u64) {
             self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
+            self.now_unix_ms.fetch_add(delta_ms, Ordering::SeqCst);
+        }
+
+        /// 只拨墙钟、不动 sticky 的单调轴——用于 NTP 回退用例（N7），
+        /// 单独验证 `current_load`/`decay_load_to` 面对时钟倒退时的自愈行为。
+        fn set_wall_ms(&self, wall_ms: u64) {
+            self.now_unix_ms.store(wall_ms, Ordering::SeqCst);
         }
     }
 
     impl Clock for TestClock {
         fn now_ms(&self) -> u64 {
             self.now_ms.load(Ordering::SeqCst)
+        }
+
+        fn now_unix_ms(&self) -> u64 {
+            self.now_unix_ms.load(Ordering::SeqCst)
         }
     }
 
