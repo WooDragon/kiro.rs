@@ -469,6 +469,13 @@ impl KiroProvider {
             // `#98`：5xx（上游服务端错误）独立预算，与 408/429 分支彻底分开——
             // 统一两条链路的凭据切换行为是阶段三的范围，本 PR 只加预算、不改换
             // 凭据语义，故此处仍保留 MCP 既有的 failed_credential_ids.insert。
+            //
+            // `#101`：`is_server_error()` 把 500/502/503/504 全族绑在同一个
+            // `MAX_5XX_RETRIES = 1` 上，是**有意收紧**不是漏拆——生产排查数据是
+            // 100/100 全 500，这个预算对 500 对症；503/504 以前能跟 429 一样重
+            // 试到 9 次，现在同样只给 1 次。若将来拿到 503/504 的黑盒数据表明
+            // 它们更接近 408 的"瞬态但预算应更宽"语义，可再单独拆分出去，本次
+            // 不改行为，只把这条取舍写清楚。
             if status.is_server_error() {
                 server_error_retries += 1;
                 tracing::warn!(
@@ -547,14 +554,27 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
         let session_id = Self::extract_session_id_from_request(request_body);
 
+        // `#101` MUST FIX 1：瞬态重试粘住本轮凭据。见
+        // `MultiTokenManager::acquire_context_for_session_excluding_pinned` 的
+        // doc comment 讲清动机与不变量。这里只需一条不变量：把"上一次实际拿到
+        // 的凭据"记下来，下一轮请求它。不必按分支手工设置/清除——凡是必须换
+        // 凭据的分支（402/401·403 失败/未知状态兜底）本来就会把该 id 写进
+        // `failed_credential_ids` 或让它被禁用，pin 在下一轮 reserve 时自然因
+        // 排除/禁用而落空、回落到常规选路；凡是允许继续用同一张的分支（408/429、
+        // 5xx、连接失败、以及 401/403 强制刷新成功后的同凭据重试）本来就不会
+        // 把它排除，下一轮 pin 原样生效。按分支特判"哪些该粘哪些该清"反而是
+        // 在复刻已经存在的排除逻辑，多一处就多一处两边失步的风险。
+        let mut pinned_credential_id: Option<u64> = None;
+
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context_for_session_excluding(
+                .acquire_context_for_session_excluding_pinned(
                     model.as_deref(),
                     session_id.as_deref(),
                     &failed_credential_ids,
+                    pinned_credential_id,
                 )
                 .await
             {
@@ -575,6 +595,11 @@ impl KiroProvider {
                     return Err(pe.into());
                 }
             };
+
+            // 记下这一轮实际拿到的凭据，作为下一轮重试（若发生）的 pin 候选。
+            // 是否真的粘住取决于下一轮 acquire 时它是否仍可预留——见上方
+            // `pinned_credential_id` 声明处的注释。
+            pinned_credential_id = Some(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -757,6 +782,13 @@ impl KiroProvider {
 
             // `#98`：5xx（上游服务端错误）独立于 429/408 的重试预算——与全局预算
             // 乘数完全正交，专治"同一次故障被乘以最多 9 次上游调用"。
+            //
+            // `#101`：`is_server_error()` 把 500/502/503/504 全族绑在同一个
+            // `MAX_5XX_RETRIES = 1` 上，是**有意收紧**不是漏拆——生产排查数据是
+            // 100/100 全 500，这个预算对 500 对症；503/504 以前能跟 429 一样重
+            // 试到 9 次，现在同样只给 1 次。若将来拿到 503/504 的黑盒数据表明
+            // 它们更接近 408 的"瞬态但预算应更宽"语义，可再单独拆分出去，本次
+            // 不改行为，只把这条取舍写清楚。
             if status.is_server_error() {
                 server_error_retries += 1;
                 tracing::warn!(
@@ -1031,6 +1063,18 @@ mod tests {
         )
     }
 
+    /// `#101`：与 [`Config::default`] 唯一区别是 `load_balancing_mode` 改
+    /// `"balanced"`。已确证事实（本次派发 prompt）——priority 模式下的既有
+    /// provider 测试从未覆盖过 balanced（`Config::default()` 的
+    /// `load_balancing_mode` 来自 `default_load_balancing_mode()` 即
+    /// `"priority"`），而生产落盘实测正是 balanced 模式下两次调用落在不同
+    /// 凭据上，故 P1/429 基线的反事实验证必须切到这个配置才有辨识力。
+    fn balanced_config() -> Config {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config
+    }
+
     /// 合法 JSON 请求体，携带 `extract_model_from_request` 需要的
     /// `conversationState.currentMessage.userInputMessage.modelId`，以及
     /// `extract_session_id_from_request` 需要的 `conversationId`。
@@ -1048,15 +1092,31 @@ mod tests {
     /// （429 不受 5xx 预算影响，`min(3*3,9)` 这个算式的结果本就等于
     /// `MAX_TOTAL_RETRIES`），故它同时兼任 plan 测试设计表里的 P2——commit 6
     /// 不重复添加 P2，只在其反事实验证环节复用这条测试。
+    ///
+    /// `#101` 改造：原函数名 "across_all_credentials" 描述的其实是
+    /// `min(3*3,9)=9` 这个总重试预算算式，不是"确实换过凭据"——priority 模式
+    /// 下这条测试恒在同一张凭据上打满 9 次，名字名不副实。改到 balanced 模式
+    /// 后，命名的名实关系反而更需要澄清：`#98` 引入的 load 排序本会在每次
+    /// 429（瞬态、不排除）重试时把凭据换走（本 PR MUST FIX 1 修复前的真实
+    /// 观测，见 `BLOCKED`/反事实记录），修复后又回到"9 次全部粘在同一张"——
+    /// 与 priority 模式殊途同归，与函数名字面意思仍然相反。故改名去掉
+    /// "across_all_credentials" 的误导，实际覆盖面见新 doc comment：
+    /// balanced 模式 + 瞬态错误 + 粘滞修复，9 次重试应全部落在同一张凭据。
     #[tokio::test]
-    async fn test_baseline_429_exhausts_all_retries_across_all_credentials() {
+    async fn test_baseline_429_exhausts_all_retries_pinned_to_one_credential() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("kiro-rs-test-429baseline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let _guard = TempDirGuard(temp_dir.clone());
+
         let stub = StubUpstream::start("429 Too Many Requests", r#"{"message":"slow down"}"#).await;
         let credentials = vec![
             api_key_credential(1, 0, None),
             api_key_credential(2, 1, None),
             api_key_credential(3, 2, None),
         ];
-        let provider = provider_with_stub(credentials, &stub);
+        let (provider, manager) =
+            provider_with_stub_and_manager_balanced(credentials, &stub, &temp_dir);
         let body = request_body("claude-sonnet-5");
 
         let result = provider.call_api_with_retry(&body, false).await;
@@ -1065,7 +1125,27 @@ mod tests {
         assert_eq!(
             stub.hits(),
             9,
-            "min(3 张凭据 × MAX_RETRIES_PER_CREDENTIAL(3), MAX_TOTAL_RETRIES(9)) == 9"
+            "min(3 张凭据 × MAX_RETRIES_PER_CREDENTIAL(3), MAX_TOTAL_RETRIES(9)) == 9，\
+             该算式与本 PR 的粘滞修复正交（429 分支本就不受 failed_credential_ids/pin 影响\
+             总重试次数，只影响落在哪张凭据上）"
+        );
+
+        drop(provider);
+        drop(manager);
+
+        let stats_path = temp_dir.join("kiro_stats.json");
+        let raw = std::fs::read_to_string(&stats_path)
+            .unwrap_or_else(|e| panic!("Drop 应已把 kiro_stats.json 落盘到 {stats_path:?}: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nonzero_loads: Vec<&str> = ["1", "2", "3"]
+            .into_iter()
+            .filter(|id| json[*id]["load"].as_f64().unwrap_or(0.0) > 0.0)
+            .collect();
+        assert_eq!(
+            nonzero_loads.len(),
+            1,
+            "MUST FIX 1：429 是瞬态分支，应粘住本轮凭据——9 次重试应全部落在同一张凭据上，\
+             故有且仅有一个 entry 的 load 非零，实际非零的凭据: {nonzero_loads:?}，落盘原文: {raw}"
         );
     }
 
@@ -1106,6 +1186,32 @@ mod tests {
         (provider, manager)
     }
 
+    /// 与 [`provider_with_stub_and_manager`] 等价，唯一区别是 [`balanced_config`]。
+    fn provider_with_stub_and_manager_balanced(
+        credentials: Vec<KiroCredentials>,
+        stub: &StubUpstream,
+        cache_dir: &std::path::Path,
+    ) -> (KiroProvider, Arc<MultiTokenManager>) {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                balanced_config(),
+                credentials,
+                None,
+                Some(cache_dir.join("credentials.json")),
+                false,
+                Arc::new(ModelRegistry::builtin()),
+            )
+            .unwrap(),
+        );
+        let provider = KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints_map(stub),
+            "test".to_string(),
+        );
+        (provider, manager)
+    }
+
     /// `Result::expect_err` 要求 `T: Debug`，但 `KiroApiResponse`（生产类型，
     /// 范围围栏之外，不改）没有派生 `Debug`——这个小 helper 手写等价逻辑，
     /// 不碰任何生产代码。
@@ -1128,6 +1234,12 @@ mod tests {
     /// （`credentials_path` 挂临时目录、`drop(provider)`/`drop(manager)` 触发
     /// `MultiTokenManager` 落盘、解析 `kiro_stats.json`）：3 张凭据里应有且仅
     /// 有一张 `load` 非零。
+    ///
+    /// `#101` MUST FIX 2：改到 balanced 模式跑（[`provider_with_stub_and_manager_balanced`]）
+    /// ——priority 模式下 `current_id` 本来就粘住，这条不变量在 priority 下测不出
+    /// `#98` 引入的 load 排序问题；已确证事实（本次派发 prompt）：balanced 模式下
+    /// 恒 500 的 3 凭据场景实测落盘 `load=1.0/1.0/0.0`，两次调用落在不同凭据上。
+    /// `hits==2` 与错误变体断言原样保留（5xx 预算与选路正交，见上方 doc）。
     #[tokio::test]
     async fn test_p1_5xx_budget_caps_upstream_hits_at_two() {
         let temp_dir =
@@ -1141,7 +1253,8 @@ mod tests {
             api_key_credential(2, 1, None),
             api_key_credential(3, 2, None),
         ];
-        let (provider, manager) = provider_with_stub_and_manager(credentials, &stub, &temp_dir);
+        let (provider, manager) =
+            provider_with_stub_and_manager_balanced(credentials, &stub, &temp_dir);
         let body = request_body("claude-sonnet-5");
 
         let result = provider.call_api_with_retry(&body, false).await;

@@ -1379,6 +1379,50 @@ impl MultiTokenManager {
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_excluding_pinned(model, session_id, excluded_ids, None)
+            .await
+    }
+
+    /// `#101`：与 [`Self::acquire_context_for_session_excluding`] 完全相同，多接受一个
+    /// `pinned_id`——调用方（目前只有 `call_api_with_retry` 的瞬态重试路径）传入
+    /// "上一次尝试已选中、这次仍想复用"的凭据 id。
+    ///
+    /// 动机（裁决理由，见 PR #101 评审 MUST FIX 1）：D3 保留"5xx/429 重试但不切换
+    /// 凭据"，其动机是换凭据会打断上游按内容前缀命中的缓存折扣（本仓黑盒结论
+    /// ~47% credits）。`#98` 把 balanced 模式的选路依据从"success_count 累加、
+    /// 瞬态失败不影响排序键"改成了"current_load + in_flight 实时重排"——而
+    /// `record_upstream_call` 在 `send()` **之前**就已经给本张记了一笔 load，
+    /// 于是紧跟着的瞬态重试在 balanced 模式下必然把它挤出"当前最低"，重试被
+    /// 静默换到另一张凭据。更严重的是：换走之后一旦成功，
+    /// `report_success_for_session` 会把整个会话的 sticky 绑到**新**凭据上——
+    /// 一次瞬态错误就迁走了整条会话，是 `#86` 修掉的"大面积换号丢热缓存"同构
+    /// 复发。本 PR 之前不存在这个问题：旧排序键（`success_count` 主导）在瞬态
+    /// 失败时纹丝不动，下一轮自然还选同一张；是 `#98` 让 load 参与排序才打断
+    /// 了这条不变量。
+    ///
+    /// 粘滞只是"偏好"：只在 balanced 模式下生效（`is_balanced` 判据之外，方法
+    /// 体与旧签名逐字相同，对 priority 模式零观测差异——priority 本来就靠
+    /// `current_id` 粘住，不需要也不该被这里的 pin 覆盖，避免并发场景下
+    /// `current_id` 漂移与本调用自身的 pin 产生行为分叉）。命中优先于 sticky
+    /// 会话表查找（这是"同一次调用内部的重试"，比跨请求的 session 级绑定更
+    /// 具体）；pin 的凭据若在此期间变得不可用（被并发禁用、被 tier 过滤、已在
+    /// `excluded_ids` 里）—— `reserve_existing_credential_excluding` 内部的
+    /// `is_entry_available_for_model_excluding` 检查会自然返回 `None`——立即
+    /// 回落到本方法原有的 sticky/current_id/balanced 选路逻辑，不 bail、不
+    /// 空转。复用既有的"按指定 id 预留"能力（`reserve_existing_credential_excluding`，
+    /// 本来就是 priority 模式 `current_hit` 用的那条路径），不另造一套平行选路。
+    ///
+    /// 调用契约：只负责"选谁"，不改变"记不记账"——`record_upstream_call` 仍由
+    /// 调用方在 `send()` 之前对每次真实发出的上游调用调用一次；in_flight 的
+    /// reserve/release 配对同样不变（pin 命中也走 `reserve_existing_credential_excluding`，
+    /// 与非 pin 路径完全相同的 reserve 语义）。
+    pub(crate) async fn acquire_context_for_session_excluding_pinned(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        pinned_id: Option<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1398,7 +1442,22 @@ impl MultiTokenManager {
             let (id, credentials, sticky_hit) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                let sticky_hit = if is_balanced {
+                // `#101`：pin 只在 balanced 模式生效、且优先于 sticky 会话表查找
+                // （见方法 doc comment）；priority 模式忽略 pinned_id，走下方与
+                // 旧签名完全相同的 current_hit 分支，零观测差异。
+                let pin_hit = if is_balanced {
+                    pinned_id.and_then(|pid| {
+                        self.reserve_existing_credential_excluding(
+                            pid,
+                            model,
+                            &selection_excluded_ids,
+                        )
+                    })
+                } else {
+                    None
+                };
+
+                let sticky_hit = if pin_hit.is_none() && is_balanced {
                     session_id.and_then(|sid| {
                         self.select_sticky_credential(sid, model, &selection_excluded_ids)
                     })
@@ -1408,7 +1467,7 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if sticky_hit.is_some() || is_balanced {
+                let current_hit = if pin_hit.is_some() || sticky_hit.is_some() || is_balanced {
                     None
                 } else {
                     let current_id = *self.current_id.lock();
@@ -1419,7 +1478,13 @@ impl MultiTokenManager {
                     )
                 };
 
-                if let Some((hit_id, _hit_credentials)) = sticky_hit {
+                if let Some((pin_id, pin_credentials)) = pin_hit {
+                    // pin 命中：这次尝试沿用上一次尝试已选中的凭据。不是 sticky
+                    // 会话表命中，也不是"粘性机制未启用"，三态里都不精确对应，
+                    // 归为 N/A（None）——与 priority 模式 current_hit 分支同值，
+                    // 对下游日志不新增第四态。
+                    (pin_id, pin_credentials, None)
+                } else if let Some((hit_id, _hit_credentials)) = sticky_hit {
                     match self.reserve_existing_credential_excluding(
                         hit_id,
                         model,
@@ -1476,8 +1541,10 @@ impl MultiTokenManager {
                     }
                 } else if let Some((hit_id, hit_credentials)) = current_hit {
                     // current_hit 只在 is_balanced==false 时才可能非 None（见上方
-                    // `let current_hit = if sticky_hit.is_some() || is_balanced { None } else {...}`），
-                    // 即此分支恒为 priority 模式，粘性机制未启用，语义是 N/A 不是"未命中"。
+                    // `let current_hit = if pin_hit.is_some() || sticky_hit.is_some() ||
+                    // is_balanced { None } else {...}`；pin_hit 恒为 None 因为它本身只在
+                    // is_balanced 时才会被求值为 Some），即此分支恒为 priority 模式，
+                    // 粘性机制未启用，语义是 N/A 不是"未命中"。
                     (hit_id, hit_credentials, None)
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -1510,9 +1577,10 @@ impl MultiTokenManager {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        // 这个分支在 balanced 模式（sticky 桶查无记录，真实未命中）和 priority
-                        // 模式（粘性机制未启用，current_hit 落空只是常规选择）都会走到，
-                        // 必须靠 is_balanced 区分，不能像其余分支那样从路径本身唯一推出结论。
+                        // 这个分支在 balanced 模式（pin 未命中/未提供 + sticky 桶查无记录，
+                        // 真实未命中）和 priority 模式（粘性机制未启用，current_hit 落空只是
+                        // 常规选择）都会走到，必须靠 is_balanced 区分，不能像其余分支那样从
+                        // 路径本身唯一推出结论。
                         (
                             new_id,
                             new_creds,
