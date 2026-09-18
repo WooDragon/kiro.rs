@@ -332,6 +332,7 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
+            self.token_manager.record_upstream_call(ctx.id, None);
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -577,6 +578,8 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
+            self.token_manager
+                .record_upstream_call(ctx.id, model.as_deref());
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {

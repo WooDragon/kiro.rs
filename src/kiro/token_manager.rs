@@ -1267,21 +1267,28 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used + in-flight 策略：选择已成功和正在处理请求总量最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                //
-                // `#98`（本 commit 尚不改选路行为）：`balanced_offset` 字段已随 §A
-                // 删除，这里暂时只是去掉那一项——真正切到按衰减 credit 负载排序
-                // 的新键在下一个 commit（§B.3）落地。
-                let idx = available.iter().min_by_key(|idx| {
-                    let e = &entries[**idx];
-                    (
-                        e.success_count.saturating_add(e.in_flight_count),
-                        e.credentials.priority,
-                    )
+                // 按衰减 credit 负载排序（#98）：load 是按调用权重累加、随时间
+                // 指数衰减的读侧惰性值；in_flight 按本次请求权重折算成同一量纲
+                // 一起参与比较，平局按优先级、再按 id 决胜。
+                let now_unix_ms = self.now_unix_ms();
+                let weight = self.model_registry.credit_weight_by_kiro_id(model);
+                let idx = *available.iter().min_by(|a, b| {
+                    let (ea, eb) = (&entries[**a], &entries[**b]);
+                    let ka = ea.current_load(now_unix_ms) + ea.in_flight_count as f64 * weight;
+                    let kb = eb.current_load(now_unix_ms) + eb.in_flight_count as f64 * weight;
+                    // f64 非 Ord，必须显式全序。用 total_cmp 而非
+                    // partial_cmp().unwrap_or(Equal)：前者把 NaN 排在所有数之后
+                    // （NaN 凭据被避开，安全方向失败），后者把 NaN 当平局、让它
+                    // 靠 priority 赢下选择。
+                    ka.total_cmp(&kb)
+                        .then_with(|| ea.credentials.priority.cmp(&eb.credentials.priority))
+                        // 第三级 tiebreak：load 完全相等只发生在全 0 场景，而那
+                        // 正是启动后第一批请求。无 id 兜底则结果依赖 Vec 迭代
+                        // 顺序，测试会变成薛定谔的绿。
+                        .then_with(|| ea.id.cmp(&eb.id))
                 })?;
 
-                Some(Self::reserve_credential(&mut entries[*idx], Utc::now()))
+                Some(Self::reserve_credential(&mut entries[idx], Utc::now()))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -2295,6 +2302,11 @@ impl MultiTokenManager {
     /// 报告请求已结束但不应影响凭据健康或成功计数。
     pub fn report_no_result(&self, id: u64) {
         self.release_in_flight(id);
+        // `#98`：这是 6 个 `report_*` 里唯一原本不标脏的一个，而它恰好是
+        // 5xx/429/连接失败三条路径的收尾——也就是新增 load 增量里占比最大
+        // 的那部分。此处调用时 `release_in_flight` 已释放 entries 锁，满足
+        // 「先释放 entries 再标记版本号」的落盘不变量。
+        self.save_stats_debounced();
     }
 
     /// `#98`：记录一次真实发生的上游调用，把它按 credit 权重计入 balanced 负载。
@@ -3929,6 +3941,10 @@ mod tests {
             .acquire_context_for_session(None, Some("session-1"))
             .await
             .unwrap();
+        // provider 在 send() 之前会对本次上游调用计量；本测试直接调 token_manager
+        // API 绕过了 provider，故显式补上这一步。缺了它，两张凭据的 load 恒为
+        // 0，新排序键全等、只能靠 priority→id 决胜，跨 session 轮转就不会发生。
+        manager.record_upstream_call(first.id, None);
         manager.report_success_for_session(first.id, Some("session-1"));
         assert_eq!(
             manager
@@ -3944,6 +3960,7 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(second_session.id, first.id);
+        manager.record_upstream_call(second_session.id, None);
         manager.report_success_for_session(second_session.id, Some("session-2"));
         assert_eq!(
             manager
@@ -4066,25 +4083,30 @@ mod tests {
         assert_eq!(second.id, 2);
         assert_eq!(third.id, 3);
 
+        // `#98`：此刻三张凭据 in_flight 均为 1、load 均为 0，新排序键完全打平，
+        // 决胜链落到 priority→id。三张凭据 priority 递增（0/1/2），所以第四次
+        // 选择必须仍是 priority 最高（数字最小）的 id 1——把 tiebreak 从隐含
+        // 行为变成显式断言。
+        let fourth = manager.acquire_context(None).await.unwrap();
+        assert_eq!(fourth.id, 1);
+        manager.report_no_result(fourth.id);
+
         manager.report_no_result(first.id);
         manager.report_no_result(second.id);
         manager.report_no_result(third.id);
     }
 
-    /// `#98`：这条测试正处在两次 commit 之间的过渡态——add_credential 的播种
-    /// 逻辑（§C）本 commit 已经切到读 `load` 字段，`balanced_offset` 字段已随
-    /// §A 一并删除，测试构造与旧字段名必须同步调整才能编译；但 balanced 模式
-    /// 的**选路键**要到下一个 commit（§B.3）才切到读 `load`，本 commit 仍是旧的
-    /// `success_count + in_flight` 键——用新字段 `load` 播种、旧键选路两者语义
-    /// 不再一致，尾部两条选路顺序断言在本 commit 下不成立，故先删去，改成只
-    /// 断言 §C 播种本身的正确性；选路顺序断言与函数改名在下一个 commit 随新键
-    /// 一起补回（task 派发文档 commit #4 的既定范围）。
     #[tokio::test]
-    async fn test_balanced_new_credential_uses_offset_without_changing_success_count() {
+    async fn test_balanced_new_credential_seeds_load_from_current_minimum() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
-        let manager = MultiTokenManager::new(
+        // 用 TestClock 固定墙钟：真实时钟会在 add_credential 播种与随后两次
+        // acquire 之间流逝几微秒，导致播种值相对 entries[0] 的哨兵值（永不
+        // 衰减）产生浮点误差、打破本该精确相等的平局，使 tiebreak 断言变
+        // flaky。
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
             config,
             vec![
                 valid_access_credential("token-1", 0),
@@ -4094,6 +4116,7 @@ mod tests {
             None,
             false,
             test_registry(),
+            clock.clone(),
         )
         .unwrap();
 
@@ -4112,16 +4135,101 @@ mod tests {
 
         let new_id = manager.add_credential(new_credential).await.unwrap();
 
-        let entries = manager.entries.lock();
-        let new_entry = entries.iter().find(|e| e.id == new_id).unwrap();
-        assert_eq!(new_entry.success_count, 0, "T4：success_count 不再参与播种");
-        assert!(
-            (new_entry.load - 100.0).abs() < 1e-9,
-            "播种值应是未禁用凭据里 current_load 的最小值（100.0），而非 120.0"
+        {
+            let entries = manager.entries.lock();
+            let new_entry = entries.iter().find(|e| e.id == new_id).unwrap();
+            assert_eq!(new_entry.success_count, 0, "T4：success_count 不再参与播种");
+            assert!(
+                (new_entry.load - 100.0).abs() < 1e-9,
+                "播种值应是未禁用凭据里 current_load 的最小值（100.0），而非 120.0"
+            );
+            assert_ne!(
+                new_entry.load_updated_at_ms, 0,
+                "播种时应记录时间基准，而非停在哨兵值"
+            );
+        }
+
+        // `#98`：新排序键已在本 commit 生效，选路顺序断言随之补回。
+        // 首选：token-1（load=100.0）与 new（播种值 100.0）平局，priority 0<2
+        // 选 token-1（id 1）。
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        // 次选：token-1 因刚被选中 in_flight=1，键变成 101.0 > 100.0，new 反超
+        // 当选。
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, new_id);
+    }
+
+    // ===== #98 §B.3：新排序键（N1-N2） =====
+
+    /// N1：根因 1（旧键以调用次数计量，不折算 credit 单位）。
+    ///
+    /// 凭据1 记 1 次 sol（权重 2.4）→ load=2.4；凭据2 记 2 次 luna（权重 0.6）
+    /// → load=1.2。凭据2 次数更多但 credit 更少，新键应选它。
+    #[tokio::test]
+    async fn test_balanced_selection_weighs_by_credit_not_call_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.record_upstream_call(1, Some("gpt-5.6-sol"));
+        manager.record_upstream_call(2, Some("gpt-5.6-luna"));
+        manager.record_upstream_call(2, Some("gpt-5.6-luna"));
+
+        let next = manager.acquire_context(None).await.unwrap();
+        assert_eq!(
+            next.id, 2,
+            "凭据2 调用次数更多（2 次）但折算 credit 更少（1.2 < 2.4），新键应选它"
         );
-        assert_ne!(
-            new_entry.load_updated_at_ms, 0,
-            "播种时应记录时间基准，而非停在哨兵值"
+    }
+
+    /// N2：根因 2（失败调用不计量，5xx 刷屏的凭据反而看起来"更闲"）。
+    ///
+    /// 凭据1 连续 5 次 5xx（`record_upstream_call` + `report_no_result`，一次
+    /// 未成功）；凭据2 只成功 1 次。旧键（`success_count + in_flight`）下凭据1
+    /// success=0、凭据2=1，会错误地继续把请求灌给已经在刷 5xx 的凭据1；新键
+    /// 应选凭据2，直接钉死这条正反馈回路。
+    #[tokio::test]
+    async fn test_balanced_selection_counts_failed_calls_too() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        for _ in 0..5 {
+            manager.record_upstream_call(1, None);
+            manager.report_no_result(1);
+        }
+        manager.record_upstream_call(2, None);
+        manager.report_success(2);
+
+        let next = manager.acquire_context(None).await.unwrap();
+        assert_eq!(
+            next.id, 2,
+            "凭据1 连续 5xx 应计入负载，不能因 success_count 仍是 0 而继续被选中"
         );
     }
 
@@ -4162,10 +4270,7 @@ mod tests {
 
         let (load1, load2) = {
             let entries = manager.entries.lock();
-            (
-                entries[0].current_load(now1),
-                entries[1].current_load(now1),
-            )
+            (entries[0].current_load(now1), entries[1].current_load(now1))
         };
         assert!(
             (load1 - 50.0).abs() < 1e-6,
@@ -4184,10 +4289,7 @@ mod tests {
         }
         let (load1_after, load2_after) = {
             let entries = manager.entries.lock();
-            (
-                entries[0].current_load(now1),
-                entries[1].current_load(now1),
-            )
+            (entries[0].current_load(now1), entries[1].current_load(now1))
         };
         assert!(
             load1_after < load2_after,
@@ -4634,9 +4736,15 @@ mod tests {
         let config = Config::default();
         // 默认凭据缺少 refreshToken，try_ensure_token 会同步失败（validate_refresh_token
         // 报"缺少 refreshToken"），不发起任何网络请求，失败路径确定性触发。
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false, test_registry())
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
 
         {
             let mut entries = manager.entries.lock();
