@@ -3213,6 +3213,22 @@ mod tests {
         Arc::new(ModelRegistry::from_toml(include_str!("../../models.toml")).unwrap())
     }
 
+    /// registry.rs N13 第三段专用（`#98`）：真实 `models.toml` 剥离全部
+    /// `credit_weight` 行后构造的 registry。与 `registry.rs` 里
+    /// `test_deleting_credit_weight_fields_maintains_functionality` 用的是
+    /// 同一份过滤逻辑（按行前缀剔除），刻意不共享代码——那条测试在
+    /// `model::registry` 模块、本模块在 `kiro::token_manager`，为一行
+    /// 字符串过滤拉一条跨模块可见性通道不划算。
+    fn test_registry_without_credit_weight_fields() -> Arc<ModelRegistry> {
+        let raw = include_str!("../../models.toml");
+        let stripped: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("credit_weight"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Arc::new(ModelRegistry::from_toml(&stripped).unwrap())
+    }
+
     /// 构造一个 `stats_path()` 可写的 manager（#86 返工统计落盘回归测试专用）。
     /// 返回 `(manager, 临时凭据目录)`，调用方用完须 `remove_dir_all` 清理。
     /// 测试专用清理 guard：无论测试函数体正常返回还是因断言失败 panic 退出，
@@ -4237,6 +4253,55 @@ mod tests {
         assert_eq!(
             next.id, 2,
             "凭据2 调用次数更多（2 次）但折算 credit 更少（1.2 < 2.4），新键应选它"
+        );
+    }
+
+    /// registry.rs N13 第三段（`#98` 返工 MUST FIX C1）：删除全部
+    /// `credit_weight` 字段后，balanced 选路仍然正常——用真实剥权重
+    /// 的 registry 喂给一个 2 凭据 balanced manager，跑
+    /// `acquire → record_upstream_call → acquire`，断言第二次选中
+    /// 另一张凭据。
+    ///
+    /// 这段是 registry.rs 里 `test_deleting_credit_weight_fields_maintains_functionality`
+    /// （N13）doc comment 承诺覆盖、但此前实际只测到 registry 层、从未
+    /// 跑过选路的那一段验收——issue 验收清单「删除全部 credit_weight 字段后
+    /// 选路正常、无 panic」由本测试兑现；registry.rs 处留了指引，不重复
+    /// 描述覆盖内容避免两处 doc 打架。
+    ///
+    /// 第一次 `acquire_context` 的 `model` 参数传一个真实存在的 kiro_id
+    /// （`gpt-5.6-sol`，剥权重后回落默认 1.0），让 `credit_weight_by_kiro_id`
+    /// 的查表路径真的被走到，不是靠 `None` 的 1.0 短路蒙混过关。
+    ///
+    /// 反事实验证：把下方 `assert_eq!(next.id, ...)` 改成断言选中同一张
+    /// （即预期值从"另一张"换成"第一次选中的那张"），会因 record 后该凭据
+    /// 负载更高、选路选走另一张而断言失败——证明这段真的在观察选路结果，
+    /// 不是恒绿。
+    #[tokio::test]
+    async fn test_balanced_selection_survives_credit_weight_fields_removed() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+            test_registry_without_credit_weight_fields(),
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(Some("gpt-5.6-sol")).await.unwrap();
+        manager.record_upstream_call(first.id, Some("gpt-5.6-sol"));
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_ne!(
+            second.id, first.id,
+            "删除全部 credit_weight 字段后，balanced 选路仍应正常运作：\
+             第一张凭据记过一次调用负载更高，第二次 acquire 应选中另一张"
         );
     }
 
