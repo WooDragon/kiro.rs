@@ -523,6 +523,31 @@ impl CredentialEntry {
 
     /// 写侧：把 `load` 就地衰减到 `now_unix_ms`，并推进 `load_updated_at_ms`。
     fn decay_load_to(&mut self, now_unix_ms: u64) {
+        // 基准合理性检查（#98 返工 MUST FIX）：若 `load_updated_at_ms` 超前当前墙钟
+        // 超过一个半衰期，视其为不可信、强制拉回当前墙钟——`load` 本身不动，因为
+        // 此刻已无法推断该衰减多少，保守地按"不衰减"处理。
+        //
+        // 触发场景：宿主墙钟被短暂校正前跳（chrony 收敛前 / VM 快照恢复 / RTC 故障），
+        // 该凭据恰在前跳窗口内被记了一笔，`load_updated_at_ms` 被盖上一个远未来的戳；
+        // 随后墙钟被 NTP 步进校正回正确时间。此时下面这段之前的逻辑会一直判定
+        // `now_unix_ms <= load_updated_at_ms`（时钟"倒退"），既不衰减 `load` 也不
+        // 推进基准——直到真实时间重新追上那个远未来的戳为止，其间该凭据的排序键
+        // 单调只增不减，balanced 模式会一直跳过它。
+        //
+        // 阈值刻意取 `LOAD_HALF_LIFE_MS` 本身，不另立更小的常量：更小的阈值会把
+        // T2（时钟小幅回退时暂停衰减、追上即自愈）那条既有路径一并破坏掉；取一个
+        // 半衰期同时把这里能覆盖到的最坏冻结时间封顶到与"已知代价 4"（未被校正的
+        // 前跳，一次性归零、自愈时间=一个半衰期）同一量级。
+        //
+        // 残留窗口（已知、有界）：本函数只在该凭据被 `record_load`/`decay_load_to`
+        // 触达时才生效——若凭据因 load 偏高而一直不被选中、进程又不重启，这里够
+        // 不着它，要等 `load_stats` 载入回填处（下次重启）才自愈。不为消灭这个残留
+        // 窗口去改排序路径或引入定时扫描，那会引入更难推理的状态。
+        if self.load_updated_at_ms > now_unix_ms
+            && self.load_updated_at_ms - now_unix_ms > LOAD_HALF_LIFE_MS as u64
+        {
+            self.load_updated_at_ms = now_unix_ms;
+        }
         self.load = self.current_load(now_unix_ms);
         // 时钟倒退时不推进基准，否则恢复正常后会一次性补算掉本不该衰减的那段。
         if now_unix_ms > self.load_updated_at_ms || self.load_updated_at_ms == 0 {
@@ -2049,6 +2074,7 @@ impl MultiTokenManager {
             }
         };
 
+        let now_unix_ms = self.now_unix_ms();
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
@@ -2056,6 +2082,18 @@ impl MultiTokenManager {
                 entry.load = s.load;
                 entry.load_updated_at_ms = s.load_updated_at_ms;
                 entry.last_used_at = s.last_used_at.clone();
+                // 基准合理性检查（#98 返工 MUST FIX，与 `decay_load_to` 同一判据）：
+                // 磁盘上的 `load_updated_at_ms` 若超前当前墙钟超过一个半衰期，说明
+                // 落盘时宿主墙钟正处于前跳窗口内、之后被校正——这是本缺陷"跨重启
+                // 存活"的那一面：不重置就要靠该凭据下次被 `decay_load_to`/`record_load`
+                // 触达才自愈，而它恰恰因排序键偏高一直选不中，导致只能手工改
+                // `kiro_stats.json`。载入即重置让重启本身就是自愈点。`load` 值不动，
+                // 理由同 `decay_load_to`。
+                if entry.load_updated_at_ms > now_unix_ms
+                    && entry.load_updated_at_ms - now_unix_ms > LOAD_HALF_LIFE_MS as u64
+                {
+                    entry.load_updated_at_ms = now_unix_ms;
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -2230,10 +2268,11 @@ impl MultiTokenManager {
         // 还是之后"的关键。
         //
         // ⚠️ 不变量（`save_stats` 的 doc comment 有完整推导，这里只放告警）：
-        // 本函数是当前唯一的标记点，且全部 5 个调用方
+        // 本函数是当前唯一的标记点，且全部 6 个调用方
         // （report_success/report_quota_exhausted/report_failure/
-        // report_refresh_failure/report_refresh_token_invalid）都保证先释放
-        // entries 锁、完成对 entries 的修改，再调用本函数标记版本号。这个顺序
+        // report_refresh_failure/report_refresh_token_invalid/report_no_result，
+        // 最后一个由 #98 新增）都保证先释放 entries 锁、完成对 entries 的修改，
+        // 再调用本函数标记版本号。这个顺序
         // 是 `stats_saved_version` 清脏正确性的地基——新增任何调用点，都必须在
         // entries 修改**提交、锁释放之后**才调用本函数；一旦反过来（先标记后
         // 改 entries），落盘可能在标记之后、entries 修改之前完成，那次修改就会
@@ -4568,6 +4607,145 @@ mod tests {
             entry.load, 1.0,
             "未登记模型应精确按权重 1.0 计入，实际 {}",
             entry.load
+        );
+    }
+
+    /// N16（#98 返工 MUST FIX）：被校正的时钟前跳不应让衰减永久冻结。
+    ///
+    /// 场景还原：宿主墙钟一度前跳到 `now0`（chrony 收敛前 / VM 快照恢复），该
+    /// 凭据恰在这一刻被记了一笔，`load_updated_at_ms` 被盖上 `now0` 这个"未来"
+    /// 戳；随后 NTP 把墙钟校正回 `now0 - 24h`（超过 12h 半衰期阈值）。在旧逻辑
+    /// 下，这之后每次 `decay_load_to` 都会判定"时钟倒退"而拒绝推进基准、也不
+    /// 衰减——直到真实时间重新追上 `now0` 为止，load 只增不减，这个凭据在
+    /// balanced 排序里会被冻结在高位、永不被选中。
+    ///
+    /// 反事实：把 `decay_load_to` 里的基准合理性检查删掉重跑本测试，最终
+    /// `current_load` 应稳定停在 150.0（100 冻结未衰减 + 50 新记，advance 12h
+    /// 后仍判定"倒退"不衰减），与断言的约 75.0 不符，真红。
+    #[test]
+    fn test_decay_load_to_resets_basis_after_corrected_clock_jump() {
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![valid_access_credential("token-1", 0)],
+            None,
+            None,
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        // 模拟前跳：在"未来"时刻 now0 记一笔，基准被盖上 now0。
+        let now0 = clock.now_unix_ms();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].record_load(100.0, now0);
+        }
+
+        // 模拟 NTP 校正：墙钟被拨回 now0 之前 24 小时（超过 12h 半衰期阈值，
+        // 触发基准合理性检查；N7 覆盖的是 1 小时回拨，不越过阈值，两者互补）。
+        let corrected = now0 - 24 * 60 * 60 * 1000;
+        clock.set_wall_ms(corrected);
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].record_load(50.0, corrected);
+        }
+
+        {
+            let entries = manager.entries.lock();
+            assert_eq!(
+                entries[0].load_updated_at_ms, corrected,
+                "基准应被拉回校正后的墙钟，而非停在超前的 now0"
+            );
+            assert!(
+                (entries[0].load - 150.0).abs() < 1e-9,
+                "重置基准的那一刻不应衰减（无法推断该衰减多少），只叠加新权重：100 + 50 = 150，实际 {}",
+                entries[0].load
+            );
+        }
+
+        // 校正之后，时间照常往前走 12 小时——应恢复正常半衰期衰减。
+        clock.advance_ms(12 * 60 * 60 * 1000);
+        let after = clock.now_unix_ms();
+        let load = {
+            let entries = manager.entries.lock();
+            entries[0].current_load(after)
+        };
+        assert!(
+            (load - 75.0).abs() < 1e-6,
+            "校正后正常前进 12h（1 个半衰期）应从 150 衰减到约 75.0，实际 {load}"
+        );
+    }
+
+    /// N16 补充：`load_stats` 载入回填处的同一条基准合理性检查——覆盖"跨重启
+    /// 存活"这一面。磁盘上的 `load_updated_at_ms` 本身就是前跳窗口内落盘的
+    /// "未来"戳，新进程启动时墙钟已经是校正后的正常时间，载入应立即自愈，
+    /// 不必等这枚凭据下次被 `record_load` 触达。
+    ///
+    /// 反事实：把 `load_stats` 里新增的重置检查删掉重跑本测试，`load_updated_at_ms`
+    /// 会原样读回超前的 `future_basis`，`current_load(wall_at_restart)` 因
+    /// `saturating_sub` 钳零而返回未衰减的 80.0，与断言的约 40.0 不符，真红。
+    #[test]
+    fn test_load_stats_resets_basis_when_disk_timestamp_is_ahead_of_wall_clock() {
+        let cred_dir =
+            std::env::temp_dir().join(format!("kiro-load-future-basis-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let _cleanup = TempDirGuard(cred_dir.clone());
+
+        // 重启时的墙钟固定在某个基准点；磁盘上的 load_updated_at_ms 比它超前
+        // 24 小时（同样越过 12h 半衰期阈值），模拟"前跳窗口内落盘、之后被
+        // NTP 校正回来才重启"。
+        let clock = TestClock::new();
+        let wall_at_restart = clock.now_unix_ms();
+        let future_basis = wall_at_restart + 24 * 60 * 60 * 1000;
+        std::fs::write(
+            cred_dir.join("kiro_stats.json"),
+            format!(
+                r#"{{"1":{{"success_count":3,"load":80.0,"load_updated_at_ms":{future_basis},"last_used_at":null}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_dir.join("credentials.json")),
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(
+                entry.load_updated_at_ms, wall_at_restart,
+                "载入即应把超前的基准重置为当前墙钟，实际 {}",
+                entry.load_updated_at_ms
+            );
+            assert!(
+                (entry.load - 80.0).abs() < 1e-9,
+                "重置基准不应连带改动 load 的裸值，实际 {}",
+                entry.load
+            );
+        }
+
+        clock.advance_ms(12 * 60 * 60 * 1000);
+        let load = {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            entry.current_load(clock.now_unix_ms())
+        };
+        assert!(
+            (load - 40.0).abs() < 1e-6,
+            "重启后正常前进 12h（1 个半衰期）应从 80 衰减到约 40.0，实际 {load}"
         );
     }
 
