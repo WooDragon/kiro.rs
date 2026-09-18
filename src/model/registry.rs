@@ -618,49 +618,49 @@ credit_weight = 2.5
     #[test]
     fn test_credit_weight_values_in_production_models_toml() {
         // N14：权重数值护栏 —— 对真实 models.toml 断言数值完整性。
+        //
+        // `#99`：官方一手来源（https://kiro.dev/docs/models，2026-09-17 版本）
+        // 更新前，claude 全族 9 条压根没配 credit_weight（走 serde default
+        // 1.0 回落），GPT-5.6 三条的取值来自未背书的人工注释。现在 12 条
+        // 全部有非默认权重，逐条断言官方值——不再对 claude 全族断言
+        // "回落 1.0"，那个断言此后表达的是「忘记配置」而非「等权重」。
         let registry = ModelRegistry::builtin();
 
-        // 三个 GPT-5.6 模型的权重确为指定值
+        let expected: &[(&str, f64)] = &[
+            ("claude-opus-5", 2.2),
+            ("claude-opus-4.8", 2.2),
+            ("claude-opus-4.7", 2.2),
+            ("claude-opus-4.6", 2.2),
+            ("claude-opus-4.5", 2.2),
+            ("claude-sonnet-5", 1.3),
+            ("claude-sonnet-4.6", 1.3),
+            ("claude-sonnet-4.5", 1.3),
+            ("claude-haiku-4.5", 0.4),
+            ("gpt-5.6-sol", 4.4),
+            ("gpt-5.6-terra", 2.2),
+            ("gpt-5.6-luna", 1.1),
+        ];
+
+        // 前提断言：防止在空集合/漏项上恒真通过——上表必须恰好覆盖
+        // models.toml 里全部 12 条目，一个不多一个不少。
         assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-sol")),
-            2.4,
-            "gpt-5.6-sol credit_weight 应为 2.4"
+            expected.len(),
+            12,
+            "前提：官方权重表应恰好覆盖 12 个 kiro_id（9 claude + 3 GPT-5.6）"
         );
         assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-terra")),
-            1.2,
-            "gpt-5.6-terra credit_weight 应为 1.2"
-        );
-        assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-luna")),
-            0.6,
-            "gpt-5.6-luna credit_weight 应为 0.6"
+            registry.entries.len(),
+            12,
+            "前提：models.toml 应恰好有 12 条模型条目，与官方权重表逐一对应；\
+             实际 {} 条，说明表内条目增减但本测试未同步",
+            registry.entries.len()
         );
 
-        // `#98` 返工 SUGGESTION C4：原先只抽查 2 个 claude 条目，改成遍历全部
-        // 非 gpt 条目断言 credit_weight == 1.0。该测试的价值就是钉死「claude
-        // 全族等权重」这个假设——只抽查 2 条时，手滑给某个没被抽到的 claude
-        // 条目加上权重不会让测试变红。
-        //
-        // 前提断言：证明「非 gpt 条目」这个集合非空。没有它，若过滤条件写错
-        // （比如 kiro_id 前缀拼错）导致集合变空，下面的遍历会在空集合上
-        // 恒真通过，退化成又一个恒绿测试。
-        let non_gpt_entries: Vec<&ModelEntry> = registry
-            .entries
-            .iter()
-            .filter(|e| !e.kiro_id.starts_with("gpt"))
-            .collect();
-        assert!(
-            !non_gpt_entries.is_empty(),
-            "前提：models.toml 中确实存在非 gpt 条目（claude 全族），\
-             否则下面的遍历断言会在空集合上恒真"
-        );
-        for entry in &non_gpt_entries {
+        for (kiro_id, weight) in expected {
             assert_eq!(
-                registry.credit_weight_by_kiro_id(Some(&entry.kiro_id)),
-                1.0,
-                "{} 未配 credit_weight，应回落 1.0（claude 全族等权重）",
-                entry.kiro_id
+                registry.credit_weight_by_kiro_id(Some(kiro_id)),
+                *weight,
+                "{kiro_id} credit_weight 应为 {weight}（Kiro 官方倍率，基准 1.0x = Auto）"
             );
         }
     }

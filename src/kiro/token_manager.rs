@@ -4376,8 +4376,8 @@ mod tests {
 
     /// N1：根因 1（旧键以调用次数计量，不折算 credit 单位）。
     ///
-    /// 凭据1 记 1 次 sol（权重 2.4）→ load=2.4；凭据2 记 2 次 luna（权重 0.6）
-    /// → load=1.2。凭据2 次数更多但 credit 更少，新键应选它。
+    /// 凭据1 记 1 次 sol（权重 4.4，`#99` 官方倍率）→ load=4.4；凭据2 记 2 次
+    /// luna（权重 1.1）→ load=2.2。凭据2 次数更多但 credit 更少，新键应选它。
     #[tokio::test]
     async fn test_balanced_selection_weighs_by_credit_not_call_count() {
         let mut config = Config::default();
@@ -4403,7 +4403,7 @@ mod tests {
         let next = manager.acquire_context(None).await.unwrap();
         assert_eq!(
             next.id, 2,
-            "凭据2 调用次数更多（2 次）但折算 credit 更少（1.2 < 2.4），新键应选它"
+            "凭据2 调用次数更多（2 次）但折算 credit 更少（2.2 < 4.4），新键应选它"
         );
     }
 
