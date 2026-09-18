@@ -481,8 +481,12 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
-    /// balanced 模式下的内部选路偏移，不计入对外成功次数
-    balanced_offset: u64,
+    /// balanced 模式的**加权负载**（单位 credit，非请求次数）。
+    /// 惰性求值：写侧 `record_load` 就地衰减+累加，读侧 `current_load(now)` 纯函数
+    /// 外推不写回——指数衰减可组合，两路径数学等价。恒为有限非负数。
+    load: f64,
+    /// `load` 上次就地更新的**墙钟 Unix 毫秒**。`0` = 哨兵"无时间基准"。
+    load_updated_at_ms: u64,
     /// 当前已分配但尚未完成的 API 调用数
     in_flight_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -491,6 +495,51 @@ struct CredentialEntry {
     profile_lookup_retry_after_ms: Option<u64>,
     /// 同一凭据 profile discovery 的 single-flight 锁。
     profile_lookup_lock: Arc<TokioMutex<()>>,
+}
+
+impl CredentialEntry {
+    /// 纯函数：把 `load` 按半衰期外推到 `now_unix_ms`，**不写回**任何字段。
+    /// 指数衰减可组合，读侧外推与写侧就地衰减数学等价，读路径不需要 `&mut self`。
+    fn current_load(&self, now_unix_ms: u64) -> f64 {
+        if !self.load.is_finite() || self.load <= 0.0 {
+            return 0.0;
+        }
+        if self.load_updated_at_ms == 0 {
+            return self.load;
+        }
+        // saturating_sub 是 NTP 回拨的唯一防线：裸减法给出负 elapsed，
+        // 经 powf 变成 >1 的因子，load 会反向**增长**。
+        let elapsed = now_unix_ms.saturating_sub(self.load_updated_at_ms) as f64;
+        if elapsed <= 0.0 {
+            return self.load;
+        }
+        let decayed = self.load * 0.5f64.powf(elapsed / LOAD_HALF_LIFE_MS);
+        if !decayed.is_finite() || decayed < LOAD_EPSILON {
+            0.0
+        } else {
+            decayed
+        }
+    }
+
+    /// 写侧：把 `load` 就地衰减到 `now_unix_ms`，并推进 `load_updated_at_ms`。
+    fn decay_load_to(&mut self, now_unix_ms: u64) {
+        self.load = self.current_load(now_unix_ms);
+        // 时钟倒退时不推进基准，否则恢复正常后会一次性补算掉本不该衰减的那段。
+        if now_unix_ms > self.load_updated_at_ms || self.load_updated_at_ms == 0 {
+            self.load_updated_at_ms = now_unix_ms;
+        }
+    }
+
+    /// 先就地衰减到当前时刻，再叠加本次调用的权重增量。
+    fn record_load(&mut self, weight: f64, now_unix_ms: u64) {
+        self.decay_load_to(now_unix_ms);
+        let w = if weight.is_finite() && weight > 0.0 {
+            weight
+        } else {
+            1.0
+        };
+        self.load += w;
+    }
 }
 
 /// 禁用原因
@@ -514,9 +563,25 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    #[serde(default, deserialize_with = "de_finite_load")]
+    load: f64,
     #[serde(default)]
-    balanced_offset: u64,
+    load_updated_at_ms: u64,
     last_used_at: Option<String>,
+}
+
+/// `f64` 落盘防护的读侧收口点：`serde_json` 把非有限浮点静默写成 `null`，
+/// 而裸 `Option<f64>` 反序列化遇 `null` 会报错——若不特殊处理，一个脏值就会
+/// 让整份 `kiro_stats.json` 被 `load_stats` 判定解析失败、整文件丢弃，
+/// 连带 success_count / last_used_at 一起归零。这里把任何非有限或负数一律
+/// 兜底成 `0.0`，与写侧 `save_stats_locked_at` 的落盘防护对称。
+fn de_finite_load<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(d)?
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0))
 }
 
 /// sticky 子系统时钟抽象（#86），仅用于 TTL / LRU 判定。
@@ -768,6 +833,12 @@ enum ProfileLookupOutcome {
 
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// `#98`：balanced 负载半衰期，写死常量不做配置项——12 小时。
+const LOAD_HALF_LIFE_MS: f64 = 12.0 * 60.0 * 60.0 * 1000.0;
+/// `#98`：衰减后的 load 低于此阈值直接归零，避免长期停机后残留一个不为 0
+/// 但无意义的极小浮点数。`0.5.powf(730) ≈ 2.9e-220`（停机 1 年）不会 panic，
+/// 这条只是把"数学上非零但无意义"的尾巴剪掉。
+const LOAD_EPSILON: f64 = 1e-6;
 /// 会话粘性保留时间（毫秒），避免长期运行时无界增长
 const STICKY_SESSION_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 /// 会话粘性映射最大容量
@@ -879,7 +950,8 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
-                    balanced_offset: 0,
+                    load: 0.0,
+                    load_updated_at_ms: 0,
                     in_flight_count: 0,
                     last_used_at: None,
                     profile_lookup_retry_after_ms: None,
@@ -1197,12 +1269,14 @@ impl MultiTokenManager {
             "balanced" => {
                 // Least-Used + in-flight 策略：选择已成功和正在处理请求总量最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
+                //
+                // `#98`（本 commit 尚不改选路行为）：`balanced_offset` 字段已随 §A
+                // 删除，这里暂时只是去掉那一项——真正切到按衰减 credit 负载排序
+                // 的新键在下一个 commit（§B.3）落地。
                 let idx = available.iter().min_by_key(|idx| {
                     let e = &entries[**idx];
                     (
-                        e.success_count
-                            .saturating_add(e.balanced_offset)
-                            .saturating_add(e.in_flight_count),
+                        e.success_count.saturating_add(e.in_flight_count),
                         e.credentials.priority,
                     )
                 })?;
@@ -1970,7 +2044,8 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
-                entry.balanced_offset = s.balanced_offset;
+                entry.load = s.load;
+                entry.load_updated_at_ms = s.load_updated_at_ms;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -2036,7 +2111,15 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
-                            balanced_offset: e.balanced_offset,
+                            // `serde_json` 无法表示非有限浮点，会静默写成 `null`，
+                            // 而 `null` 在读侧是解析错误——双重防护的写侧一半，
+                            // 与 `de_finite_load`（读侧一半）对称。
+                            load: if e.load.is_finite() && e.load >= 0.0 {
+                                e.load
+                            } else {
+                                0.0
+                            },
+                            load_updated_at_ms: e.load_updated_at_ms,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2212,6 +2295,26 @@ impl MultiTokenManager {
     /// 报告请求已结束但不应影响凭据健康或成功计数。
     pub fn report_no_result(&self, id: u64) {
         self.release_in_flight(id);
+    }
+
+    /// `#98`：记录一次真实发生的上游调用，把它按 credit 权重计入 balanced 负载。
+    ///
+    /// # 调用契约（违反会静默产生错误的均衡，不会有任何编译或测试报错）
+    /// - 必须在 `send()` **之前**调用——请求发出即消耗上游 credit，与结果无关，
+    ///   **不退款**。
+    /// - 每次上游调用只调一次，且必须在 `for attempt` 重试循环**内部**调用——
+    ///   这是"一处改动同时覆盖失败可见与重试可见"成立的唯一位置：handlers 只
+    ///   看得到 1 次顶层调用，看不见内部最多 9 次重试。
+    /// - `model` 是 **kiro_id** 口径（不是 Anthropic 模型名），未登记的模型一律
+    ///   按权重 1.0 计入（`credit_weight_by_kiro_id` 的既定回落行为）。
+    pub fn record_upstream_call(&self, id: u64, model: Option<&str>) {
+        // 先算权重取时钟再加锁：两者都不需要 entries，放锁外缩短临界区。
+        let weight = self.model_registry.credit_weight_by_kiro_id(model);
+        let now_unix_ms = self.now_unix_ms();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.record_load(weight, now_unix_ms);
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2813,12 +2916,15 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
-            let balanced_offset = entries
+            // 必须先对每个条目做惰性衰减再取最小：load 是时点量，磁盘裸值分属不同时刻，
+            // 直接比裸值等于拿不同时点的数做比较。current_load 是纯函数，只读不写。
+            let now_unix_ms = self.now_unix_ms();
+            let load = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .map(|e| e.success_count.saturating_add(e.balanced_offset))
-                .min()
-                .unwrap_or(0);
+                .map(|e| e.current_load(now_unix_ms))
+                .fold(f64::INFINITY, f64::min); // f64::min 对 (NaN,x) 返回 x，天然滤脏值
+            let load = if load.is_finite() { load } else { 0.0 };
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2827,7 +2933,8 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
-                balanced_offset,
+                load,
+                load_updated_at_ms: now_unix_ms,
                 in_flight_count: 0,
                 last_used_at: None,
                 profile_lookup_retry_after_ms: None,
@@ -3964,6 +4071,14 @@ mod tests {
         manager.report_no_result(third.id);
     }
 
+    /// `#98`：这条测试正处在两次 commit 之间的过渡态——add_credential 的播种
+    /// 逻辑（§C）本 commit 已经切到读 `load` 字段，`balanced_offset` 字段已随
+    /// §A 一并删除，测试构造与旧字段名必须同步调整才能编译；但 balanced 模式
+    /// 的**选路键**要到下一个 commit（§B.3）才切到读 `load`，本 commit 仍是旧的
+    /// `success_count + in_flight` 键——用新字段 `load` 播种、旧键选路两者语义
+    /// 不再一致，尾部两条选路顺序断言在本 commit 下不成立，故先删去，改成只
+    /// 断言 §C 播种本身的正确性；选路顺序断言与函数改名在下一个 commit 随新键
+    /// 一起补回（task 派发文档 commit #4 的既定范围）。
     #[tokio::test]
     async fn test_balanced_new_credential_uses_offset_without_changing_success_count() {
         let mut config = Config::default();
@@ -3984,8 +4099,8 @@ mod tests {
 
         {
             let mut entries = manager.entries.lock();
-            entries[0].success_count = 100;
-            entries[1].success_count = 120;
+            entries[0].load = 100.0;
+            entries[1].load = 120.0;
         }
 
         let new_credential = KiroCredentials {
@@ -3997,21 +4112,317 @@ mod tests {
 
         let new_id = manager.add_credential(new_credential).await.unwrap();
 
+        let entries = manager.entries.lock();
+        let new_entry = entries.iter().find(|e| e.id == new_id).unwrap();
+        assert_eq!(new_entry.success_count, 0, "T4：success_count 不再参与播种");
+        assert!(
+            (new_entry.load - 100.0).abs() < 1e-9,
+            "播种值应是未禁用凭据里 current_load 的最小值（100.0），而非 120.0"
+        );
+        assert_ne!(
+            new_entry.load_updated_at_ms, 0,
+            "播种时应记录时间基准，而非停在哨兵值"
+        );
+    }
+
+    // ===== #98 §B：衰减与计量核心（N3-N8） =====
+
+    /// N3：半衰期数学 + 根因 3（历史永不重置）。
+    ///
+    /// ⚠️数值断言与行为断言缺一不可——两者方向相同，单独一个不足以证明半衰期
+    /// 常数真的生效（例如把 `LOAD_HALF_LIFE_MS` 改成 `INFINITY` 会让数值断言
+    /// 先红，但若只断言行为方向，`INFINITY` 下"历史更重者反超"这个方向性结论
+    /// 依然可能凑巧成立，测不出真正的半衰期数学）。
+    #[test]
+    fn test_current_load_decays_by_half_life_and_reorders_by_history() {
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![
+                valid_access_credential("token-1", 0),
+                valid_access_credential("token-2", 1),
+            ],
+            None,
+            None,
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        let now0 = clock.now_unix_ms();
         {
-            let entries = manager.entries.lock();
-            let new_entry = entries.iter().find(|e| e.id == new_id).unwrap();
-            assert_eq!(new_entry.success_count, 0);
-            assert_eq!(new_entry.balanced_offset, 100);
+            let mut entries = manager.entries.lock();
+            entries[0].record_load(100.0, now0);
+            entries[1].record_load(60.0, now0);
         }
 
-        let first = manager.acquire_context(None).await.unwrap();
-        let second = manager.acquire_context(None).await.unwrap();
+        clock.advance_ms(12 * 60 * 60 * 1000);
+        let now1 = clock.now_unix_ms();
 
-        assert_ne!(first.id, new_id);
-        assert_eq!(second.id, new_id);
+        let (load1, load2) = {
+            let entries = manager.entries.lock();
+            (
+                entries[0].current_load(now1),
+                entries[1].current_load(now1),
+            )
+        };
+        assert!(
+            (load1 - 50.0).abs() < 1e-6,
+            "凭据1（历史 100）半衰期后应衰减到约 50.0，实际 {load1}"
+        );
+        assert!(
+            (load2 - 30.0).abs() < 1e-6,
+            "凭据2（历史 60）半衰期后应衰减到约 30.0，实际 {load2}"
+        );
 
-        manager.report_no_result(first.id);
-        manager.report_no_result(second.id);
+        // 行为段：凭据2 再记 45（30 + 45 = 75），历史更重的凭据1（50）此时反而更小，
+        // 即衰减后"历史更重者"赢回更靠前的排位——历史包袱不再永久锁死排序。
+        {
+            let mut entries = manager.entries.lock();
+            entries[1].record_load(45.0, now1);
+        }
+        let (load1_after, load2_after) = {
+            let entries = manager.entries.lock();
+            (
+                entries[0].current_load(now1),
+                entries[1].current_load(now1),
+            )
+        };
+        assert!(
+            load1_after < load2_after,
+            "历史更重的凭据1({load1_after}) 衰减后应小于凭据2({load2_after})，即会被优先选中"
+        );
+    }
+
+    /// N4：重启 + 停机衰减。惰性求值的核心不变量——磁盘上存的是**衰减前**的
+    /// 裸值，`load_stats` 只回填不计算，衰减只在 `current_load` 读侧发生。
+    #[test]
+    fn test_load_survives_restart_and_decays_only_on_read() {
+        let cred_dir =
+            std::env::temp_dir().join(format!("kiro-load-restart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let _cleanup = TempDirGuard(cred_dir.clone());
+        let cred_path = cred_dir.join("credentials.json");
+
+        let clock_a = TestClock::new();
+        let wall0 = clock_a.now_unix_ms();
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let manager_a = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![cred.clone()],
+            None,
+            Some(cred_path.clone()),
+            false,
+            test_registry(),
+            clock_a.clone(),
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager_a.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.record_load(80.0, wall0);
+        }
+        // 绕开防抖，立即落盘。
+        manager_a.save_stats();
+
+        let clock_b = TestClock::new();
+        clock_b.set_wall_ms(wall0 + 24 * 60 * 60 * 1000); // A 之后 24 小时（2 个半衰期）重启
+        let manager_b = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_path),
+            false,
+            test_registry(),
+            clock_b.clone(),
+        )
+        .unwrap();
+
+        let entries = manager_b.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(
+            (entry.load - 80.0).abs() < 1e-9,
+            "磁盘原样读回，读取时不应就地衰减，实际 {}",
+            entry.load
+        );
+        assert_eq!(
+            entry.load_updated_at_ms, wall0,
+            "应原样保留 A 写盘时的时间基准，而非重启时刻"
+        );
+        let decayed = entry.current_load(clock_b.now_unix_ms());
+        assert!(
+            (decayed - 20.0).abs() < 1e-6,
+            "停机 24h（2 个半衰期）后 current_load 应约为 20.0，实际 {decayed}"
+        );
+    }
+
+    /// N5：旧 `kiro_stats.json`（含 `balanced_offset`）兼容性。
+    ///
+    /// ⚠️只断言 `load == 0.0` 会恒绿——解析失败时新字段同样是 0.0（默认值）。
+    /// `success_count == 728` 是关键断言：它证明整份文件确实被成功解析，而不
+    /// 是解析失败后 `load_stats` 提前 return、entry 保持构造期默认值。
+    #[test]
+    fn test_load_stats_tolerates_legacy_balanced_offset_field() {
+        let cred_dir =
+            std::env::temp_dir().join(format!("kiro-load-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let _cleanup = TempDirGuard(cred_dir.clone());
+        std::fs::write(
+            cred_dir.join("kiro_stats.json"),
+            r#"{"1":{"success_count":728,"balanced_offset":100,"last_used_at":null}}"#,
+        )
+        .unwrap();
+
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_dir.join("credentials.json")),
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            entry.success_count, 728,
+            "旧字段 balanced_offset 应被静默忽略，success_count 等其余字段须正常解析出来"
+        );
+        assert_eq!(entry.load, 0.0, "新字段缺失应回落默认值 0.0");
+    }
+
+    /// N6：`load` 字段为 `null` 时的读侧容错（对称写侧的 `save_stats_locked_at`
+    /// 落盘防护：`serde_json` 把非有限浮点静默写成 `null`）。
+    #[test]
+    fn test_load_stats_tolerates_null_load_field() {
+        let cred_dir =
+            std::env::temp_dir().join(format!("kiro-load-null-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let _cleanup = TempDirGuard(cred_dir.clone());
+        std::fs::write(
+            cred_dir.join("kiro_stats.json"),
+            r#"{"1":{"success_count":5,"load":null,"last_used_at":null}}"#,
+        )
+        .unwrap();
+
+        let cred = KiroCredentials {
+            refresh_token: Some("token1".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_dir.join("credentials.json")),
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            entry.success_count, 5,
+            "load 为 null 不应导致整个 HashMap 反序列化被拒绝"
+        );
+        assert_eq!(entry.load, 0.0, "null 应回落 0.0");
+    }
+
+    /// N7：NTP 回退自愈。`saturating_sub` 是唯一防线——裸减法会把负 elapsed
+    /// 喂给 `powf`，变成 >1 的因子，让 load 在回拨期间反向增长。
+    #[test]
+    fn test_current_load_self_heals_after_clock_rollback() {
+        let clock = TestClock::new();
+        let manager = MultiTokenManager::new_with_clock(
+            Config::default(),
+            vec![valid_access_credential("token-1", 0)],
+            None,
+            None,
+            false,
+            test_registry(),
+            clock.clone(),
+        )
+        .unwrap();
+
+        let now0 = clock.now_unix_ms();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].record_load(100.0, now0);
+        }
+
+        // NTP 回拨 1 小时。
+        clock.set_wall_ms(now0.saturating_sub(60 * 60 * 1000));
+        let rolled_back = clock.now_unix_ms();
+        {
+            let entries = manager.entries.lock();
+            let load = entries[0].current_load(rolled_back);
+            assert!(
+                (load - 100.0).abs() < 1e-9,
+                "回拨期间 saturating_sub 应把 elapsed 钳到 0，load 不增不塌不 NaN，实际 {load}"
+            );
+        }
+
+        // 回拨期间再记一次：时间基准不应被拨回。
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].record_load(1.0, rolled_back);
+            assert_eq!(
+                entries[0].load_updated_at_ms, now0,
+                "回拨期间不应把时间基准往回推，否则时钟恢复后会一次性补算掉不该衰减的那段"
+            );
+        }
+        {
+            let entries = manager.entries.lock();
+            let load = entries[0].current_load(rolled_back);
+            assert!((load - 101.0).abs() < 1e-9, "实际 {load}");
+        }
+
+        // 时钟恢复并越过原基准 12 小时——自愈：按 12h 半衰期正常衰减。
+        clock.set_wall_ms(now0 + 12 * 60 * 60 * 1000);
+        let now1 = clock.now_unix_ms();
+        let load = {
+            let entries = manager.entries.lock();
+            entries[0].current_load(now1)
+        };
+        assert!(
+            (load - 50.5).abs() < 1e-6,
+            "时钟恢复后应从 101 按 12h 半衰期正常衰减到约 50.5，实际 {load}"
+        );
+    }
+
+    /// N8：未登记权重的模型一律按 1.0 计入负载（`credit_weight_by_kiro_id` 的
+    /// 既定回落行为，经 `record_upstream_call` 这条真实调用路径验证）。
+    #[test]
+    fn test_record_upstream_call_unknown_model_uses_default_weight() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![valid_access_credential("token-1", 0)],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        manager.record_upstream_call(1, Some("some-model-nobody-registered"));
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            entry.load, 1.0,
+            "未登记模型应精确按权重 1.0 计入，实际 {}",
+            entry.load
+        );
     }
 
     #[tokio::test]
@@ -6071,7 +6482,8 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             success_count: 0,
-            balanced_offset: 0,
+            load: 0.0,
+            load_updated_at_ms: 0,
             in_flight_count: 0,
             last_used_at: None,
             profile_lookup_retry_after_ms: None,
@@ -6090,7 +6502,8 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             success_count: 0,
-            balanced_offset: 0,
+            load: 0.0,
+            load_updated_at_ms: 0,
             in_flight_count: 0,
             last_used_at: None,
             profile_lookup_retry_after_ms: None,
@@ -6228,7 +6641,8 @@ mod tests {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
-                balanced_offset: 0,
+                load: 0.0,
+                load_updated_at_ms: 0,
                 in_flight_count: 0,
                 last_used_at: None,
                 profile_lookup_retry_after_ms: None,
@@ -6305,7 +6719,8 @@ mod tests {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
-                balanced_offset: 0,
+                load: 0.0,
+                load_updated_at_ms: 0,
                 in_flight_count: 0,
                 last_used_at: None,
                 profile_lookup_retry_after_ms: None,
