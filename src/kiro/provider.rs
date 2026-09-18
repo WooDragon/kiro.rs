@@ -85,10 +85,6 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// 每个凭据的最大重试次数
-///
-/// `#98`：同时承担逐凭据上限与全局预算乘数两个角色；#538 之前只有后者生效——
-/// 429/408/5xx 分支从不把用满次数的凭据加入排除集，`max_retries` 里的这个乘数
-/// 只是恰好等于 `MAX_TOTAL_RETRIES` 时才顶到边界，逐凭据上限本身是装饰性代码。
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
@@ -288,7 +284,6 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut failed_credential_ids: HashSet<u64> = HashSet::new();
-        let mut attempts_per_credential: HashMap<u64, usize> = HashMap::new();
         let mut server_error_retries: usize = 0;
 
         for attempt in 0..max_retries {
@@ -304,14 +299,6 @@ impl KiroProvider {
                     continue;
                 }
             };
-
-            // 达到上限时立即把它加进排除集，但本次尝试照常进行——
-            // 语义是"这是它最后一次机会"，不是"这次不算"。
-            let used = attempts_per_credential.entry(ctx.id).or_insert(0);
-            *used += 1;
-            if *used >= MAX_RETRIES_PER_CREDENTIAL {
-                failed_credential_ids.insert(ctx.id);
-            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -553,7 +540,6 @@ impl KiroProvider {
         let mut last_error: Option<ProviderError> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut failed_credential_ids: HashSet<u64> = HashSet::new();
-        let mut attempts_per_credential: HashMap<u64, usize> = HashMap::new();
         let mut server_error_retries: usize = 0;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
@@ -574,11 +560,6 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    // 若此前已从上游拿到过真实错误，优先如实上报它。逐凭据上限打空池时，
-                    // "所有凭据均已禁用"是对现象的错误描述——凭据没被禁用，是本次尝试配额用完了。
-                    if let Some(pe) = last_error.take() {
-                        return Err(pe.into());
-                    }
                     let err_str = e.to_string();
                     let pe = if err_str.contains("所有凭据均已禁用") {
                         ProviderError::AllCredentialsDisabled {
@@ -594,14 +575,6 @@ impl KiroProvider {
                     return Err(pe.into());
                 }
             };
-
-            // 达到上限时立即把它加进排除集，但本次尝试照常进行——
-            // 语义是"这是它最后一次机会"，不是"这次不算"。
-            let used = attempts_per_credential.entry(ctx.id).or_insert(0);
-            *used += 1;
-            if *used >= MAX_RETRIES_PER_CREDENTIAL {
-                failed_credential_ids.insert(ctx.id);
-            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -782,13 +755,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // `#98`：5xx（上游服务端错误）独立于 429/408 的重试预算——与逐凭据/
-            // 全局预算乘数完全正交，专治"同一次故障被乘以最多 9 次上游调用"。
-            //
-            // 两个计数器不会互相遮蔽（方向正交）：attempts_per_credential 只收窄
-            // 候选从不终止循环；server_error_retries 只提前终止从不碰候选集。纯
-            // 5xx 序列下全局预算必定先触发，逐凭据计数器在该路径上由构造决定是
-            // 惰性的——它唯一可观测的落点是"选择池被模型 tier 过滤收窄"（见 P4）。
+            // `#98`：5xx（上游服务端错误）独立于 429/408 的重试预算——与全局预算
+            // 乘数完全正交，专治"同一次故障被乘以最多 9 次上游调用"。
             if status.is_server_error() {
                 server_error_retries += 1;
                 tracing::warn!(
@@ -1102,9 +1070,15 @@ mod tests {
     }
 
     /// 与 `provider_with_stub` 等价，但额外把 `Arc<MultiTokenManager>` 单独返回
-    /// 给调用方持有——P3 需要在 `provider` 用完后显式 drop 掉它内部的克隆，
-    /// 让引用计数归零触发 `impl Drop for MultiTokenManager` 的无条件落盘，
-    /// 绕开 30 秒防抖窗口读到最终值（而非仅第一次调用触发的同步落盘）。
+    /// 给调用方持有——P1/P3 需要在 `provider` 用完后显式 drop 掉它内部的克隆，
+    /// 让引用计数归零触发 `impl Drop for MultiTokenManager` 的落盘，绕开 30 秒
+    /// 防抖窗口读到最终值（而非仅第一次调用触发的同步落盘）。
+    ///
+    /// 该 Drop 是**有条件**的（`stats_dirty_version != stats_saved_version` 才
+    /// 写，见 `token_manager.rs` 字段注释），不是无条件兜底——这条测试今天能
+    /// 依赖它落盘，依赖的是本 PR 新给 `report_no_result` 加的标脏（`#98` 之前
+    /// 它是 6 个 `report_*` 里唯一不标脏的一个）；若后人删掉那处标脏，Drop 不
+    /// 会兜底重写，这条测试会因文件不存在而失败，不是静默通过。
     /// `credentials_path` 指向临时目录下一个不存在的文件——`cache_dir()` 只取
     /// 其 parent，文件本身是否存在不影响 `stats_path()` 解析。
     fn provider_with_stub_and_manager(
@@ -1146,15 +1120,28 @@ mod tests {
     /// 调用次数从旧的 `min(3*3,9)=9` 降到 2，且预算耗尽后返回的仍是
     /// `UpstreamTransientExhausted{last_status:500}`（与今天跑满重试后同一变体，
     /// `handlers.rs` 零改动的前提）。
+    ///
+    /// 追加断言（D3：5xx 不换凭据，本函数内 5xx 分支处的注释所记的设计决策）：两次上游
+    /// 调用必须落在同一张凭据上。单看 `hits==2` 无法辨识这条不变量——预算恒在
+    /// 第 2 次终止，无论 5xx 分支是否误插一行 `failed_credential_ids.insert`，
+    /// `hits` 都还是 2，反事实测不出来。改用 P3 已验证可用的落盘观测手法
+    /// （`credentials_path` 挂临时目录、`drop(provider)`/`drop(manager)` 触发
+    /// `MultiTokenManager` 落盘、解析 `kiro_stats.json`）：3 张凭据里应有且仅
+    /// 有一张 `load` 非零。
     #[tokio::test]
     async fn test_p1_5xx_budget_caps_upstream_hits_at_two() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("kiro-rs-test-p1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let _guard = TempDirGuard(temp_dir.clone());
+
         let stub = StubUpstream::start("500 Internal Server Error", r#"{"message":"boom"}"#).await;
         let credentials = vec![
             api_key_credential(1, 0, None),
             api_key_credential(2, 1, None),
             api_key_credential(3, 2, None),
         ];
-        let provider = provider_with_stub(credentials, &stub);
+        let (provider, manager) = provider_with_stub_and_manager(credentials, &stub, &temp_dir);
         let body = request_body("claude-sonnet-5");
 
         let result = provider.call_api_with_retry(&body, false).await;
@@ -1171,6 +1158,23 @@ mod tests {
             }
             other => panic!("期望 UpstreamTransientExhausted{{500}}，实际: {other:?}"),
         }
+
+        drop(provider);
+        drop(manager);
+
+        let stats_path = temp_dir.join("kiro_stats.json");
+        let raw = std::fs::read_to_string(&stats_path)
+            .unwrap_or_else(|e| panic!("Drop 应已把 kiro_stats.json 落盘到 {stats_path:?}: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nonzero_loads: Vec<&str> = ["1", "2", "3"]
+            .into_iter()
+            .filter(|id| json[*id]["load"].as_f64().unwrap_or(0.0) > 0.0)
+            .collect();
+        assert_eq!(
+            nonzero_loads.len(),
+            1,
+            "D3：5xx 不换凭据，两次调用应落在同一张凭据上，故有且仅有一个 entry 的 load 非零，实际非零的凭据: {nonzero_loads:?}，落盘原文: {raw}"
+        );
     }
 
     /// P3：计量恰好一次 + 不退款。恒 500、1 张凭据、`modelId="gpt-5.6-sol"`
@@ -1202,8 +1206,10 @@ mod tests {
         assert!(result.is_err(), "恒 500 必须以 Err 收尾");
         assert_eq!(stub.hits(), 2, "5xx 预算=1，纯 500 序列总共 2 次上游调用");
 
-        // 强制同步落盘：drop 掉 provider 内部克隆与本地持有的最后一份 Arc，
-        // 引用计数归零触发 `impl Drop for MultiTokenManager` 的无条件 `save_stats`。
+        // 强制落盘：drop 掉 provider 内部克隆与本地持有的最后一份 Arc，引用计数
+        // 归零触发 `impl Drop for MultiTokenManager` 的 `save_stats`——该 Drop 是
+        // 有条件的（脏才写），这里能读到最终值依赖本 PR 新给 `report_no_result`
+        // 加的标脏，见 `provider_with_stub_and_manager` 上方 doc comment。
         drop(provider);
         drop(manager);
 
@@ -1218,59 +1224,6 @@ mod tests {
             (load - 4.8).abs() < 1e-2,
             "load 应约等于 2 次调用 × credit_weight(gpt-5.6-sol)=2.4 = 4.8（容差 1e-2 内，见上方 doc comment），实际: {load}"
         );
-    }
-
-    /// P4：逐凭据上限不是装饰性代码——唯一可观测形态是"选择池被模型 tier
-    /// 过滤收窄"。A 支持 opus（PRO），B 不支持（FREE，`subscription_title`
-    /// 含 "FREE"）；modelId 取 tier=pro 的 `claude-opus-4.8`，B 从一开始就
-    /// 被 `is_entry_available_for_model` 过滤出候选池，只有 A 可选。恒 429
-    /// （不是 500，避免被 5xx 预算抢先终止）。A 用满 `MAX_RETRIES_PER_CREDENTIAL`
-    /// (3) 后被加入排除集，第 4 次 acquire 时 A 被排除、B 本就不合格 → 无候选 →
-    /// acquire 失败，总共只打了 3 次上游。
-    #[tokio::test]
-    async fn test_p4_per_credential_cap_narrows_pool_under_tier_filter() {
-        let stub = StubUpstream::start("429 Too Many Requests", r#"{"message":"slow down"}"#).await;
-        let credentials = vec![
-            api_key_credential(1, 0, None),
-            api_key_credential(2, 1, Some("KIRO FREE")),
-        ];
-        let provider = provider_with_stub(credentials, &stub);
-        let body = request_body("claude-opus-4.8");
-
-        let result = provider.call_api_with_retry(&body, false).await;
-
-        assert!(result.is_err(), "恒 429 + 候选池被打空必须以 Err 收尾");
-        assert_eq!(
-            stub.hits(),
-            3,
-            "只有 A 可选：A 打满 MAX_RETRIES_PER_CREDENTIAL(3) 次后被排除，B 从未合格过，第 4 次 acquire 直接失败，不产生第 4 次上游调用"
-        );
-    }
-
-    /// P5：§E 429→503 回归的缓解——P4 同构造，候选池被逐凭据上限打空后，
-    /// acquire 失败分支必须优先返回此前已拿到的真实上游错误
-    /// （`UpstreamTransientExhausted{429}`），而不是把"配额用完"误报成
-    /// "所有凭据均已禁用"（`AllCredentialsDisabled`）。
-    #[tokio::test]
-    async fn test_p5_pool_exhaustion_reports_real_upstream_error_not_all_disabled() {
-        let stub = StubUpstream::start("429 Too Many Requests", r#"{"message":"slow down"}"#).await;
-        let credentials = vec![
-            api_key_credential(1, 0, None),
-            api_key_credential(2, 1, Some("KIRO FREE")),
-        ];
-        let provider = provider_with_stub(credentials, &stub);
-        let body = request_body("claude-opus-4.8");
-
-        let result = provider.call_api_with_retry(&body, false).await;
-        let err = expect_err(result, "候选池打空必须以 Err 收尾");
-        match err.downcast_ref::<ProviderError>() {
-            Some(ProviderError::UpstreamTransientExhausted { last_status, .. }) => {
-                assert_eq!(*last_status, 429);
-            }
-            other => panic!(
-                "期望如实上报 UpstreamTransientExhausted{{429}}，而非 AllCredentialsDisabled，实际: {other:?}"
-            ),
-        }
     }
 
     /// P6：分支穷尽——5xx 拆分动了 `if` 链顺序敏感区，验证 400/404/402(月度
