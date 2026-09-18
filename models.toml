@@ -12,6 +12,18 @@
 # Consequence: within a family, put more specific versions before general ones.
 # Fallback entries (match_version = []) always come after all versioned entries regardless of TOML position.
 
+# credit_weight：相对 Kiro 官方 credit 倍率，基准 1.0x = Auto（自动路由档），
+# 语义为「该任务在 Auto 下消耗的 credits × 本倍率」。用于 balanced 负载均衡按真实
+# credit 加权选路（#98）。来源 https://kiro.dev/docs/models（2026-09-17 版本）。
+# 未登记的模型回落 1.0，见 ModelRegistry::credit_weight_by_kiro_id。
+# ⚠️ GPT-5.6 族官方为双层计费：≤272K token 按下方数值，>272K token 翻倍。本表只取
+#    短上下文档——权重是 kiro_id 级静态查表、不看请求大小，这是已知的精度损失
+#    （与 in_flight 按本次请求权重估价同属启发式）。
+# ⚠️ 改动本表的权重值有运维代价：kiro_stats.json 里的 load 是所有模型消耗累加成的
+#    标量，无法按模型拆回重算（乘一个全局系数是假精度，不要写迁移代码）。改倍率后
+#    旧存量仍以旧单位记账、新增量用新单位，需约 1~2 个半衰期（LOAD_HALF_LIFE_MS=12h）
+#    洗净。运维二选一：接受约一天的均衡失真，或清掉 stats 里的 load 让凭据从零重新计量。
+
 [defaults]
 context_window = 200_000
 min_cacheable_tokens = 1024
@@ -32,6 +44,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1785110400
 tier = "pro"
+credit_weight = 2.2
 min_cacheable_tokens = 4096
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
@@ -49,6 +62,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1779753600
 tier = "pro"
+credit_weight = 2.2
 min_cacheable_tokens = 4096
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
@@ -66,6 +80,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1773446400
 tier = "pro"
+credit_weight = 2.2
 min_cacheable_tokens = 4096
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
@@ -83,6 +98,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1770163200
 tier = "pro"
+credit_weight = 2.2
 min_cacheable_tokens = 4096
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
@@ -100,6 +116,7 @@ context_window = 200_000
 max_tokens = 64000
 created = 1763942400
 tier = "pro"
+credit_weight = 2.2
 min_cacheable_tokens = 4096
 thinking_type = "enabled"
 thinking_budget_tokens = 20000
@@ -120,6 +137,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1782432000
 tier = "free"
+credit_weight = 1.3
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
 thinking_effort = "high"
@@ -136,6 +154,7 @@ context_window = 1_000_000
 max_tokens = 64000
 created = 1771286400
 tier = "free"
+credit_weight = 1.3
 thinking_type = "adaptive"
 thinking_budget_tokens = 20000
 thinking_effort = "high"
@@ -152,6 +171,7 @@ context_window = 200_000
 max_tokens = 64000
 created = 1759104000
 tier = "free"
+credit_weight = 1.3
 thinking_type = "enabled"
 thinking_budget_tokens = 20000
 expose_thinking_variant = true
@@ -171,6 +191,7 @@ context_window = 200_000
 max_tokens = 64000
 created = 1760486400
 tier = "free"
+credit_weight = 0.4
 thinking_type = "enabled"
 thinking_budget_tokens = 20000
 expose_thinking_variant = true
@@ -180,8 +201,7 @@ expose_thinking_variant = true
 # Blackbox-verified 2026-07-28: sol/terra return HTTP 200, text output.
 # Thinking silently ignored by upstream (no 400, no thinking blocks produced).
 # context_window = 272K (Kiro upstream spec; OpenAI native 1M not adopted).
-# credit multiplier: sol 2.4x / terra 1.2x / luna 0.6x
-# ↑ 即下方各条目 credit_weight 字段的取值来源。**未经黑盒实测**（见 #99），实测后需回来修正本行与各字段。
+# credit multiplier: sol 4.4x / terra 2.2x / luna 1.1x（≤272K token 档；>272K 翻倍，本表不建模）
 # ============================================================================
 
 [[models]]
@@ -195,7 +215,7 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
-credit_weight = 2.4
+credit_weight = 4.4
 expose_thinking_variant = false
 
 [[models]]
@@ -209,7 +229,7 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
-credit_weight = 1.2
+credit_weight = 2.2
 expose_thinking_variant = false
 
 [[models]]
@@ -223,5 +243,5 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
-credit_weight = 0.6
+credit_weight = 1.1
 expose_thinking_variant = false

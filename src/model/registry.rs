@@ -618,48 +618,60 @@ credit_weight = 2.5
     #[test]
     fn test_credit_weight_values_in_production_models_toml() {
         // N14：权重数值护栏 —— 对真实 models.toml 断言数值完整性。
+        //
+        // `#99`：官方一手来源（https://kiro.dev/docs/models，2026-09-17 版本）
+        // 更新前，claude 全族 9 条压根没配 credit_weight（走 serde default
+        // 1.0 回落），GPT-5.6 三条的取值来自未背书的人工注释。现在 12 条
+        // 全部有非默认权重，逐条断言官方值——不再对 claude 全族断言
+        // "回落 1.0"，那个断言此后表达的是「忘记配置」而非「等权重」。
         let registry = ModelRegistry::builtin();
 
-        // 三个 GPT-5.6 模型的权重确为指定值
+        let expected: &[(&str, f64)] = &[
+            ("claude-opus-5", 2.2),
+            ("claude-opus-4.8", 2.2),
+            ("claude-opus-4.7", 2.2),
+            ("claude-opus-4.6", 2.2),
+            ("claude-opus-4.5", 2.2),
+            ("claude-sonnet-5", 1.3),
+            ("claude-sonnet-4.6", 1.3),
+            ("claude-sonnet-4.5", 1.3),
+            ("claude-haiku-4.5", 0.4),
+            ("gpt-5.6-sol", 4.4),
+            ("gpt-5.6-terra", 2.2),
+            ("gpt-5.6-luna", 1.1),
+        ];
+
+        // 前提断言：长度相等推不出集合相等——若 expected 里把某一条误写成
+        // 另一条已有的 kiro_id（重复），同时漏掉了 toml 里的另一条，两个
+        // "12" 依然成立，而被漏掉的那条完全没有任何断言。改用
+        // HashMap<kiro_id, weight> 承担「全表覆盖」：重复 key 会让 map 变
+        // 短，`map.len() == registry.entries.len()` 随即失败，抓住的正是
+        // 这个形态；expected 与 registry.entries 集合相等（非仅同长度）
+        // 由此断言承担。
+        let expected_by_id: std::collections::HashMap<&str, f64> =
+            expected.iter().copied().collect();
         assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-sol")),
-            2.4,
-            "gpt-5.6-sol credit_weight 应为 2.4"
-        );
-        assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-terra")),
-            1.2,
-            "gpt-5.6-terra credit_weight 应为 1.2"
-        );
-        assert_eq!(
-            registry.credit_weight_by_kiro_id(Some("gpt-5.6-luna")),
-            0.6,
-            "gpt-5.6-luna credit_weight 应为 0.6"
+            expected_by_id.len(),
+            registry.entries.len(),
+            "前提：官方权重表去重后的 kiro_id 数量应与 models.toml 条目数一致；\
+             expected_by_id={}, registry.entries={}，说明存在重复 kiro_id 或漏项",
+            expected_by_id.len(),
+            registry.entries.len()
         );
 
-        // `#98` 返工 SUGGESTION C4：原先只抽查 2 个 claude 条目，改成遍历全部
-        // 非 gpt 条目断言 credit_weight == 1.0。该测试的价值就是钉死「claude
-        // 全族等权重」这个假设——只抽查 2 条时，手滑给某个没被抽到的 claude
-        // 条目加上权重不会让测试变红。
-        //
-        // 前提断言：证明「非 gpt 条目」这个集合非空。没有它，若过滤条件写错
-        // （比如 kiro_id 前缀拼错）导致集合变空，下面的遍历会在空集合上
-        // 恒真通过，退化成又一个恒绿测试。
-        let non_gpt_entries: Vec<&ModelEntry> = registry
-            .entries
-            .iter()
-            .filter(|e| !e.kiro_id.starts_with("gpt"))
-            .collect();
-        assert!(
-            !non_gpt_entries.is_empty(),
-            "前提：models.toml 中确实存在非 gpt 条目（claude 全族），\
-             否则下面的遍历断言会在空集合上恒真"
-        );
-        for entry in &non_gpt_entries {
+        for entry in &registry.entries {
+            let expected_weight = expected_by_id
+                .get(entry.kiro_id.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} 出现在 models.toml 但不在官方权重表 expected 中，本测试未同步",
+                        entry.kiro_id
+                    )
+                });
             assert_eq!(
                 registry.credit_weight_by_kiro_id(Some(&entry.kiro_id)),
-                1.0,
-                "{} 未配 credit_weight，应回落 1.0（claude 全族等权重）",
+                *expected_weight,
+                "{} credit_weight 应为 {expected_weight}（Kiro 官方倍率，基准 1.0x = Auto）",
                 entry.kiro_id
             );
         }
