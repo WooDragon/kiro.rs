@@ -800,3 +800,196 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 }
+
+/// `#98` provider 重试逻辑测试脚手架。
+///
+/// 脚手架选型论证（plan `测试设计` §"新增 —— provider.rs"）：本仓
+/// dev-dependencies 当前为空，引入 `wiremock` 会带进十余个传递依赖，而
+/// CI/本地全靠 `rust:1.92-alpine` 冷编译，每次都要多付这个代价；抽纯函数
+/// 测的是新造的抽象而非真实重试循环，且"错误分类表"本身是阶段三的产出物，
+/// 现在造半个会被下一个 PR 推翻。故选裸 `TcpListener` stub +
+/// `#[cfg(test)] TestEndpoint`：零生产改动（`KiroProvider::with_proxy` 的
+/// `endpoints` 本就是构造期注入的 `HashMap<String, Arc<dyn KiroEndpoint>>`，
+/// URL 完全由 endpoint 自己拥有，`build_idle_client` 没有 `https_only`，
+/// 明文 HTTP loopback 直接可用），且与 token_manager.rs 测试里已有的
+/// loopback profile-lookup stub 是同一手法，仓内一致。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::model::config::Config;
+    use crate::model::registry::ModelRegistry;
+
+    /// 测试专用清理 guard：无论测试函数体正常返回还是断言失败 panic 退出，
+    /// `Drop` 都会执行，不残留临时目录（同 token_manager.rs 测试里的
+    /// `TempDirGuard` 手法）。
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// 裸 loopback 上游 stub：起一个 TCP 服务，对每个连接原样回放固定的
+    /// `status_line`/`body`，命中次数写入共享 `hits`。循环 `accept`，服务
+    /// 测试期间的全部重试请求；随值 `Drop` 时 `abort` 后台任务，不残留。
+    struct StubUpstream {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl StubUpstream {
+        async fn start(status_line: &'static str, body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_for_server = hits.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    hits_for_server.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = vec![0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            Self {
+                url: format!("http://{addr}/generateAssistantResponse"),
+                hits,
+                server,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for StubUpstream {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// 最小 `KiroEndpoint` 实现：URL 固定指向 stub，请求体/头原样透传，
+    /// `is_monthly_request_limit` / `is_bearer_token_invalid` 走 trait 默认
+    /// 实现（body 文本判断，足够覆盖 P6 的 402 场景）。
+    struct TestEndpoint {
+        url: String,
+    }
+
+    impl KiroEndpoint for TestEndpoint {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    /// `id` 号 API Key 凭据（跳过 token 刷新的全部网络交互）。`subscription_title`
+    /// 传 `Some("KIRO FREE")` 构造不支持 opus 的凭据（P4/P5 的 tier 过滤探针）。
+    fn api_key_credential(id: u64, priority: u32, subscription_title: Option<&str>) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            kiro_api_key: Some(format!("ksk_test_{id}")),
+            priority,
+            subscription_title: subscription_title.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn endpoints_map(stub: &StubUpstream) -> HashMap<String, Arc<dyn KiroEndpoint>> {
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                url: stub.url.clone(),
+            }) as Arc<dyn KiroEndpoint>,
+        );
+        endpoints
+    }
+
+    fn provider_with_stub(credentials: Vec<KiroCredentials>, stub: &StubUpstream) -> KiroProvider {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            None,
+            false,
+            Arc::new(ModelRegistry::builtin()),
+        )
+        .unwrap();
+        KiroProvider::with_proxy(Arc::new(manager), None, endpoints_map(stub), "test".to_string())
+    }
+
+    /// 合法 JSON 请求体，携带 `extract_model_from_request` 需要的
+    /// `conversationState.currentMessage.userInputMessage.modelId`，以及
+    /// `extract_session_id_from_request` 需要的 `conversationId`。
+    fn request_body(model_id: &str) -> String {
+        format!(
+            r#"{{"conversationState":{{"conversationId":"11111111-1111-1111-1111-111111111111","currentMessage":{{"userInputMessage":{{"modelId":"{model_id}","content":"hi"}}}}}}}}"#
+        )
+    }
+
+    /// commit 5 基线测试：刻画改造前（本 commit 不改任何生产重试逻辑）的当前
+    /// 行为——408|429|5xx 目前是同一条分支，且没有真正生效的逐凭据排除（见
+    /// commit 6 doc：`MAX_RETRIES_PER_CREDENTIAL` 在 #98 之前只有"全局预算
+    /// 乘数"这一个角色生效），3 张凭据、上游恒 429 时，总重试次数恒为
+    /// `min(3*3,9)=9`。commit 6 落地 5xx 预算拆分后，这条测试的断言值不变
+    /// （429 不受 5xx 预算影响，`min(3*3,9)` 这个算式的结果本就等于
+    /// `MAX_TOTAL_RETRIES`），故它同时兼任 plan 测试设计表里的 P2——commit 6
+    /// 不重复添加 P2，只在其反事实验证环节复用这条测试。
+    #[tokio::test]
+    async fn test_baseline_429_exhausts_all_retries_across_all_credentials() {
+        let stub = StubUpstream::start("429 Too Many Requests", r#"{"message":"slow down"}"#).await;
+        let credentials = vec![
+            api_key_credential(1, 0, None),
+            api_key_credential(2, 1, None),
+            api_key_credential(3, 2, None),
+        ];
+        let provider = provider_with_stub(credentials, &stub);
+        let body = request_body("claude-sonnet-5");
+
+        let result = provider.call_api_with_retry(&body, false).await;
+
+        assert!(result.is_err(), "恒 429 必须以 Err 收尾");
+        assert_eq!(
+            stub.hits(),
+            9,
+            "min(3 张凭据 × MAX_RETRIES_PER_CREDENTIAL(3), MAX_TOTAL_RETRIES(9)) == 9"
+        );
+    }
+}
