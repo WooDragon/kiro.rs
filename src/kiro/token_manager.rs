@@ -1410,6 +1410,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // #98 §F：这次 reserve 恰好释放一次。下面按错误类型可能还会调
+                    // report_refresh_token_invalid / report_refresh_failure，但那两个
+                    // 函数自身已不再释放 in_flight（责任已收归此处），不会重复减。
                     self.report_no_result(id);
                     attempt_count += 1;
                     // A bounded identity race means this reservation lost its credential generation,
@@ -2342,7 +2345,11 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
+            // #98 §F：in_flight 的释放已收归调用方 acquire_context_for_session_excluding
+            // 的 try_ensure_token 失败分支（该分支已无条件调 report_no_result 释放一次）。
+            // 本函数同时被"有预留"（该分支）与"无预留"（handle_usage_refresh_error，
+            // 余额查询路径从未 reserve 过）两类调用方共用，若在这里再减一次，前者会
+            // 一次失败减两次，后者会凭空减到别人头上——两者都不对，故这里不再释放。
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.refresh_failure_count += 1;
             let refresh_failure_count = entry.refresh_failure_count;
@@ -2408,7 +2415,8 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
+            // #98 §F：同上，释放已收归调用方，这里不再重复释放（详见
+            // report_refresh_failure 同一处的注释）。
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
@@ -4159,6 +4167,83 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(first.disabled, "永久失效凭据应立即禁用");
         assert_eq!(snapshot.current_id, 2, "应已切换到存活凭据");
+    }
+
+    /// N9（#98 §F 缺陷1）：acquire_context 内 try_ensure_token 失败后走
+    /// report_no_result + report_refresh_failure 两步，修复前会对 in_flight
+    /// 减两次。用 saturating_sub 的陷阱是：从 1 减两次也饱和成 0，"acquire 后
+    /// 断言 == 0" 在修复前后都绿——必须预置一个非零基线才能把两次减法与一次
+    /// 减法区分开。
+    ///
+    /// 把 refresh_failure_count 预置到阈值-1，让这唯一一次失败的 acquire 尝试
+    /// 直接触发禁用+bail，从而恰好只经历一次 Err 分支（不被内部重试循环再拖
+    /// 着多跑几轮，避免多次失败的减法相互叠加、掩盖单次双减的信号）。
+    #[tokio::test]
+    async fn test_acquire_context_releases_in_flight_exactly_once_on_refresh_failure() {
+        let config = Config::default();
+        // 默认凭据缺少 refreshToken，try_ensure_token 会同步失败（validate_refresh_token
+        // 报"缺少 refreshToken"），不发起任何网络请求，失败路径确定性触发。
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false, test_registry())
+                .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            // 阈值-1：这一次失败恰好把 refresh_failure_count 推到阈值，立即禁用+bail，
+            // 保证 Err 分支只被执行一次。
+            entry.refresh_failure_count = MAX_FAILURES_PER_CREDENTIAL - 1;
+            // 预置一个非零基线（模拟并发中的其它在飞请求），使双减(-2)与单减(-1)
+            // 的结果可区分（5 vs 4），而不是都饱和到 0。
+            entry.in_flight_count = 5;
+        }
+
+        let err = manager.acquire_context(None).await.err();
+        assert!(err.is_some(), "唯一凭据缺少 refreshToken，acquire 应失败");
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            entry.in_flight_count, 5,
+            "reserve(+1) 与唯一一次释放(-1) 应抵消，回到预置基线；\
+             若 report_refresh_failure 仍重复释放会多减一次变成 4"
+        );
+    }
+
+    /// N10（#98 §F 缺陷2）：report_refresh_token_invalid 同时被"有预留"
+    /// （acquire_context 内部失败分支）与"无预留"（handle_usage_refresh_error，
+    /// Admin 余额查询路径从未 reserve 过）两类调用方共用。修复后释放责任已
+    /// 收归调用方，本函数自身不再改动 in_flight_count——直接调用它不应影响
+    /// 该字段，否则"无预留"调用方会凭空偷走别的在飞请求的计数。
+    #[test]
+    fn test_report_refresh_token_invalid_does_not_touch_in_flight_without_reservation() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+            test_registry(),
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.in_flight_count = 3;
+        }
+
+        // 未经过任何 reserve，直接模拟 handle_usage_refresh_error 的调用形状。
+        let has_available = manager.report_refresh_token_invalid(1);
+        assert!(has_available, "禁用 #1 后仍有 #2 可用");
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            entry.in_flight_count, 3,
+            "无预留的调用方不应释放 in_flight；若函数内仍有减法会变成 2"
+        );
     }
 
     #[tokio::test]
