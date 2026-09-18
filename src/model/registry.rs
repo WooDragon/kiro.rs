@@ -50,6 +50,13 @@ pub struct ModelEntry {
     pub thinking_effort: Option<String>,
     #[serde(default = "default_true")]
     pub expose_thinking_variant: bool,
+    /// crate 私有（`#98` 返工 SUGGESTION C2）：`credit_weight_by_kiro_id` 的
+    /// `.filter(|w| w.is_finite() && *w > 0.0)` 是该字段唯一的 sanitize
+    /// 收口点。字段若 `pub`，仓内任何地方都能绕过收口点直接读到未净化的
+    /// `inf`/`nan`/`0.0`/负数；降级为 crate 私有，让"必须过收口点"由
+    /// 类型系统强制而非靠纪律。
+    #[serde(default = "default_credit_weight")]
+    pub(crate) credit_weight: f64,
 }
 
 pub struct ThinkingOverride {
@@ -187,6 +194,36 @@ impl ModelRegistry {
             .map(|e| e.tier == "pro")
             .unwrap_or(false)
     }
+
+    /// 按 kiro_id **精确相等**反查该模型的 credit 权重（上游计费倍率）。
+    ///
+    /// 刻意**不复用** `resolve()`：`resolve()` 带族级兜底（`match_version = []` 的条目
+    /// 会捞走同族任意版本号），未登记的新模型会被同族兜底条目捞走、拿到别人的权重，
+    /// 违反「未登记一律 1.0」这条硬性要求。现在 kiro_id 恰好也能被 `resolve()` 命中，
+    /// 只是 `match_version` 同时列了点号与连字符两种写法的**巧合，不是契约**。
+    ///
+    /// 本方法是权重 sanitize 的**唯一收口点**：`models.toml` 是 TOML，`inf` / `nan`
+    /// 是合法浮点字面量；权重 `0.0` 会让一张凭据「永远免费」被独占选中，负数会让
+    /// 负载倒着走。非有限、非正的取值一律回落 1.0。
+    pub fn credit_weight_by_kiro_id(&self, kiro_id: Option<&str>) -> f64 {
+        let Some(kiro_id) = kiro_id else {
+            return 1.0;
+        };
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.kiro_id.eq_ignore_ascii_case(kiro_id));
+        // `#98` 返工 SUGGESTION C3：未命中静默回落 1.0 是既定设计（未登记一律
+        // 1.0），不是异常，故用 debug 而非 warn；但线上「某模型权重不对」的
+        // 排查此前没有任何可观测信号，只能靠读代码推断，补一条日志留痕。
+        if entry.is_none() {
+            tracing::debug!(kiro_id, "credit_weight 查表未命中，回落默认权重 1.0");
+        }
+        entry
+            .map(|e| e.credit_weight)
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .unwrap_or(1.0)
+    }
 }
 
 fn default_context_window() -> i32 {
@@ -209,6 +246,10 @@ fn default_max_tokens() -> i32 {
 
 fn default_tier() -> String {
     "free".to_string()
+}
+
+fn default_credit_weight() -> f64 {
+    1.0
 }
 
 fn default_thinking_budget() -> i32 {
@@ -400,5 +441,227 @@ match_family = "test"
         let registry = ModelRegistry::from_toml(toml).unwrap();
         assert_eq!(registry.entries.len(), 1);
         assert_eq!(registry.entries[0].id, "test-model");
+    }
+
+    #[test]
+    fn test_credit_weight_not_captured_by_family_fallback() {
+        // N11：未登记模型不会被族级兜底捞走权重。
+        //
+        // 不要用真实 models.toml 断言 credit_weight_by_kiro_id("claude-opus-9") == 1.0
+        // —— 那是恒绿零覆盖：即使实现走了 resolve()，命中的 opus-4.6 兜底条目也没写权重
+        // （默认就是 1.0），两种实现都返回 1.0，测不出区别。
+        //
+        // 正确构造 = 内联一份最小 TOML，让族级兜底条目（match_version = []）带一个**非 1.0**
+        // 的权重（如 3.0），然后两条断言缺一不可。
+        let toml = r#"
+[[models]]
+id = "claude-opus-fallback"
+kiro_id = "claude-opus-latest"
+family = "opus"
+display_name = "Claude Opus (fallback)"
+match_family = "opus"
+match_version = []
+credit_weight = 3.0
+"#;
+        let registry = ModelRegistry::from_toml(toml).unwrap();
+        // 前提：族级兜底确实会命中这个未登记版本号
+        assert!(
+            registry.resolve("claude-opus-9").is_some(),
+            "前提：族级兜底确实会命中这个未登记版本号"
+        );
+        // 实际测试：credit_weight_by_kiro_id 应该返回 1.0，不是兜底条目的 3.0
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("claude-opus-latest")),
+            3.0,
+            "兜底条目的权重可以被 kiro_id 精确匹配"
+        );
+        // 关键：未登记 kiro_id 应该返回 1.0
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("claude-opus-9")),
+            1.0,
+            "未登记 kiro_id 不会被族级兜底捞走权重"
+        );
+    }
+
+    #[test]
+    fn test_credit_weight_sanitize_zero_negative_inf_nan() {
+        // N12：权重 sanitize —— 0.0 / -1.0 / inf / nan 全部回落 1.0。
+        let toml = r#"
+[[models]]
+id = "test-zero"
+kiro_id = "test-zero"
+family = "test"
+display_name = "Test Zero"
+match_family = "test"
+credit_weight = 0.0
+
+[[models]]
+id = "test-negative"
+kiro_id = "test-negative"
+family = "test"
+display_name = "Test Negative"
+match_family = "test"
+credit_weight = -1.0
+
+[[models]]
+id = "test-infinity"
+kiro_id = "test-infinity"
+family = "test"
+display_name = "Test Infinity"
+match_family = "test"
+credit_weight = inf
+
+[[models]]
+id = "test-nan"
+kiro_id = "test-nan"
+family = "test"
+display_name = "Test NaN"
+match_family = "test"
+credit_weight = nan
+
+[[models]]
+id = "test-normal"
+kiro_id = "test-normal"
+family = "test"
+display_name = "Test Normal"
+match_family = "test"
+credit_weight = 2.5
+"#;
+        let registry = ModelRegistry::from_toml(toml).unwrap();
+        // 0.0 -> 1.0
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("test-zero")),
+            1.0,
+            "credit_weight 为 0.0 应回落 1.0"
+        );
+        // -1.0 -> 1.0
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("test-negative")),
+            1.0,
+            "credit_weight 为负数应回落 1.0"
+        );
+        // inf -> 1.0（被 sanitize 拦截）
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("test-infinity")),
+            1.0,
+            "credit_weight 为 inf 应回落 1.0"
+        );
+        // nan -> 1.0（被 sanitize 拦截）
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("test-nan")),
+            1.0,
+            "credit_weight 为 nan 应回落 1.0"
+        );
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("test-normal")),
+            2.5,
+            "finite 且为正的权重原样返回"
+        );
+    }
+
+    #[test]
+    fn test_deleting_credit_weight_fields_maintains_functionality() {
+        // N13：覆盖「删除全部权重字段后仍正常启动 / 选路 / 无 panic / 无 500」。
+        //
+        // 「无 500」在本层测不到（这里没有 HTTP 栈），由「能加载 + 回落 1.0 + 选路成功」推出：
+        // 新路径唯一能产 500 的形态是 panic，而 panic 会让本测试直接失败。
+        // 不要误以为这条测试真打了 HTTP。
+        //
+        // 「选路成功」这个前提**不**由本测试内的 `resolve()` 检查兑现（那只证明
+        // 模型名能查到条目，从不涉及负载均衡挑凭据的路径，删不删权重字段两种
+        // 实现下都会通过、对这条验收项零覆盖）。真正跑一遍 balanced 选路的
+        // 用例在 `crate::kiro::token_manager` 测试模块的
+        // `test_balanced_selection_survives_credit_weight_fields_removed`
+        // （#98 返工 C1）——构造同一份剥离 credit_weight 的 registry 喂给
+        // `MultiTokenManager`，跑 `acquire → record_upstream_call → acquire`
+        // 断言选路真的换了凭据。两处 doc 以那条测试的断言为准，本测试下方
+        // 第 3 段的 `resolve()` 检查只保留其本身「模型名仍能被查到」这一较
+        // 窄的价值，不再重复声称覆盖选路。
+        let raw = include_str!("../../models.toml");
+        let stripped: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("credit_weight"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 1. from_toml(&stripped) 返回 Ok，且条目数不变
+        let registry_with_weights = ModelRegistry::from_toml(raw).unwrap();
+        let registry_without_weights = ModelRegistry::from_toml(&stripped).unwrap();
+        assert_eq!(
+            registry_with_weights.available_models().len(),
+            registry_without_weights.available_models().len(),
+            "删除权重字段后，条目数（含思考变体）应不变"
+        );
+
+        // 2. 删除权重后，GPT-5.6-sol 应回落 1.0
+        assert_eq!(
+            registry_without_weights.credit_weight_by_kiro_id(Some("gpt-5.6-sol")),
+            1.0,
+            "删除权重字段后，应回落默认值 1.0"
+        );
+
+        // 3. resolve() 对若干真实模型名仍能查到条目（仅证明模型名解析不受
+        //    影响；负载均衡选路的真实覆盖见上方 doc comment 指向的
+        //    token_manager 测试，这里不重复声称）
+        assert!(
+            registry_without_weights
+                .resolve("claude-opus-4-8")
+                .is_some(),
+            "删除权重后，模型名仍应能被解析到条目"
+        );
+        assert!(
+            registry_without_weights.resolve("gpt-5.6-sol").is_some(),
+            "GPT-5.6-sol 仍应能被解析到条目"
+        );
+    }
+
+    #[test]
+    fn test_credit_weight_values_in_production_models_toml() {
+        // N14：权重数值护栏 —— 对真实 models.toml 断言数值完整性。
+        let registry = ModelRegistry::builtin();
+
+        // 三个 GPT-5.6 模型的权重确为指定值
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("gpt-5.6-sol")),
+            2.4,
+            "gpt-5.6-sol credit_weight 应为 2.4"
+        );
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("gpt-5.6-terra")),
+            1.2,
+            "gpt-5.6-terra credit_weight 应为 1.2"
+        );
+        assert_eq!(
+            registry.credit_weight_by_kiro_id(Some("gpt-5.6-luna")),
+            0.6,
+            "gpt-5.6-luna credit_weight 应为 0.6"
+        );
+
+        // `#98` 返工 SUGGESTION C4：原先只抽查 2 个 claude 条目，改成遍历全部
+        // 非 gpt 条目断言 credit_weight == 1.0。该测试的价值就是钉死「claude
+        // 全族等权重」这个假设——只抽查 2 条时，手滑给某个没被抽到的 claude
+        // 条目加上权重不会让测试变红。
+        //
+        // 前提断言：证明「非 gpt 条目」这个集合非空。没有它，若过滤条件写错
+        // （比如 kiro_id 前缀拼错）导致集合变空，下面的遍历会在空集合上
+        // 恒真通过，退化成又一个恒绿测试。
+        let non_gpt_entries: Vec<&ModelEntry> = registry
+            .entries
+            .iter()
+            .filter(|e| !e.kiro_id.starts_with("gpt"))
+            .collect();
+        assert!(
+            !non_gpt_entries.is_empty(),
+            "前提：models.toml 中确实存在非 gpt 条目（claude 全族），\
+             否则下面的遍历断言会在空集合上恒真"
+        );
+        for entry in &non_gpt_entries {
+            assert_eq!(
+                registry.credit_weight_by_kiro_id(Some(&entry.kiro_id)),
+                1.0,
+                "{} 未配 credit_weight，应回落 1.0（claude 全族等权重）",
+                entry.kiro_id
+            );
+        }
     }
 }

@@ -181,6 +181,7 @@ expose_thinking_variant = true
 # Thinking silently ignored by upstream (no 400, no thinking blocks produced).
 # context_window = 272K (Kiro upstream spec; OpenAI native 1M not adopted).
 # credit multiplier: sol 2.4x / terra 1.2x / luna 0.6x
+# ↑ 即下方各条目 credit_weight 字段的取值来源。**未经黑盒实测**（见 #99），实测后需回来修正本行与各字段。
 # ============================================================================
 
 [[models]]
@@ -194,6 +195,7 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
+credit_weight = 2.4
 expose_thinking_variant = false
 
 [[models]]
@@ -207,6 +209,7 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
+credit_weight = 1.2
 expose_thinking_variant = false
 
 [[models]]
@@ -220,4 +223,5 @@ context_window = 272_000
 max_tokens = 64000
 created = 1780000000
 tier = "pro"
+credit_weight = 0.6
 expose_thinking_variant = false

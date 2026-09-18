@@ -16,11 +16,16 @@ docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component 
 # lint（非阻塞，仅参考；alpine 需先装组件）
 docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component add clippy && cargo clippy'
 
+# 每个 PR 提交完成后清理本地编译产物
+docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine cargo clean
+
 # 构建发布镜像 / 起服务（compose）
 docker compose build && docker compose up -d
 ```
 
 阻塞门槛仅 `cargo test`，clippy 警告不阻塞合并（仓库有存量 clippy）；但 `cargo fmt` 失败应修。
+
+线上 CI 承担持续构建；本地编译仅用于低频测试，因此本机高速存储空间优先于本地重编译时间。每个 PR 提交完成后应执行上述 `cargo clean`；预期结果是仓库根目录的 `target/` 被删除。该规则只规定人工收尾动作，不添加脚本、hook、CI 清理步骤或其他自动化机制。
 
 ## 项目结构
 
