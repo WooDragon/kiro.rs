@@ -10,13 +10,17 @@ Rust 编写的 Anthropic Claude API 兼容代理，将 Anthropic API 请求转�
 # 测试（唯一阻塞门槛）
 docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'cargo test --workspace'
 
+# 同上，用于刚跑过 cargo clean 之后的首次编译——不带这三个包会挂在 openssl-sys 的 build script 上
+docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine \
+  sh -c 'apk add --no-cache perl make musl-dev && cargo test --workspace'
+
 # 格式化（merge 前必跑——CI 的 Check formatting 会拦）
 docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component add rustfmt && cargo fmt'
 
 # lint（非阻塞，仅参考；alpine 需先装组件）
 docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine sh -c 'rustup component add clippy && cargo clippy'
 
-# 每个 PR 提交完成后清理本地编译产物
+# 收尾清理：一个 PR 的全部改动落地后跑一次，不是每个 commit 之后都跑
 docker run --rm -v "$PWD":/app -w /app rust:1.92-alpine cargo clean
 
 # 构建发布镜像 / 起服务（compose）
@@ -25,7 +29,7 @@ docker compose build && docker compose up -d
 
 阻塞门槛仅 `cargo test`，clippy 警告不阻塞合并（仓库有存量 clippy）；但 `cargo fmt` 失败应修。
 
-线上 CI 承担持续构建；本地编译仅用于低频测试，因此本机高速存储空间优先于本地重编译时间。每个 PR 提交完成后应执行上述 `cargo clean`；预期结果是仓库根目录的 `target/` 被删除。该规则只规定人工收尾动作，不添加脚本、hook、CI 清理步骤或其他自动化机制。
+线上 CI 承担持续构建；本地编译仅用于低频测试，因此本机高速存储空间优先于本地重编译时间。**一个 PR 的全部改动落地后执行一次**上述 `cargo clean`，**不是每个 commit 之后都执行**；预期结果是仓库根目录的 `target/` 被删除。清理之后的首次编译是冷编译，须改用上面带 `apk add` 前缀的那条测试命令。该规则只规定人工收尾动作，不添加脚本、hook、CI 清理步骤或其他自动化机制。
 
 ## 项目结构
 
