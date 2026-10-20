@@ -1515,6 +1515,7 @@ mod tests {
             (1, 1, 3000, 1),                 // real_total 极小
             (3000, 0, 3000, 0),              // real_total 为 0
             (3000, 0, 3000, 1),              // real_total 极小且饱和
+            (999, 0, 1000, 100), // 未饱和但取整进位到 real_total：round(100*0.999)=100，cap 须钳到 99
         ];
         for (cc, cr, local_total, real_total) in cases {
             let scaled = ScaledCacheUsage::Local {
@@ -1610,6 +1611,7 @@ mod tests {
             (100_000, 50_000, 10_000, 5000, 4999),
             (3000, 0, 3000, 1, 0),
             (3000, 0, 3000, 0, 0),
+            (999, 0, 1000, 100, 99), // 未饱和但取整进位到 real_total：cap 须无条件生效，不能只在 ratio==1.0 时收紧
         ];
         for (cc, cr, local_total, real_total, expected) in cases {
             let scaled = ScaledCacheUsage::Local {
