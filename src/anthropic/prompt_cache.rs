@@ -80,15 +80,17 @@ impl ScaledCacheUsage {
     }
 
     /// 换算成与 `real_total`（如 `context_input_tokens`/上游真实值）同源尺度的
-    /// `PromptCacheUsage`，保证 `cache_creation + cache_read <= real_total`。
+    /// `PromptCacheUsage`，保证 `cache_creation + cache_read <= max(real_total - 1, 0)`，
+    /// 即 `real_total >= 1` 时未缓存尾部恒留 1 个 token、`input_tokens` 恒 >= 1。
     ///
     /// `Real` 分支直接透传，不重新缩放（上游给的就是真值，缩放反而画蛇添足）。
     /// `Local` 分支按比例换算：
     /// ```text
     /// ratio_cached  = clamp(last_tokens    / local_total, 0.0, 1.0)
     /// ratio_matched = clamp(matched_tokens / local_total, 0.0, ratio_cached)
-    /// cr = clamp(round(real_total * ratio_matched), 0, real_total)
-    /// cc = clamp(round(real_total * ratio_cached),  cr, real_total) - cr
+    /// cap = max(real_total - 1, 0)
+    /// cr = clamp(round(real_total * ratio_matched), 0, cap)
+    /// cc = clamp(round(real_total * ratio_cached),  cr, cap) - cr
     /// ```
     /// 除法在转 `f64` 之后才进行（唯一的实现级硬约束——i32 整除在
     /// `last_tokens < local_total` 时恒为 0，会把 cc/cr 全部清零，直接废掉整个重构）。
@@ -111,8 +113,14 @@ impl ScaledCacheUsage {
         let ratio_cached = (last_tokens as f64 / local_total as f64).clamp(0.0, 1.0);
         let ratio_matched = (matched_tokens as f64 / local_total as f64).clamp(0.0, ratio_cached);
 
-        let cr = ((real_total as f64 * ratio_matched).round() as i32).clamp(0, real_total);
-        let cc = ((real_total as f64 * ratio_cached).round() as i32).clamp(cr, real_total) - cr;
+        // 未缓存尾部恒留 1 个 token：其他 Claude 渠道观测到的 input_tokens 是个位数到
+        // 较小的非零值，断点落在 prompt 末尾（Claude Code 常态）时这里却会算成 0。旧版
+        // new-api 把 input==0 当作 usage 缺失，流被客户端中断时会用本地估算覆盖整段
+        // prompt，可能重复计费。
+        // 守恒 input + cc + cr == real_total 不变，仅把 <=1 个 token 从 cache 桶挪到 input 桶。
+        let cap = (real_total - 1).max(0);
+        let cr = ((real_total as f64 * ratio_matched).round() as i32).clamp(0, cap);
+        let cc = ((real_total as f64 * ratio_cached).round() as i32).clamp(cr, cap) - cr;
 
         let (cache_5m, cache_1h) = split_5m_1h_by_local_ratio(
             usage.cache_creation_5m_input_tokens,
@@ -1464,7 +1472,7 @@ mod tests {
     /// 是构造性成立还是被兜底掩盖"零覆盖，故补三条更强断言（#85 B2）：
     /// 1. 守恒等式 `uncached + cc + cr == real_total`；
     /// 2. `uncached` 精确等于裸减法 `real_total - cc - cr`，不是被 `.max(0)` 钳出的值；
-    /// 3. ratio 被 clamp 到 1.0 的饱和场景精确打满 `real_total`（不能只满足 `<=`）。
+    /// 3. ratio 被 clamp 到 1.0 的饱和场景精确打满 `real_total - 1`（恒留 1 个未缓存 token，不能只满足 `<=`）。
     ///
     /// 用固定种子的一组边界/常规值代替 proptest（仓库无此依赖，不新增），
     /// 覆盖：cc/cr 均为 0、cc 独大、cr 独大、cc=cr、local_total 远大于 real_total、
@@ -1486,6 +1494,8 @@ mod tests {
     ///   `ratio_cached>=1.0 && cc+cr==real_total`），重跑得到 `left: 4999
     ///   right: 5000`——证明饱和场景的 `==` 确实比旧测试的 `<=` 更能抓问题
     ///   （`<=` 对 4999<=5000 会照样放行）。
+    ///   （以上数值是留 1 token 之前的记录，彼时饱和目标为 real_total；现目标为
+    ///   real_total-1，同构注入的数值各减 1。）
     #[test]
     fn into_real_conserves_cc_plus_cr_uncached_identity() {
         // 本数组仅接受 real_total >= 0：下方 `uncached == raw_subtraction`（裸减法）
@@ -1504,6 +1514,8 @@ mod tests {
             (100_000, 50_000, 10_000, 5000), // 越界输入：last_tokens > local_total，ratio 饱和 clamp 到 1.0
             (1, 1, 3000, 1),                 // real_total 极小
             (3000, 0, 3000, 0),              // real_total 为 0
+            (3000, 0, 3000, 1),              // real_total 极小且饱和
+            (999, 0, 1000, 100), // 未饱和但取整进位到 real_total：round(100*0.999)=100，cap 须钳到 99
         ];
         for (cc, cr, local_total, real_total) in cases {
             let scaled = ScaledCacheUsage::Local {
@@ -1557,19 +1569,77 @@ mod tests {
                 real_total
             );
 
-            // #85 B2 断言 3：ratio 饱和(clamp 到 1.0)场景须精确打满 real_total。
+            // #85 B2 断言 3：ratio 饱和(clamp 到 1.0)场景须精确打满 real_total-1（恒留 1 个未缓存 token）。
             // 判据用结构条件而非硬编码某一条 case 的字面值：cc+cr >= local_total
             // 就是 ratio_cached 被 clamp 到 1.0 的定义本身（输入 last_tokens 达到
-            // 或超过 local_total 时，比例饱和封顶），此时和恰好 == real_total。
+            // 或超过 local_total 时，比例饱和封顶），此时和恰好 == (real_total-1).max(0)。
             // 用字面元组单点特判会导致任何人调整 cases 数组里的具体数值都让 `if`
             // 静默不再匹配、断言退化成死代码；结构条件不受具体数值变动影响。
             if cc + cr >= local_total {
                 assert_eq!(
                     real.cache_creation_input_tokens + real.cache_read_input_tokens,
-                    real_total,
-                    "ratio 饱和场景应精确打满 real_total，不能只满足 <="
+                    (real_total - 1).max(0),
+                    "ratio 饱和场景应精确打满 real_total-1（恒留 1 个未缓存 token），不能只满足 <="
                 );
             }
+
+            // #85 断言 4：只要有 token 可分，未缓存尾部恒 >= 1（下游把 input==0 当 usage 缺失）。
+            if real_total >= 1 {
+                assert!(
+                    uncached >= 1,
+                    "real_total>=1 时未缓存尾部必须 >= 1（输入 cc={} cr={} local_total={} real_total={}）",
+                    cc,
+                    cr,
+                    local_total,
+                    real_total
+                );
+            }
+        }
+    }
+
+    /// 饱和时未缓存尾部恒留 1 个 token：断点落在 prompt 末尾（Claude Code 常态）时
+    /// `input_tokens` 不得为 0；`real_total` 为 1/0 时无 token 可挪，cc+cr 退化为 0。
+    ///
+    /// 反事实：把 `into_real` 里的 `cap` 还原成 `real_total`，各 case 的 cc+cr 变为
+    /// real_total、uncached 变为 0，本测试变红。
+    #[test]
+    fn into_real_reserves_one_uncached_token_when_cache_saturates() {
+        // (cc, cr, local_total, real_total, expected_cc_plus_cr)
+        let cases = [
+            (3000, 0, 3000, 5000, 4999),
+            (0, 3000, 3000, 5000, 4999),
+            (100_000, 50_000, 10_000, 5000, 4999),
+            (3000, 0, 3000, 1, 0),
+            (3000, 0, 3000, 0, 0),
+            (999, 0, 1000, 100, 99), // 未饱和但取整进位到 real_total：cap 须无条件生效，不能只在 ratio==1.0 时收紧
+        ];
+        for (cc, cr, local_total, real_total, expected) in cases {
+            let scaled = ScaledCacheUsage::Local {
+                usage: PromptCacheUsage {
+                    cache_creation_input_tokens: cc,
+                    cache_read_input_tokens: cr,
+                    cache_creation_5m_input_tokens: cc,
+                    cache_creation_1h_input_tokens: 0,
+                },
+                local_total,
+            };
+            let real = scaled.into_real(real_total);
+            assert_eq!(
+                real.cache_creation_input_tokens + real.cache_read_input_tokens,
+                expected,
+                "cc+cr 应为 {}（输入 cc={} cr={} local_total={} real_total={}）",
+                expected,
+                cc,
+                cr,
+                local_total,
+                real_total
+            );
+            assert_eq!(
+                uncached_input_tokens(real_total, real),
+                real_total.min(1),
+                "未缓存尾部应恒留 1 个 token（real_total={}）",
+                real_total
+            );
         }
     }
 
@@ -1719,6 +1789,32 @@ mod tests {
         let reported_input = value["input_tokens"].as_i64().unwrap() as i32;
         let cc = value["cache_creation_input_tokens"].as_i64().unwrap() as i32;
         let cr = value["cache_read_input_tokens"].as_i64().unwrap() as i32;
+        assert_eq!(
+            reported_input + cc + cr,
+            real_total,
+            "守恒律：input_tokens + cc + cr 必须恒等于 real_total"
+        );
+    }
+
+    /// 客户端可见形状：缓存断点落在 prompt 末尾时，最终 JSON 的 `input_tokens` 恒 >= 1，
+    /// 且 `input + cc + cr == real_total`（守恒不变）。数值取自线上带缓存请求的量级。
+    #[test]
+    fn build_usage_value_never_reports_zero_input_when_cache_saturates() {
+        let scaled = ScaledCacheUsage::Local {
+            usage: PromptCacheUsage {
+                cache_creation_input_tokens: 600,
+                cache_read_input_tokens: 2400,
+                cache_creation_5m_input_tokens: 600,
+                cache_creation_1h_input_tokens: 0,
+            },
+            local_total: 3000,
+        };
+        let real_total = 235_442;
+        let value = build_usage_value(real_total, 79, scaled, true);
+        let reported_input = value["input_tokens"].as_i64().unwrap() as i32;
+        let cc = value["cache_creation_input_tokens"].as_i64().unwrap() as i32;
+        let cr = value["cache_read_input_tokens"].as_i64().unwrap() as i32;
+        assert_eq!(reported_input, 1, "饱和时 input_tokens 应恒留 1");
         assert_eq!(
             reported_input + cc + cr,
             real_total,
