@@ -311,6 +311,31 @@ impl MultiTokenManager {
         }
     }
 
+    fn record_maintenance_auth_failure(&self, id: u64, identity: &EntryIdentity, permanent: bool) {
+        let isolated = {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.id == id && identity.matches(entry))
+            else {
+                return;
+            };
+            entry.auth_retry_after_ms =
+                Some(AuthSchedule::Failed(self.now_ms().saturating_add(RETRY_MS)));
+            // 只隔离仍启用的同一状态，不能覆盖 Manual 或丢失额度阻塞。
+            let isolate = permanent && !entry.disabled;
+            if isolate {
+                entry.set_reason(Some(DisabledReason::InvalidRefreshToken));
+            }
+            isolate
+        };
+        if isolated {
+            self.clear_sticky_sessions_for_credential(id);
+            self.select_highest_priority();
+            self.persist_credentials_observed();
+        }
+    }
+
     async fn maintain_entry(&self, id: u64, identity: EntryIdentity) {
         let oauth = {
             let entries = self.entries.lock();
@@ -338,15 +363,9 @@ impl MultiTokenManager {
                 .refresh_auth(id, RefreshMode::Maintenance(&identity))
                 .await
         {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries
-                .iter_mut()
-                .find(|entry| entry.id == id && identity.matches(entry))
-            {
-                entry.auth_retry_after_ms =
-                    Some(AuthSchedule::Failed(self.now_ms().saturating_add(RETRY_MS)));
-            }
-            if let Some(invalid) = error.downcast_ref::<RefreshTokenInvalidError>() {
+            let invalid = error.downcast_ref::<RefreshTokenInvalidError>();
+            self.record_maintenance_auth_failure(id, &identity, invalid.is_some());
+            if let Some(invalid) = invalid {
                 tracing::warn!(
                     credential_id = id,
                     error_code = invalid.error_code,
@@ -438,6 +457,7 @@ mod tests {
     struct HttpState {
         requests: Mutex<Vec<(String, Value)>>,
         status: Mutex<StatusCode>,
+        error_body: Mutex<Value>,
         ttl: AtomicU64,
         usage: Mutex<Value>,
         pause: AtomicBool,
@@ -486,7 +506,7 @@ mod tests {
             let response = if status.is_success() {
                 json!({"accessToken":"new-access", "refreshToken":format!("{}x", body["refreshToken"].as_str().unwrap()), "expiresIn":state.ttl.load(Ordering::SeqCst)})
             } else {
-                json!({"error":"invalid_client"})
+                state.error_body.lock().clone()
             };
             return (status, Json(response)).into_response();
         }
@@ -499,6 +519,7 @@ mod tests {
             let state = Arc::new(HttpState {
                 requests: Mutex::new(vec![]),
                 status: Mutex::new(StatusCode::OK),
+                error_body: Mutex::new(json!({"error":"invalid_client"})),
                 ttl: AtomicU64::new(3600),
                 usage: Mutex::new(
                     json!({"usageBreakdownList":[{"currentUsageWithPrecision":10,"usageLimitWithPrecision":10}]}),
@@ -792,11 +813,177 @@ mod tests {
         assert_eq!(server.count("/token"), 0);
     }
 
+    fn permanent_failure(server: &Server) {
+        *server.state.status.lock() = StatusCode::BAD_REQUEST;
+        *server.state.error_body.lock() = json!({
+            "error":"invalid_grant",
+            "error_description":"Invalid refresh token provided"
+        });
+    }
+
+    fn assert_maintenance_health_unchanged(manager: &MultiTokenManager) {
+        let entries = manager.entries.lock();
+        let entry = &entries[0];
+        assert_eq!(
+            (
+                entry.failure_count,
+                entry.refresh_failure_count,
+                entry.success_count,
+                entry.in_flight_count,
+                entry.load,
+                entry.load_updated_at_ms
+            ),
+            (0, 0, 0, 0, 0.0, 0)
+        );
+        assert!(entry.last_used_at.is_none());
+    }
+
     #[tokio::test]
-    async fn maintenance_auth_failure_throttles_quota_and_continues_scan() {
-        for status in [StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE] {
+    async fn maintenance_permanent_failure_isolates_business_and_retries_to_recover() {
+        let server = Server::new().await;
+        permanent_failure(&server);
+        let clock = TestClock::new();
+        let mut fallback = oauth(2, false);
+        fallback.priority = 1;
+        let manager = manager(clock.clone(), vec![oauth(1, true), fallback]);
+        server.attach(&manager);
+        manager.bind_sticky_session("revoked-session", 1);
+        manager.maintain_once().await;
+        assert_eq!(
+            manager.entries.lock()[0].disabled_reason,
+            Some(DisabledReason::InvalidRefreshToken)
+        );
+        assert!(manager.entries.lock()[0].disabled);
+        assert_eq!(*manager.current_id.lock(), 2);
+        assert!(
+            !manager
+                .sticky_sessions
+                .lock()
+                .contains_key("revoked-session")
+        );
+        assert!(matches!(manager.entries.lock()[0].auth_retry_after_ms,
+            Some(AuthSchedule::Failed(at)) if at == manager.now_ms() + RETRY_MS));
+        assert_maintenance_health_unchanged(&manager);
+        let context = manager
+            .acquire_context(Some("claude-sonnet-5"))
+            .await
+            .unwrap();
+        assert_eq!(context.id, 2, "revoked credential must not serve business");
+        manager.report_no_result(context.id);
+        clock.advance_ms(RETRY_MS - 1);
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 1, "backoff forbids extra HTTP");
+        *server.state.status.lock() = StatusCode::OK;
+        clock.advance_ms(1);
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 2);
+        assert!(!manager.entries.lock()[0].disabled);
+        assert_eq!(manager.entries.lock()[0].disabled_reason, None);
+        assert_maintenance_health_unchanged(&manager);
+        let context = manager
+            .acquire_context(Some("claude-sonnet-5"))
+            .await
+            .unwrap();
+        assert_eq!(
+            context.id, 1,
+            "actual refresh restores business eligibility"
+        );
+        manager.report_no_result(context.id);
+        assert_eq!(server.count("/getUsageLimits"), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_transient_failure_keeps_enabled_business_state() {
+        for (status, body) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error":"invalid_client"}),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_grant","error_description":"clock skew detected"}),
+            ),
+        ] {
             let server = Server::new().await;
             *server.state.status.lock() = status;
+            *server.state.error_body.lock() = body;
+            let manager = manager(TestClock::new(), vec![oauth(1, true)]);
+            server.attach(&manager);
+            manager.maintain_once().await;
+            assert!(!manager.entries.lock()[0].disabled);
+            assert_eq!(manager.entries.lock()[0].disabled_reason, None);
+            assert!(matches!(
+                manager.entries.lock()[0].auth_retry_after_ms,
+                Some(AuthSchedule::Failed(_))
+            ));
+            assert_eq!(server.count("/token"), 1);
+            assert_maintenance_health_unchanged(&manager);
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_stale_permanent_failure_preserves_current_decisions() {
+        for change in ["manual", "enable", "quota", "replace"] {
+            let server = Server::new().await;
+            permanent_failure(&server);
+            server.state.pause.store(true, Ordering::SeqCst);
+            let manager = manager(TestClock::new(), vec![oauth(1, true)]);
+            server.attach(&manager);
+            let identity = EntryIdentity::of(&manager.entries.lock()[0]);
+            let worker = manager.clone();
+            let task = tokio::spawn(async move { worker.maintain_once().await });
+            server.wait_count("/token", 1).await;
+            let expected = match change {
+                "manual" => {
+                    manager.set_disabled(1, true).unwrap();
+                    Some(DisabledReason::Manual)
+                }
+                "enable" => {
+                    manager.set_disabled(1, false).unwrap();
+                    None
+                }
+                "quota" => {
+                    manager.report_quota_exhausted(1);
+                    Some(DisabledReason::QuotaExceeded)
+                }
+                _ => {
+                    let fresh =
+                        profile_test_manager(TestClock::new(), vec![oauth(1, true)], None, true);
+                    let entry = fresh.entries.lock().pop().unwrap();
+                    manager.set_disabled(1, true).unwrap();
+                    manager.delete_credential(1).unwrap();
+                    manager.entries.lock().push(entry);
+                    None
+                }
+            };
+            assert!(!identity.matches(&manager.entries.lock()[0]));
+            server.state.release.add_permits(1);
+            task.await.unwrap();
+            let entries = manager.entries.lock();
+            assert_eq!(entries[0].disabled_reason, expected, "{change}");
+            assert_eq!(entries[0].disabled, expected.is_some(), "{change}");
+            assert!(
+                entries[0].auth_retry_after_ms.is_none(),
+                "{change}: stale failure must not schedule new state"
+            );
+            assert_eq!(server.count("/token"), 1);
+            assert_eq!(server.count("/getUsageLimits"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_auth_failure_throttles_quota_and_continues_scan() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let server = Server::new().await;
+            if status == StatusCode::BAD_REQUEST {
+                permanent_failure(&server);
+            } else {
+                *server.state.status.lock() = status;
+            }
             let clock = TestClock::new();
             let manager = manager(clock.clone(), vec![oauth(1, true), oauth(2, true)]);
             server.attach(&manager);
@@ -809,6 +996,15 @@ mod tests {
                 "one failure must not terminate the round"
             );
             assert_eq!(server.count("/getUsageLimits"), 0);
+            {
+                let entries = manager.entries.lock();
+                assert_eq!(
+                    entries[0].disabled_reason,
+                    Some(DisabledReason::QuotaExceeded)
+                );
+                assert_eq!(entries[1].disabled_reason, Some(DisabledReason::Manual));
+                assert_eq!(entries[0].failure_count, MAX_FAILURES_PER_CREDENTIAL);
+            }
             for _ in 0..14 {
                 clock.advance_ms(60_000);
                 manager.maintain_once().await;
