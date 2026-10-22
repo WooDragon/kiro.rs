@@ -259,5 +259,13 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let maintenance = token_manager.spawn_maintenance();
+    let result = axum::serve(listener, app).await;
+    maintenance.abort();
+    if let Err(error) = maintenance.await
+        && !error.is_cancelled()
+    {
+        tracing::warn!(error = %error, "凭据维护任务异常结束");
+    }
+    result.unwrap();
 }
