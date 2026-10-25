@@ -503,56 +503,130 @@ pub type RequestHeaders = Vec<(String, String)>;
 
 /// 受控的 TCP 目标服务：接受连接并回一句固定响应，记录被连次数与收到的请求头。
 pub struct TargetServer {
+    /// IPv4 回环地址（含端口）。`localhost:{port}` 的端口部分取自这里。
     pub addr: std::net::SocketAddr,
+    /// IPv6 回环地址（与 `addr` 同端口）；平台不支持 IPv6 时为 `None`。
+    ipv6_addr: Option<std::net::SocketAddr>,
     pub connections: Arc<AtomicUsize>,
     /// 每个请求收到的请求头（`(name, value)`，name 转小写）。
     ///
     /// 这是「代理凭据不得进入目标请求」的唯一有效观测面：只看代理侧认证成功
     /// 无法排除"顺带把 Proxy-Authorization 也转发给目标"。
     pub received_headers: Arc<parking_lot::Mutex<Vec<RequestHeaders>>>,
-    task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for TargetServer {
     fn drop(&mut self) {
-        self.task.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
+}
+
+/// 绑定一对同端口的 loopback listener：IPv4 恒有，IPv6 在平台支持时一并绑定。
+///
+/// 为什么两个族都要：`localhost` 的解析结果依赖平台——musl/Alpine 上优先是
+/// `::1`，glibc/macOS 上多是 `127.0.0.1`。只绑 `127.0.0.1` 时，"客户端本地解析
+/// 后按 IP 类型发出"的用例会在解析成 `::1` 的平台上打空（SOCKS 夹具因此回
+/// REP=0x05，客户端看到 ConnectionRefused），红在与被验收行为无关的地方。
+///
+/// 两个 listener 用**同一个端口**，所以调用方拼 `localhost:{port}` 时无论解析成
+/// 哪个族都能连上。IPv6 绑不上（容器禁用 IPv6）时降级为仅 IPv4，不 panic——
+/// 那条路径下 `localhost` 同样解析不出 `::1`，用例照常成立。
+async fn bind_loopback_pair() -> (TcpListener, Option<TcpListener>) {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let bind_v4 = || TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    let bind_v6 = |port| TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+
+    // 探针只用来区分「平台不支持 IPv6」与「这个端口在 ::1 上恰好被占」，
+    // 拿到结果后立即 drop。
+    if bind_v6(0).await.is_err() {
+        return (bind_v4().await.unwrap(), None);
+    }
+    for _ in 0..32 {
+        let ipv4 = bind_v4().await.unwrap();
+        let port = ipv4.local_addr().unwrap().port();
+        if let Ok(ipv6) = bind_v6(port).await {
+            return (ipv4, Some(ipv6));
+        }
+        // 该端口在 ::1 上被别的进程占了：换一个 IPv4 临时端口重试。
+    }
+    // 极小概率连续撞车：降级为仅 IPv4，不让夹具 panic。
+    (bind_v4().await.unwrap(), None)
+}
+
+/// 为一个 listener 起 accept 循环；两个族的 listener 共用这一个循环实现，
+/// 因此连接计数与请求处理逻辑对两族完全一致。
+fn spawn_accept_loop(
+    listener: TcpListener,
+    connections: Arc<AtomicUsize>,
+    received_headers: Arc<parking_lot::Mutex<Vec<RequestHeaders>>>,
+    body: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            connections.fetch_add(1, Ordering::SeqCst);
+            let headers = received_headers.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                headers.lock().push(parse_request_headers(&buffer[..read]));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    })
 }
 
 impl TargetServer {
     /// `body` 作为 HTTP 响应体返回；`connections` 记录连接建立次数。
     pub async fn spawn(body: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (listener, ipv6_listener) = bind_loopback_pair().await;
         let addr = listener.local_addr().unwrap();
+        let ipv6_addr = ipv6_listener
+            .as_ref()
+            .map(|listener| listener.local_addr().unwrap());
         let connections = Arc::new(AtomicUsize::new(0));
         let received_headers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let counter = connections.clone();
-        let headers = received_headers.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                counter.fetch_add(1, Ordering::SeqCst);
-                let headers = headers.clone();
-                tokio::spawn(async move {
-                    let mut buffer = vec![0u8; 8192];
-                    let read = stream.read(&mut buffer).await.unwrap_or(0);
-                    headers.lock().push(parse_request_headers(&buffer[..read]));
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
+        let mut tasks = vec![spawn_accept_loop(
+            listener,
+            connections.clone(),
+            received_headers.clone(),
+            body,
+        )];
+        if let Some(listener) = ipv6_listener {
+            tasks.push(spawn_accept_loop(
+                listener,
+                connections.clone(),
+                received_headers.clone(),
+                body,
+            ));
+        }
         Self {
             addr,
+            ipv6_addr,
             connections,
             received_headers,
-            task,
+            tasks,
         }
+    }
+
+    /// 本夹具实际监听的 loopback 地址（IPv4 恒有；IPv6 在平台支持时也有）。
+    ///
+    /// 用于断言"客户端本地解析出的地址确实是本目标的某个回环地址"：IPv6 可用时
+    /// `localhost` 可能解析成 `::1`，这类断言不能钉死 IPv4。
+    pub fn loopback_addrs(&self) -> Vec<std::net::IpAddr> {
+        std::iter::once(self.addr.ip())
+            .chain(self.ipv6_addr.map(|addr| addr.ip()))
+            .collect()
     }
 
     pub fn connections(&self) -> usize {

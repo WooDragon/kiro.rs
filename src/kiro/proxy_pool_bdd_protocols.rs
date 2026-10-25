@@ -299,39 +299,113 @@ async fn bdd_https_connect_with_wrong_auth_never_reaches_target() {
 // SOCKS5 vs SOCKS5h：目标地址类型（DNS 由谁解析）
 // ─────────────────────────────────────────────────────────────
 
-/// `socks5://` 由**客户端**解析：以 IPv4 地址类型发出。
+// 下面三条用例按"一条用例只证明一件事"拆开：
+//
+//   1. `bdd_socks5_tunnels_to_ip_literal_target` —— 隧道**连通性** + 目标以 IP
+//      类型发出。目标用 `127.0.0.1` 字面量，不做 DNS，因此不依赖平台的解析顺序，
+//      IPv4/IPv6 环境下都确定性成立。
+//   2. `bdd_socks5_resolves_hostname_locally` —— DNS **位置**（socks5 臂）。
+//   3. `bdd_socks5h_hands_hostname_to_proxy` —— DNS **位置**（socks5h 臂）。
+//
+// 为什么必须拆：把"隧道通了"和"DNS 在哪解析"塞进同一条用例，会让前者依赖后者
+// 的成败。而 `socks5://` + 主机名解析到 IPv6 在 reqwest 0.12.28 + hyper-util
+// 0.1.19 上**必然失败**（上游缺陷，见第 2 条用例的注释），那条用例于是红在与被
+// 验收行为无关的地方。拆开之后，连通性由用例 1 确定性覆盖，用例 2/3 只对 DNS
+// 位置负责。
+
+/// `socks5://` 隧道连通性 + 目标以 IP 地址类型发出（确定性用例）。
 ///
-/// 目标主机名用 `localhost`（本地回环，不依赖公网 DNS），因此"socks5 用例观察
-/// 到 IP 类型"就是"客户端本地解析了"。
+/// 目标主机名用 `127.0.0.1` 字面量：不做名字解析，不依赖 `localhost` 在平台间
+/// （glibc/macOS 多给 `127.0.0.1`，musl/Alpine 优先 `::1`）的解析顺序。因此本条
+/// 在 IPv4-only 与 IPv6 优先环境下结论相同。
 ///
-/// 反事实：在 `apply_proxy` 里把 `socks5://` 改写成 `socks5h://` → 观察到的
-/// 是域名类型，本条红。
+/// 本用例证明两件事，且都确定性：
+/// - 隧道真的通了（200 + body 正确 + 目标侧确实收到 1 个连接）；
+/// - CONNECT 里发的是 IP 类型（ATYP=1）、目标是 `127.0.0.1:<port>`。
+///
+/// 反事实：`apply_proxy` 不再施加代理 → 代理侧 0 次 CONNECT，前置条件断言红。
+/// 注意：把 `socks5://` 改写成 `socks5h://` 时本条**不会**红——IP 字面量在
+/// hyper-util 的 `SocksV5::call` 里 `host.parse::<IpAddr>()` 恒成功
+/// （`socks5/v5/mod.rs:114-125`），两个 scheme 都发 ATYP=1。scheme 的区分由下面
+/// 两条 DNS 位置用例承担，本条不重复证明。
 #[tokio::test]
-async fn bdd_socks5_resolves_locally_and_sends_ip_address_type() {
+async fn bdd_socks5_tunnels_to_ip_literal_target() {
     let socks = spawn_socks5(None, "socks5").await;
     let target = TargetServer::spawn(r#"{"ok":true}"#).await;
     let route = route(ProxyConfig::new(&socks.url));
+    let port = target.addr.port();
 
+    // IP 字面量：不做 DNS，不受"先用 IPv4 还是先用 IPv6"影响。
     let response = route
         .short
-        .get(format!("http://localhost:{}/probe", target.addr.port()))
+        .get(format!("http://127.0.0.1:{port}/probe"))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.status().as_u16(), 200, "隧道必须让请求到达目标");
+    assert_eq!(response.text().await.unwrap(), r#"{"ok":true}"#);
 
     let observed = socks.stats.targets();
     assert_eq!(observed.len(), 1, "前置条件：代理必须收到 1 次 CONNECT");
     assert!(
         !observed[0].domain,
-        "socks5 必须由客户端本地解析并以 IP 类型发出，实际: {:?}",
+        "IP 字面量目标必须以 IP 类型发出（ATYP=1），实际: {:?}",
         observed[0]
     );
+    assert_eq!(
+        observed[0].target,
+        format!("127.0.0.1:{port}"),
+        "CONNECT 目标必须是字面量的回环地址（不含任何解析结果）"
+    );
+    assert_eq!(target.connections(), 1, "隧道必须真的连到目标");
+}
+
+/// `socks5://` 由**客户端**解析：主机名不得到达代理。
+///
+/// 本条只对"DNS 在哪解析"负责，**不**对隧道连通性负责——连通性由
+/// [`bdd_socks5_tunnels_to_ip_literal_target`] 以 IP 字面量确定性覆盖。因此这里
+/// 有意允许传输失败、不做 `unwrap`，这不是漏断言。
+///
+/// 为什么不许 `unwrap`：目标主机名是 `localhost`。在 IPv6 优先环境（musl/Alpine、
+/// 以及启用了 IPv6 loopback 的 CI 容器）下 reqwest 0.12.28 的
+/// `DnsResolve::Local` 分支把解析出的 IPv6 包成 `"[::1]"` 放进 URI
+/// （`reqwest/src/connect.rs:1877-1894`），hyper-util 的
+/// `"[::1]".parse::<IpAddr>()` 失败后落到 `Address::Domain("[::1]")`，以 ATYP=3
+/// 域名发出；代理侧 getaddrinfo 不认方括号 → REP=0x05 → 隧道建立失败。这是上游
+/// 缺陷，已记录，不在本 PR 修复。无论失败与否，**主机名都没有到达代理**，这正是
+/// 本条要断言的事实，在 IPv4（target=`127.0.0.1:port`）与 IPv6（target=
+/// `[::1]:port`）下都成立。
+///
+/// 反事实：把 `socks5://` 改写成 `socks5h://` → 代理收到 `localhost:<port>` 域名，
+/// 本条红。
+#[tokio::test]
+async fn bdd_socks5_resolves_hostname_locally() {
+    let socks = spawn_socks5(None, "socks5").await;
+    let target = TargetServer::spawn(r#"{"ok":true}"#).await;
+    let route = route(ProxyConfig::new(&socks.url));
+    let port = target.addr.port();
+
+    // 前置条件：目标确实在监听（双栈中至少一族可用），否则"解析结果连不上"什么
+    // 都证明不了。
     assert!(
-        observed[0]
-            .target
-            .starts_with(&format!("{}:", target.addr.ip())),
-        "本地解析结果必须是目标的回环地址，实际: {:?}",
+        !target.loopback_addrs().is_empty(),
+        "前置条件：目标必须已在回环上监听"
+    );
+
+    // 允许失败：本用例只关心 DNS 位置，隧道连通性由 IP 字面量用例覆盖。
+    let _ = route
+        .short
+        .get(format!("http://localhost:{port}/probe"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+
+    let observed = socks.stats.targets();
+    assert_eq!(observed.len(), 1, "前置条件：代理必须收到 1 次 CONNECT");
+    assert!(
+        !(observed[0].domain && observed[0].target.starts_with(&format!("localhost:{port}"))),
+        "socks5 必须由客户端本地解析，主机名不得原样到达代理，实际: {:?}",
         observed[0]
     );
 }
@@ -340,14 +414,21 @@ async fn bdd_socks5_resolves_locally_and_sends_ip_address_type() {
 ///
 /// 反事实：把 `socks5h://` 改回 `socks5://`（客户端解析）→ 观察到 IP 类型，本条红。
 #[tokio::test]
-async fn bdd_socks5h_sends_domain_so_proxy_resolves_and_target_is_reached() {
+async fn bdd_socks5h_hands_hostname_to_proxy() {
     let socks = spawn_socks5(None, "socks5h").await;
     let target = TargetServer::spawn(r#"{"ok":true}"#).await;
     let route = route(ProxyConfig::new(&socks.url));
+    let port = target.addr.port();
+
+    assert!(
+        !target.loopback_addrs().is_empty(),
+        "前置条件：目标必须已在回环上监听"
+    );
 
     let response = route
         .short
-        .get(format!("http://localhost:{}/probe", target.addr.port()))
+        .get(format!("http://localhost:{port}/probe"))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .unwrap();
@@ -362,7 +443,7 @@ async fn bdd_socks5h_sends_domain_so_proxy_resolves_and_target_is_reached() {
     );
     assert_eq!(
         observed[0].target,
-        format!("localhost:{}", target.addr.port()),
+        format!("localhost:{port}"),
         "代理端看到的必须是原始域名而不是已解析的 IP"
     );
     assert_eq!(target.connections(), 1, "代理解析出的地址必须真的连到目标");
