@@ -403,9 +403,26 @@ async fn bdd_socks5_resolves_hostname_locally() {
 
     let observed = socks.stats.targets();
     assert_eq!(observed.len(), 1, "前置条件：代理必须收到 1 次 CONNECT");
+
+    // 通过条件只有两支，缺一即红：
+    // 1. 客户端本地解析 → IP 类型，且解析结果必须是**本目标的某个回环地址**。
+    //    只写 `!domain` 太宽：别的域名、别的 IP 也都不满足 domain，会假绿。
+    // 2. 唯一的例外是已记录的上游缺陷形态：reqwest 把 IPv6 包成 "[::1]" 塞进
+    //    URI，hyper-util 的 parse::<IpAddr>() 对方括号恒失败，退化成 ATYP=3
+    //    域名发出。此时 domain=true 但目标正好是 "[::1]:{port}"。
+    //    该缺陷不在本 PR 修复。
+    let expected_ips: Vec<String> = target
+        .loopback_addrs()
+        .iter()
+        .map(|ip| format!("{ip}:{port}"))
+        .collect();
+    let locally_resolved = !observed[0].domain && expected_ips.contains(&observed[0].target);
+    let known_upstream_ipv6_defect =
+        observed[0].domain && observed[0].target == format!("[::1]:{port}");
     assert!(
-        !(observed[0].domain && observed[0].target.starts_with(&format!("localhost:{port}"))),
-        "socks5 必须由客户端本地解析，主机名不得原样到达代理，实际: {:?}",
+        locally_resolved || known_upstream_ipv6_defect,
+        "socks5 必须由客户端本地解析：预期 IP 类型且目标属于本目标的回环地址 {expected_ips:?}\
+         （唯一例外是已记录的 [::1] 上游缺陷形态），实际: {:?}",
         observed[0]
     );
 }
