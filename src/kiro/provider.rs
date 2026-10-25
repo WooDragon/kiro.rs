@@ -5,22 +5,17 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
-use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::http_client::{
-    ProxyConfig, UPSTREAM_IDLE_TIMEOUT_SECS, build_client, build_idle_client,
-};
+use crate::http_client::ProxyConfig;
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::kiro::{LOG_PAYLOAD_LIMIT, truncate_for_log};
-use crate::model::config::TlsBackend;
-use parking_lot::Mutex;
 
 /// Provider 层类型化错误，供 handlers 层 downcast 后映射到正确 HTTP 状态码。
 #[derive(Debug)]
@@ -96,19 +91,6 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// "5xx 不切换凭据"的既有设计）。
 const MAX_5XX_RETRIES: usize = 1;
 
-/// Client 类型：区分业务长响应与短请求，保证超时策略解耦。
-///
-/// - `Idle`：业务 generateAssistantResponse（流式/非流式），使用 idle/read 超时，
-///   只要上游持续吐字节就不触发，避免误杀慢但健康的长响应。
-/// - `Short`：MCP、WebSearch 等短请求，使用全局总超时死线，防止 Slowloris。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ClientKind {
-    /// 业务长响应：idle/read 超时，无全局总超时
-    Idle,
-    /// 短请求：全局总超时
-    Short,
-}
-
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -116,15 +98,6 @@ enum ClientKind {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = (effective proxy config, ClientKind)
-    ///
-    /// 按代理+类型双维度缓存，业务 idle client 与短请求 total client 严格隔离，
-    /// 防止超时策略交叉污染。
-    client_cache: Mutex<HashMap<(Option<ProxyConfig>, ClientKind), Client>>,
-    /// TLS 后端配置
-    tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
@@ -144,11 +117,14 @@ pub struct KiroApiResponse {
 }
 
 impl KiroProvider {
-    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+    /// 创建 KiroProvider 实例。
+    ///
+    /// client 已随凭据常驻在 `CallContext::route` 上（启动期预建），这里不再
+    /// 持有任何代理配置或 client 缓存——请求路径上一次 `Arc` 计数加一即可（P1）。
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
-    /// * `proxy` - 全局代理配置
+    /// * `proxy` - 已废弃的全局代理入参，仅为保持既有调用点签名兼容
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
     pub fn with_proxy(
@@ -162,60 +138,13 @@ impl KiroProvider {
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
-        let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的业务 idle client（短请求 client 按需懒创建）
-        let initial_client =
-            build_idle_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
-                .expect("创建业务 HTTP 客户端失败");
-        let mut cache = HashMap::new();
-        cache.insert((proxy.clone(), ClientKind::Idle), initial_client);
-
+        // 代理不再由 Provider 持有：路由在 manager 构造期统一按池与凭据预建。
+        drop(proxy);
         Self {
             token_manager,
-            global_proxy: proxy,
-            client_cache: Mutex::new(cache),
-            tls_backend,
             endpoints,
             default_endpoint,
         }
-    }
-
-    /// 根据凭据的代理配置和 client 类型获取（或创建并缓存）对应的 `reqwest::Client`。
-    ///
-    /// 语义边界：
-    /// - `ClientKind::Idle`：业务 generateAssistantResponse，idle/read 超时，无全局总超时。
-    ///   只要上游持续吐字节就不触发，避免慢但健康的长流被误杀。
-    /// - `ClientKind::Short`：MCP/WebSearch 等短请求，全局总超时 720s，防 Slowloris。
-    ///
-    /// # 参数
-    /// * `credentials` - 当前凭据（用于提取 effective proxy）
-    /// * `kind` - client 类型
-    ///
-    /// # 返回
-    /// 缓存命中则克隆已有 client；未命中则按 kind 构建后写入缓存
-    fn client_for(
-        &self,
-        credentials: &KiroCredentials,
-        kind: ClientKind,
-    ) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
-        let cache_key = (effective.clone(), kind.clone());
-        let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&cache_key) {
-            return Ok(client.clone());
-        }
-        let client = match kind {
-            // 业务长响应：idle/read 超时，不设全局总超时
-            ClientKind::Idle => build_idle_client(
-                effective.as_ref(),
-                UPSTREAM_IDLE_TIMEOUT_SECS,
-                self.tls_backend,
-            )?,
-            // 短请求：全局总超时 720s，与业务 client 解耦，防 Slowloris
-            ClientKind::Short => build_client(effective.as_ref(), 720, self.tls_backend)?,
-        };
-        cache.insert(cache_key, client.clone());
-        Ok(client)
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -324,15 +253,10 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            // MCP/WebSearch 属于短请求，使用全局总超时 client，防止 Slowloris
-            let client = match self.client_for(&ctx.credentials, ClientKind::Short) {
-                Ok(client) => client,
-                Err(e) => {
-                    self.token_manager.report_no_result(ctx.id);
-                    return Err(e);
-                }
-            };
-            let base = client
+            // MCP/WebSearch 属于短请求，用该凭据路由上的总超时 client，防止 Slowloris
+            let base = ctx
+                .route
+                .short
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -626,15 +550,10 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            // generateAssistantResponse 属于业务长响应（流式/非流式），使用 idle/read 超时 client
-            let client = match self.client_for(&ctx.credentials, ClientKind::Idle) {
-                Ok(client) => client,
-                Err(e) => {
-                    self.token_manager.report_no_result(ctx.id);
-                    return Err(e);
-                }
-            };
-            let base = client
+            // generateAssistantResponse 属于业务长响应（流式/非流式），用该凭据路由的 idle client
+            let base = ctx
+                .route
+                .idle
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")

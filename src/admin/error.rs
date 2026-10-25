@@ -20,6 +20,15 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 被引用的代理仍在使用中
+    Conflict(String),
+
+    /// 存储不可写（单对象格式 / 无保存路径 / 写入失败）
+    StorageNotWritable(String),
+
+    /// 按名称/标识定位的资源不存在（代理等）
+    NotFoundEntity(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -31,6 +40,9 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::Conflict(msg) => write!(f, "{}", msg),
+            AdminServiceError::StorageNotWritable(msg) => write!(f, "{}", msg),
+            AdminServiceError::NotFoundEntity(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -45,6 +57,9 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Conflict(_) => StatusCode::CONFLICT,
+            AdminServiceError::StorageNotWritable(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::NotFoundEntity(_) => StatusCode::NOT_FOUND,
         }
     }
 
@@ -59,6 +74,11 @@ impl AdminServiceError {
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
+            AdminServiceError::Conflict(_) => AdminErrorResponse::new("conflict", self.to_string()),
+            AdminServiceError::StorageNotWritable(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::NotFoundEntity(_) => AdminErrorResponse::not_found(self.to_string()),
         }
     }
 }

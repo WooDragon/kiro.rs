@@ -1,5 +1,4 @@
-import axios from 'axios'
-import { storage } from '@/lib/storage'
+import { api } from '@/api/client'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
@@ -9,23 +8,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
 } from '@/types/api'
-
-// 创建 axios 实例
-const api = axios.create({
-  baseURL: '/api/admin',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-})
-
-// 请求拦截器添加 API Key
-api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
-  }
-  return config
-})
+import type { ProxyBinding, ProxyListResponse } from '@/types/proxy'
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
@@ -90,6 +73,20 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+/**
+ * 绑定凭据的代理来源。
+ *
+ * 后端成功响应是当前代理池列表（不是 success 消息），因此返回值按列表处理：
+ * 调用方据此直接刷新池缓存。
+ */
+export async function bindCredentialProxy(
+  id: number,
+  binding: ProxyBinding
+): Promise<ProxyListResponse> {
+  const { data } = await api.put<ProxyListResponse>(`/credentials/${id}/proxy`, binding)
   return data
 }
 

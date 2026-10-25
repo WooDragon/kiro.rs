@@ -1,3 +1,5 @@
+import type { ProxyBinding as ProxyBindingPayload } from '@/types/proxy'
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -22,8 +24,18 @@ export interface CredentialStatusItem {
   maskedApiKey?: string
   successCount: number
   lastUsedAt: string | null
+  /** 是否配置了任何形式的代理（旧字段，仅保留兼容；展示请用 proxyMode/effectiveProxyUrl） */
   hasProxy: boolean
+  /** 代理 URL（已脱敏；仅内联/直连时有值） */
   proxyUrl?: string
+  /** 代理来源：inherit | direct | pool | inline */
+  proxyMode: string
+  /** 池条目 ID（仅 pool 模式） */
+  proxyId?: string
+  /** 池条目名称（仅 pool 模式） */
+  proxyName?: string
+  /** 该凭据实际使用的脱敏代理地址（含继承来的全局代理） */
+  effectiveProxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
@@ -64,6 +76,10 @@ export interface SetPriorityRequest {
 }
 
 // 添加凭据请求
+//
+// 代理有两种互斥写法：新的 tagged `proxy`，或旧的三字段
+// `proxyUrl/proxyUsername/proxyPassword`。两者同时出现后端返回 400，
+// 因此调用方必须二选一（见 add-credential-dialog 的组装逻辑）。
 export interface AddCredentialRequest {
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
@@ -76,6 +92,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  proxy?: ProxyBindingPayload
   kiroApiKey?: string
   endpoint?: string
 }

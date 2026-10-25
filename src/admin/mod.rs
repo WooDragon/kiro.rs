@@ -21,6 +21,8 @@ mod handlers;
 mod middleware;
 mod router;
 mod service;
+#[cfg(test)]
+mod tests;
 pub mod types;
 
 pub use middleware::AdminState;

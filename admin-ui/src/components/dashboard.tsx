@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Network } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,6 +12,8 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
+import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -26,6 +28,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [proxyPoolOpen, setProxyPoolOpen] = useState(false)
+  const [editingProxyCredential, setEditingProxyCredential] = useState<number | null>(null)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
@@ -125,6 +129,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryClient.clear()
     onLogout()
   }
+
+  // 通过 id 从最新查询结果解析，保证对话框拿到的是最新代理来源
+  const editingProxyCredentialItem =
+    data?.credentials.find((credential) => credential.id === editingProxyCredential) || null
 
   // 选择管理
   const toggleSelect = (id: number) => {
@@ -690,6 +698,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
+              <Button onClick={() => setProxyPoolOpen(true)} size="sm" variant="outline">
+                <Network className="h-4 w-4 mr-2" />
+                代理池
+              </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
@@ -710,6 +722,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
+                    onEditProxy={(item) => setEditingProxyCredential(item.id)}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -764,6 +777,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <BatchImportDialog
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
+      />
+
+      {/* 代理池管理 */}
+      <ProxyPoolDialog open={proxyPoolOpen} onOpenChange={setProxyPoolOpen} />
+
+      {/* 单凭据代理来源 */}
+      <CredentialProxyDialog
+        credential={editingProxyCredentialItem}
+        onClose={() => setEditingProxyCredential(null)}
       />
 
       {/* KAM 账号导入对话框 */}

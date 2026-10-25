@@ -932,6 +932,7 @@ dependencies = [
  "crc",
  "fastrand",
  "futures",
+ "h2",
  "hex",
  "http",
  "mime_guess",

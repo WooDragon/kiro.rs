@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::http_client::ProxyConfig;
+use crate::http_client::{ProxyConfig, RouteKey};
+use crate::kiro::model::proxy_pool::{
+    CREDENTIALS_ENVELOPE_VERSION, CredentialsEnvelope, CredentialsFileFormat, ProxyEntry,
+    route_key_for,
+};
+#[cfg(test)]
+use crate::kiro::model::proxy_pool::{ProxyBinding, resolve_binding};
 use crate::model::config::Config;
 
 /// Kiro OAuth 凭证
@@ -93,6 +99,13 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 绑定的代理池条目 ID（可选）
+    ///
+    /// 与上面三个内联字段互斥；两者同时出现视为配置错误，由
+    /// [`crate::kiro::model::proxy_pool::validate_binding_fields`] 拒绝。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -130,18 +143,21 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     }
 }
 
-/// 凭据配置（支持单对象或数组格式）
+/// 凭据配置（支持单对象、数组或版本化封套格式）
 ///
 /// 自动识别配置文件格式：
-/// - 单对象格式（旧格式，向后兼容）
-/// - 数组格式（新格式，支持多凭据）
+/// - 单对象格式（旧格式，向后兼容，不回写）
+/// - 数组格式（旧多凭据格式，可回写）
+/// - 封套格式 `{version, proxies, credentials}`（使用代理池时）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CredentialsConfig {
     /// 单个凭据（旧格式）
     Single(Box<KiroCredentials>),
-    /// 多凭据数组（新格式）
+    /// 多凭据数组（旧格式）
     Multiple(Vec<KiroCredentials>),
+    /// 版本化封套（含代理池）
+    Envelope(Box<CredentialsEnvelope>),
 }
 
 impl CredentialsConfig {
@@ -149,7 +165,8 @@ impl CredentialsConfig {
     ///
     /// - 如果文件不存在，返回空数组
     /// - 如果文件内容为空，返回空数组
-    /// - 支持单对象或数组格式
+    /// - 单对象 / 数组 / 封套按内容识别；封套严格校验（未知版本、重复代理 ID、
+    ///   悬空或冲突绑定一律报错）
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
 
@@ -165,31 +182,73 @@ impl CredentialsConfig {
             return Ok(CredentialsConfig::Multiple(vec![]));
         }
 
-        let config = serde_json::from_str(&content)?;
-        Ok(config)
+        let parsed = crate::kiro::model::proxy_pool::parse_credentials_file(&content)?;
+        Ok(match parsed.format {
+            CredentialsFileFormat::Single => CredentialsConfig::Single(Box::new(
+                parsed
+                    .credentials
+                    .into_iter()
+                    .next()
+                    .expect("单对象必然产出一条凭据"),
+            )),
+            CredentialsFileFormat::Array => CredentialsConfig::Multiple(parsed.credentials),
+            CredentialsFileFormat::Envelope => {
+                CredentialsConfig::Envelope(Box::new(CredentialsEnvelope {
+                    version: CREDENTIALS_ENVELOPE_VERSION,
+                    proxies: parsed.proxies,
+                    credentials: parsed.credentials,
+                }))
+            }
+        })
     }
 
     /// 转换为按优先级排序的凭据列表
+    ///
+    /// 生产路径走 [`Self::into_parts`]（需要同时拿到池），这里只保留给测试与
+    /// 调用方做纯排序视图，因此生产构建里不编译。
+    #[cfg(test)]
     pub fn into_sorted_credentials(self) -> Vec<KiroCredentials> {
+        let mut creds = self.into_parts().0;
+        // 按优先级排序（数字越小优先级越高）
+        creds.sort_by_key(|c| c.priority);
+        for cred in &mut creds {
+            cred.canonicalize_auth_method();
+        }
+        creds
+    }
+
+    /// 拆成（凭据列表、代理池）。单对象/数组格式的池为空。
+    pub fn into_parts(self) -> (Vec<KiroCredentials>, Vec<ProxyEntry>) {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
-                vec![*cred]
+                (vec![*cred], Vec::new())
             }
             CredentialsConfig::Multiple(mut creds) => {
-                // 按优先级排序（数字越小优先级越高）
-                creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
                 }
-                creds
+                (creds, Vec::new())
+            }
+            CredentialsConfig::Envelope(envelope) => {
+                let mut envelope = *envelope;
+                for cred in &mut envelope.credentials {
+                    cred.canonicalize_auth_method();
+                }
+                (envelope.credentials, envelope.proxies)
             }
         }
     }
 
-    /// 判断是否为多凭据格式（数组格式）
+    /// 判断是否为多凭据格式（数组或封套才回写）
     pub fn is_multiple(&self) -> bool {
-        matches!(self, CredentialsConfig::Multiple(_))
+        !matches!(self, CredentialsConfig::Single(_))
+    }
+
+    /// 是否为封套格式
+    #[cfg(test)]
+    pub fn is_envelope(&self) -> bool {
+        matches!(self, CredentialsConfig::Envelope(_))
     }
 }
 
@@ -222,20 +281,34 @@ impl KiroCredentials {
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    ///
+    /// ⚠️ 池绑定（`proxy_id`）无法在此解析——需要池本身。运行期请用
+    /// [`Self::effective_route_key`] 或 `CredentialEntry::route`。
+    #[cfg(test)]
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
-        match self.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
-            Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
-                if let (Some(username), Some(password)) =
-                    (&self.proxy_username, &self.proxy_password)
-                {
-                    proxy = proxy.with_auth(username, password);
-                }
-                Some(proxy)
-            }
-            None => global_proxy.cloned(),
+        match resolve_binding(
+            None,
+            self.proxy_url.as_deref(),
+            self.proxy_username.as_deref(),
+            self.proxy_password.as_deref(),
+        ) {
+            ProxyBinding::Direct => None,
+            ProxyBinding::Inline(config) => Some(config),
+            _ => global_proxy.cloned(),
         }
+    }
+
+    /// 解析该凭据的网络路由标识：池绑定 > 直连 > 内联 > 继承全局。
+    ///
+    /// `resolved_pool` 是池绑定的网络身份（`ProxyEntry::to_proxy_config`）；
+    /// `global_proxy` 是 `config.proxyUrl`。两个参数都是必填的——
+    /// 传 `None` 代表"没有"，而不是"我不知道"，避免调用点静默丢掉全局代理。
+    pub fn effective_route_key(
+        &self,
+        resolved_pool: Option<&ProxyConfig>,
+        global_proxy: Option<&ProxyConfig>,
+    ) -> RouteKey {
+        route_key_for(self, resolved_pool, global_proxy)
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -344,6 +417,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             kiro_api_key: None,
@@ -463,6 +537,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             kiro_api_key: None,
@@ -495,6 +570,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             kiro_api_key: None,
@@ -614,6 +690,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             kiro_api_key: None,

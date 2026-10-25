@@ -138,21 +138,37 @@ impl MultiTokenManager {
         }
     }
 
+    /// 用该凭据已发布的路由 client 刷新 Token。
+    ///
+    /// 刷新是短请求，沿用 `route.short` 并显式叠加 60s 总超时，等价于改动前
+    /// 现建 `build_client(proxy, 60, ..)` 的口径。
     pub(super) async fn refresh_credentials(
         &self,
         credentials: &KiroCredentials,
+        route: &Route,
     ) -> anyhow::Result<KiroCredentials> {
-        let proxy = credentials.effective_proxy(self.proxy.as_ref());
         #[cfg(test)]
         {
             let url = self.test_refresh_url.lock().clone();
-            refresh_token_at(credentials, &self.config, proxy.as_ref(), url.as_deref()).await
+            refresh_token_with_client(
+                credentials,
+                &self.config,
+                &route.short,
+                url.as_deref(),
+                Some(60),
+            )
+            .await
         }
         #[cfg(not(test))]
-        refresh_token(credentials, &self.config, proxy.as_ref()).await
+        {
+            refresh_token_with_client(credentials, &self.config, &route.short, None, Some(60)).await
+        }
     }
 
-    /// 全局锁覆盖重读、HTTP 和内存 apply；保存始终在锁外。
+    /// 每凭据一把锁覆盖重读、HTTP 和内存 apply；保存始终在锁外。
+    ///
+    /// 锁在 entries 锁内克隆、释放 entries 后才 await，因此一个慢或死的代理
+    /// 只阻塞它自己的凭据（P5），也不会倒置 `save → entries → pool` 锁序。
     pub(super) async fn refresh_auth(
         &self,
         id: u64,
@@ -166,8 +182,16 @@ impl MultiTokenManager {
                 return Ok(false);
             }
         }
+        let lock = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.refresh_lock.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
         let (refreshed, restored) = {
-            let _guard = self.refresh_lock.lock().await;
+            let _guard = lock.lock().await;
             self.refresh_auth_locked(id, mode).await?
         };
         if refreshed {
@@ -184,7 +208,7 @@ impl MultiTokenManager {
         id: u64,
         mode: RefreshMode<'_>,
     ) -> anyhow::Result<(bool, bool)> {
-        let (current, identity, auth_disabled) = {
+        let (current, identity, auth_disabled, route) = {
             let entries = self.entries.lock();
             let entry = entries
                 .iter()
@@ -205,6 +229,7 @@ impl MultiTokenManager {
                 entry.credentials.clone(),
                 EntryIdentity::of(entry),
                 entry.disabled_reason.is_some_and(DisabledReason::is_auth),
+                entry.route.clone(),
             )
         };
         if current.is_api_key_credential() {
@@ -218,7 +243,7 @@ impl MultiTokenManager {
         if !force && !is_token_expired(&current) && !is_token_expiring_soon(&current) {
             return Ok((false, false));
         }
-        let result = self.refresh_credentials(&current).await;
+        let result = self.refresh_credentials(&current, &route).await;
         let still_current = self.entries.lock().iter().any(|entry| {
             entry.id == id
                 && identity.same_instance(entry)
@@ -660,7 +685,8 @@ mod tests {
         let manager = manager(clock.clone(), vec![oauth(1, true)]);
         server.attach(&manager);
         manager.report_quota_exhausted(1);
-        let guard = manager.refresh_lock.lock().await;
+        let guard = manager.entries.lock()[0].refresh_lock.clone();
+        let guard = guard.lock().await;
         let mut waiter = Box::pin(manager.maintain_once());
         poll_waiter_pending(waiter.as_mut()).await;
         let deadline = manager.now_ms() + RETRY_MS;

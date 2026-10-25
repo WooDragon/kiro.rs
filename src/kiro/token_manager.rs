@@ -3,8 +3,12 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
+#[cfg(test)]
+mod bench;
 mod maintenance;
+pub(crate) mod proxy_pool;
 use maintenance::{AuthSchedule, EntryIdentity, RefreshMode};
+pub use proxy_pool::{ProxyBindingRequest, ProxyListItem, ProxyPoolError, ProxyUpdateRequest};
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
@@ -15,18 +19,22 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, Route, RouteKey, build_client, redact_proxy_url};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::profiles::{
     ListAvailableProfilesResponse, is_valid_profile_arn, select_profile_arn,
+};
+use crate::kiro::model::proxy_pool::{
+    CREDENTIALS_ENVELOPE_VERSION, CredentialsEnvelope, ProxyBinding, ProxyEntry, inherit_route_key,
+    resolve_binding, should_write_envelope, validate_credential_binding, validate_proxy_entry,
 };
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -35,6 +43,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::{LOG_PAYLOAD_LIMIT, truncate_for_log};
 use crate::model::config::Config;
 use crate::model::registry::ModelRegistry;
+use proxy_pool::proxy_unavailable_error;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -199,27 +208,29 @@ fn classify_permanent_refresh_failure(
     None
 }
 
-/// 刷新 Token
+/// 刷新 Token（按需现建 client）。
+///
+/// 仅供不持有路由的调用点（测试、启动前的凭据校验）使用；运行期路径一律走
+/// [`refresh_token_with_client`]，复用凭据路由上已预建的 client。
+#[allow(dead_code)]
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    refresh_token_at(
-        credentials,
-        config,
-        proxy,
-        #[cfg(test)]
-        None,
-    )
-    .await
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    refresh_token_with_client(credentials, config, &client, None, None).await
 }
 
-async fn refresh_token_at(
+/// 用给定 client 刷新 Token。`total_timeout_secs` 为 `None` 表示沿用 client
+/// 自身超时（现建 client 时已设 60s），`Some(n)` 用于复用共享 client 时叠加
+/// 与改动前等价的 60s 总死线。
+async fn refresh_token_with_client(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
-    #[cfg(test)] url: Option<&str>,
+    client: &reqwest::Client,
+    url: Option<&str>,
+    total_timeout_secs: Option<u64>,
 ) -> anyhow::Result<KiroCredentials> {
     // API Key 凭据不支持 Token 刷新：底层契约级拦截
     // 其他调用点（try_ensure_token / 活跃路径 / add_credential）在调用前已显式分流 API Key；
@@ -244,23 +255,20 @@ async fn refresh_token_at(
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
-        refresh_idc_token(
-            credentials,
-            config,
-            proxy,
-            #[cfg(test)]
-            url,
-        )
-        .await
+        refresh_idc_token(credentials, config, client, url, total_timeout_secs).await
     } else {
-        refresh_social_token(
-            credentials,
-            config,
-            proxy,
-            #[cfg(test)]
-            url,
-        )
-        .await
+        refresh_social_token(credentials, config, client, url, total_timeout_secs).await
+    }
+}
+
+/// 给共享 client 的请求叠加等价于改动前 "现建 client + 60s 总超时" 的死线。
+fn with_total_timeout(
+    request: reqwest::RequestBuilder,
+    secs: Option<u64>,
+) -> reqwest::RequestBuilder {
+    match secs {
+        Some(secs) => request.timeout(std::time::Duration::from_secs(secs)),
+        None => request,
     }
 }
 
@@ -268,8 +276,9 @@ async fn refresh_token_at(
 async fn refresh_social_token(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
-    #[cfg(test)] url: Option<&str>,
+    client: &reqwest::Client,
+    #[cfg_attr(not(test), allow(unused_variables))] url: Option<&str>,
+    total_timeout_secs: Option<u64>,
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token");
 
@@ -287,12 +296,11 @@ async fn refresh_social_token(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
 
-    let response = client
+    let request = client
         .post(&refresh_url)
         .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
@@ -303,7 +311,8 @@ async fn refresh_social_token(
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
         .header("Connection", "close")
-        .json(&body)
+        .json(&body);
+    let response = with_total_timeout(request, total_timeout_secs)
         .send()
         .await?;
 
@@ -350,8 +359,9 @@ async fn refresh_social_token(
 async fn refresh_idc_token(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
-    #[cfg(test)] url: Option<&str>,
+    client: &reqwest::Client,
+    #[cfg_attr(not(test), allow(unused_variables))] url: Option<&str>,
+    total_timeout_secs: Option<u64>,
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token");
 
@@ -382,7 +392,6 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -390,7 +399,7 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = client
+    let request = client
         .post(&refresh_url)
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
@@ -399,7 +408,8 @@ async fn refresh_idc_token(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
         .header("Connection", "close")
-        .json(&body)
+        .json(&body);
+    let response = with_total_timeout(request, total_timeout_secs)
         .send()
         .await?;
 
@@ -449,7 +459,7 @@ async fn get_usage_limits_at(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
-    proxy: Option<&ProxyConfig>,
+    client: &reqwest::Client,
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息");
 
@@ -473,7 +483,6 @@ async fn get_usage_limits_at(
         os_name, node_version, kiro_version, machine_id
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
-    let client = build_client(proxy, 60, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
@@ -489,7 +498,7 @@ async fn get_usage_limits_at(
         request = request.header("tokentype", "API_KEY");
     }
 
-    let response = request.send().await?;
+    let response = with_total_timeout(request, Some(60)).send().await?;
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
@@ -511,6 +520,9 @@ async fn get_usage_limits_at(
 // ============================================================================
 
 /// 单个凭据条目的状态
+///
+/// `route`/`profile_lookup_lock`/`refresh_lock` 在构造期统一注入，因此
+/// `Default` 只服务测试与"先占位后填入"的构造路径。
 struct CredentialEntry {
     /// 凭据唯一 ID
     id: u64,
@@ -540,12 +552,45 @@ struct CredentialEntry {
     profile_lookup_retry_after_ms: Option<u64>,
     /// 同一凭据 profile discovery 的 single-flight 锁。
     profile_lookup_lock: Arc<TokioMutex<()>>,
+    /// 同一凭据的 Token 刷新 single-flight 锁。
+    ///
+    /// 每凭据一把（而非全局一把）：一个慢/死的代理只拖慢它自己的凭据，
+    /// 不会卡住其他凭据的刷新等待链（P5）。
+    refresh_lock: Arc<TokioMutex<()>>,
+    /// 该凭据常驻的网络路由。请求路径只克隆这个 Arc。
+    route: Arc<Route>,
+    /// 运行期事实：该凭据的 route 是否是「构建失败后的回落」。
+    ///
+    /// 启用判定必须看这个字段（配合 [`api_key_without_key`]），而不是落盘的
+    /// `disabled_reason`（F2）。落盘的 `InvalidConfig` 是**历史**结论：管理员
+    /// 改好绑定之后，那条记录仍在文件里，按它恢复会让人永远无法从 UI 恢复该
+    /// 凭据。这里记录的是"此刻的配置能否构建"，改绑成功后立刻被清掉。
+    route_build_failed: bool,
     state_revision: u64,
     auth_retry_after_ms: Option<AuthSchedule>,
     quota_retry_after_ms: Option<u64>,
 }
 
+/// `authMethod=api_key` 却没给 `kiroApiKey`：加载期会据此禁用（`InvalidConfig`）。
+///
+/// 启用判定用它把这类「配置仍然无效」识别出来——F2 把判据从落盘 reason 改成
+/// 运行时事实后，route 构建失败这一路有了 [`CredentialEntry::route_build_failed`]，
+/// 而「字段缺失」这一路与 route 无关，必须单独判，否则 I6 的保护会破一个口。
+fn api_key_without_key(credentials: &KiroCredentials) -> bool {
+    credentials.kiro_api_key.is_none()
+        && credentials
+            .auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
+            .unwrap_or(false)
+}
+
 impl CredentialEntry {
+    /// 该凭据的配置此刻是否仍然无效（启用判定用，F2）。
+    fn config_currently_invalid(&self) -> bool {
+        self.route_build_failed || api_key_without_key(&self.credentials)
+    }
+
     /// 纯函数：把 `load` 按半衰期外推到 `now_unix_ms`，**不写回**任何字段。
     /// 指数衰减可组合，读侧外推与写侧就地衰减数学等价，读路径不需要 `&mut self`。
     fn current_load(&self, now_unix_ms: u64) -> f64 {
@@ -703,6 +748,59 @@ impl Clock for ProcessClock {
     }
 }
 
+/// 凭据代理绑定在快照/响应中的投影（脱敏，不含密码）。
+struct ProxyView {
+    has_proxy: bool,
+    proxy_url: Option<String>,
+    proxy_mode: &'static str,
+    proxy_name: Option<String>,
+    effective_proxy_url: Option<String>,
+}
+
+/// 计算某凭据的代理展示视图。
+///
+/// `proxy_url` 只回显内联/直连的旧字段值（已脱敏），池绑定的地址一律不单独回传，
+/// 而是统一放进 `effective_proxy_url`——避免前端在两处看到同一凭据的不同地址。
+fn proxy_view_for(
+    entry: &CredentialEntry,
+    proxies: &[ProxyEntry],
+    global_proxy: Option<&ProxyConfig>,
+) -> ProxyView {
+    let binding = resolve_binding(
+        entry.credentials.proxy_id.as_deref(),
+        entry.credentials.proxy_url.as_deref(),
+        entry.credentials.proxy_username.as_deref(),
+        entry.credentials.proxy_password.as_deref(),
+    );
+    let (proxy_mode, pool_entry) = match &binding {
+        ProxyBinding::Inherit => ("inherit", None),
+        ProxyBinding::Direct => ("direct", None),
+        ProxyBinding::Inline(_) => ("inline", None),
+        ProxyBinding::Pool(id) => ("pool", proxies.iter().find(|proxy| &proxy.id == id)),
+    };
+    let effective = match &binding {
+        ProxyBinding::Inherit => global_proxy.map(|proxy| redact_proxy_url(&proxy.url)),
+        ProxyBinding::Direct => None,
+        ProxyBinding::Inline(config) => Some(redact_proxy_url(&config.url)),
+        ProxyBinding::Pool(_) => pool_entry.map(ProxyEntry::redacted_url),
+    };
+    let proxy_url = match &binding {
+        ProxyBinding::Inline(config) => Some(redact_proxy_url(&config.url)),
+        ProxyBinding::Direct => entry.credentials.proxy_url.clone(),
+        _ => None,
+    };
+    ProxyView {
+        // 旧字段语义（never break userspace）：`hasProxy` 表示"该凭据自己有
+        // 代理覆盖"，direct 也算有；它与"实际是否经代理出站"是两件事，
+        // 后者看 `effective_proxy_url`。因此这里按绑定模式判定，不看 effective。
+        has_proxy: !matches!(binding, ProxyBinding::Inherit),
+        proxy_url,
+        proxy_mode,
+        proxy_name: pool_entry.map(|proxy| proxy.name.clone()),
+        effective_proxy_url: effective,
+    }
+}
+
 /// 会话粘性映射条目
 struct StickySessionEntry {
     credential_id: u64,
@@ -744,11 +842,22 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
-    /// 是否配置了凭据级代理
+    /// 是否配置了任何形式的代理（含继承与池绑定）
     pub has_proxy: bool,
-    /// 代理 URL（用于前端展示）
+    /// 代理 URL（已脱敏；仅内联/直连时有值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理来源：inherit | direct | pool | inline
+    pub proxy_mode: String,
+    /// 池条目 ID（仅 pool）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+    /// 池条目名称（仅 pool）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
+    /// 实际生效的脱敏代理地址
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_proxy_url: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -784,12 +893,14 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// 代理池条目 + 路由注册表。请求路径从不触碰。
+    pool: Mutex<proxy_pool::PoolState>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
-    /// 序列化 credentials 的快照、序列化和写入，防止旧快照覆盖新更新。
-    credentials_save_lock: Mutex<()>,
+    /// 守护存储状态并序列化凭据写入：值为 `true` 表示可回写。
+    ///
+    /// 同时承担"旧快照覆盖新更新"的互斥职责，锁序为 `save lock → entries → pool`。
+    credentials_save_lock: Mutex<bool>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
@@ -860,6 +971,27 @@ pub struct MultiTokenManager {
     /// Wakes deterministic tests at the save-lock boundary.
     #[cfg(test)]
     test_persist_save_lock_attempted: tokio::sync::Notify,
+    /// 绑定提交的"锁外校验"与"持锁复核"之间的测试闸门：绑定方在此等待一次
+    /// 放行，让测试确定性地插入一次并发编辑（不靠 sleep）。
+    #[cfg(test)]
+    test_bind_gate: parking_lot::Mutex<Option<Arc<proxy_pool::BindGate>>>,
+    /// 管理写事务的测试闸门（锁外预建完成、取 save lock 之前）。
+    #[cfg(test)]
+    test_admin_gate: parking_lot::Mutex<Option<Arc<proxy_pool::AdminWriteGate>>>,
+    /// 新增凭据的测试闸门（网络验证之后、取 save lock 之前）。
+    #[cfg(test)]
+    test_add_gate: parking_lot::Mutex<Option<Arc<proxy_pool::AdminWriteGate>>>,
+    /// 代理池写事务的**写盘**闸门：把事务卡在"持 save lock、已释放
+    /// entries/proxies、正要写盘"这一刻（P6 的观测点）。
+    #[cfg(test)]
+    test_pool_write_gate: parking_lot::Mutex<Option<Arc<proxy_pool::PoolWriteGate>>>,
+    /// 刷新落盘的**取 save lock 之前**闸门：让测试在真实刷新路径进入落盘前停住，
+    /// 以便在那一刻直接证明 entries/proxies 都没被持有（锁序契约）。
+    #[cfg(test)]
+    test_refresh_persist_gate: parking_lot::Mutex<Option<Arc<proxy_pool::PoolWriteGate>>>,
+    /// 路由回收的观测点：记录每次 `prune_routes` 执行时 save 锁是否空闲（F7）。
+    #[cfg(test)]
+    test_prune_observer: parking_lot::Mutex<Option<Arc<proxy_pool::PruneObserver>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -936,6 +1068,8 @@ pub struct CallContext {
     /// 访问 Token
     pub token: String,
     /// PR-0（可观测性，零行为变更）：本次凭据是否命中 balanced 模式的会话粘性表。
+    /// 该凭据当前已发布的路由（与 credentials 同一次读取，消除"凭据与路由不一致"的竞态）。
+    pub route: Arc<Route>,
     /// 由 `acquire_context_for_session_excluding` 在返回前回填，`try_ensure_token`
     /// 构造时不知道调用来源，先占位 `None`。仅供 `request outcome` 日志聚合，
     /// 不参与任何凭据选择或故障转移判断。
@@ -959,6 +1093,11 @@ impl MultiTokenManager {
     /// * `credentials_path` - 凭据文件路径（用于回写）
     /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
     /// * `model_registry` - 模型注册表
+    ///
+    /// 只被测试与基准调用（生产入口一律走 [`Self::new_with_pool`]，它接受池条目）。
+    /// 用 `#[cfg(test)]` 在类型层面表达这件事，而不是留一个永远只有测试用的
+    /// 生产符号——否则非测试构建里它带来一条 `dead_code` 告警。
+    #[cfg(test)]
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
@@ -967,9 +1106,31 @@ impl MultiTokenManager {
         is_multiple_format: bool,
         model_registry: Arc<ModelRegistry>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_clock(
+        Self::new_with_pool(
             config,
             credentials,
+            Vec::new(),
+            proxy,
+            credentials_path,
+            is_multiple_format,
+            model_registry,
+        )
+    }
+
+    /// 与 [`Self::new`] 相同，额外接受代理池条目（启动期来自凭据文件封套）。
+    pub fn new_with_pool(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxies: Vec<ProxyEntry>,
+        proxy: Option<ProxyConfig>,
+        credentials_path: Option<PathBuf>,
+        is_multiple_format: bool,
+        model_registry: Arc<ModelRegistry>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_clock(
+            config,
+            credentials,
+            proxies,
             proxy,
             credentials_path,
             is_multiple_format,
@@ -978,14 +1139,40 @@ impl MultiTokenManager {
         )
     }
 
-    /// 与 `new` 等价，额外接受一个显式 `Clock` 实现（#86 返工 S2）。
+    /// 与 [`Self::new_with_pool`] 相同，额外接受显式 `Clock` 实现（#86 返工 S2）。
     ///
-    /// 唯一存在理由是让测试在构造期注入可手动推进的时钟——`new()` 就是
-    /// `new_with_clock(..., Arc::new(ProcessClock::new()))` 的薄包装，两者共享
-    /// 全部构造逻辑，不重复。生产代码只应调用 `new()`。
+    /// 唯一存在理由是让测试在构造期注入可手动推进的时钟；生产代码只应调用
+    /// `new_with_pool()`。两者共享全部构造逻辑，不重复。
+    ///
+    /// 与 [`Self::new`] 同理用 `#[cfg(test)]`：只有测试调用它，非测试构建里
+    /// 留着就是死代码告警。
+    #[cfg(test)]
     fn new_with_clock(
         config: Config,
         credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        credentials_path: Option<PathBuf>,
+        is_multiple_format: bool,
+        model_registry: Arc<ModelRegistry>,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_clock(
+            config,
+            credentials,
+            Vec::new(),
+            proxy,
+            credentials_path,
+            is_multiple_format,
+            model_registry,
+            clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_pool_and_clock(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxies: Vec<ProxyEntry>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
@@ -999,9 +1186,18 @@ impl MultiTokenManager {
         let mut has_new_machine_ids = false;
         let config_ref = &config;
 
+        // 继承路由（全局代理或 System）只建一次：先放进池里，占位字段直接引用
+        // 同一个 `Arc`，构造器末尾的 `build_routes_for_entries` 再从池里取，
+        // 不会重复构建。构建失败仍然 fail-fast（与改动前一致）。
+        let mut pool = proxy_pool::PoolState::new(proxies);
+        let placeholder_route = pool
+            .route(&inherit_route_key(proxy.as_ref()), config.tls_backend)
+            .map_err(|error| {
+                anyhow::anyhow!("创建继承（全局代理/系统）HTTP 客户端失败: {error}")
+            })?;
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
-            .map(|mut cred| {
+            .map(|mut cred| -> CredentialEntry {
                 cred.canonicalize_auth_method();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
@@ -1033,6 +1229,10 @@ impl MultiTokenManager {
                     last_used_at: None,
                     profile_lookup_retry_after_ms: None,
                     profile_lookup_lock: Arc::new(TokioMutex::new(())),
+                    refresh_lock: Arc::new(TokioMutex::new(())),
+                    // 占位：真实 route 在下面按池与凭据统一构建后填入。
+                    route: placeholder_route.clone(),
+                    route_build_failed: false,
                     state_revision: 0,
                     auth_retry_after_ms: None,
                     quota_retry_after_ms: None,
@@ -1040,17 +1240,26 @@ impl MultiTokenManager {
             })
             .collect();
 
-        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        // F2：(a) 加载期按**当前配置**重新判定 InvalidConfig。
+        //
+        // 落盘的 `disabled_reason` 是上一次运行的历史结论；管理员后来通过管理端
+        // 改好了绑定，文件里那条记录却还在（刷新落盘会把当时的 reason 写进去）。
+        // 这里以"此刻配置能否构建"为准：
+        // - 现在能构建 → 该 reason 已经过时，清掉（只清 InvalidConfig，其它原因
+        //   照旧保留）；
+        // - 现在仍不能构建 → `build_routes_for_entries` 会重新标记。
+        // 这样"无效内联 → 禁用 → 改绑有效代理 → 启用"这条链在重启后也不会
+        // 锁死；而"配置仍无效"的凭据依旧被禁用（I6 的保护不丢）。
         let mut entries = entries;
         for entry in &mut entries {
-            if entry.credentials.kiro_api_key.is_none()
-                && entry
-                    .credentials
-                    .auth_method
-                    .as_deref()
-                    .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
-                    .unwrap_or(false)
-            {
+            if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                entry.set_reason(None);
+            }
+        }
+
+        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        for entry in &mut entries {
+            if api_key_without_key(&entry.credentials) {
                 tracing::warn!(
                     credential_id = entry.id,
                     "凭据配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用"
@@ -1080,14 +1289,15 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let writable = is_multiple_format && credentials_path.is_some();
         let manager = Self {
             config,
             proxy,
-            entries: Mutex::new(entries),
+            entries: Mutex::new(std::mem::take(&mut entries)),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            pool: Mutex::new(pool),
             credentials_path,
-            credentials_save_lock: Mutex::new(()),
+            credentials_save_lock: Mutex::new(writable),
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
@@ -1118,7 +1328,32 @@ impl MultiTokenManager {
             test_persist_save_lock_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             test_persist_save_lock_attempted: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_bind_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_admin_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_add_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_pool_write_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_refresh_persist_gate: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_prune_observer: parking_lot::Mutex::new(None),
         };
+
+        // 启动期一次性构建所有路由（P4）：之后热路径只剩 Arc 计数加一。
+        //
+        // 锁序契约：先 entries 后 pool，且**不嵌套**——entries 取出即释放
+        // （`mem::take` 留下空 vec），构建完再把结果放回去。
+        {
+            let entries = std::mem::take(&mut *manager.entries.lock());
+            let routed = {
+                let mut pool = manager.pool.lock();
+                manager.build_routes_for_entries(entries, &mut pool)?
+            };
+            *manager.entries.lock() = routed;
+        }
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -1741,7 +1976,7 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
         config: &Config,
         token: &str,
-        proxy: Option<&ProxyConfig>,
+        client: &reqwest::Client,
     ) -> anyhow::Result<ListAvailableProfilesResponse> {
         let region = credentials.effective_api_region(config);
         let host = full_url
@@ -1750,8 +1985,7 @@ impl MultiTokenManager {
             .and_then(|value| value.split('/').next())
             .ok_or_else(|| anyhow::anyhow!("profile discovery URL 缺少 host"))?;
         let machine_id = machine_id::generate_from_credentials(credentials, config);
-        let client = build_client(proxy, 60, config.tls_backend)?;
-        let response = client
+        let request = client
             .post(full_url)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
@@ -1771,9 +2005,8 @@ impl MultiTokenManager {
             .header("amz-sdk-request", "attempt=1; max=1")
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close")
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
+            .json(&serde_json::json!({}));
+        let response = with_total_timeout(request, Some(60)).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1794,6 +2027,7 @@ impl MultiTokenManager {
         &self,
         credentials: &KiroCredentials,
         token: &str,
+        client: &reqwest::Client,
     ) -> anyhow::Result<ListAvailableProfilesResponse> {
         #[cfg(not(test))]
         let url = format!(
@@ -1809,9 +2043,7 @@ impl MultiTokenManager {
         #[cfg(test)]
         self.test_profile_lookup_request_count
             .fetch_add(1, Ordering::SeqCst);
-        let proxy = credentials.effective_proxy(self.proxy.as_ref());
-        Self::list_available_profiles_at(&url, credentials, &self.config, token, proxy.as_ref())
-            .await
+        Self::list_available_profiles_at(&url, credentials, &self.config, token, client).await
     }
 
     /// Remove an invalid OAuth profile ARN from a request-only credentials snapshot.
@@ -1906,8 +2138,8 @@ impl MultiTokenManager {
 
         let discovered = {
             let _lookup_guard = lock.lock().await;
-            let current = match self.credentials_for_id(id) {
-                Ok(credentials) => credentials,
+            let (current, route) = match self.credentials_and_route_for_id(id) {
+                Ok(pair) => pair,
                 Err(_) => return ProfileLookupOutcome::IdentityChanged,
             };
             // This is the final identity check immediately before HTTP. The token passed to reqwest
@@ -1946,7 +2178,7 @@ impl MultiTokenManager {
             };
 
             match self
-                .list_available_profiles(&current, token)
+                .list_available_profiles(&current, token, &route.short)
                 .await
                 .and_then(|response| {
                     select_profile_arn(
@@ -2017,6 +2249,29 @@ impl MultiTokenManager {
         ))
     }
 
+    /// 同一次 entries 读取里取凭据与它的路由，避免"凭据与路由不一致"。
+    fn credentials_and_route_for_id(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(KiroCredentials, Arc<Route>)> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| (entry.credentials.clone(), entry.route.clone()))
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))
+    }
+
+    /// 取凭据当前已发布的路由。
+    fn route_for_id(&self, id: u64) -> anyhow::Result<Arc<Route>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.route.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))
+    }
+
     fn credentials_for_id(&self, id: u64) -> anyhow::Result<KiroCredentials> {
         self.entries
             .lock()
@@ -2033,18 +2288,232 @@ impl MultiTokenManager {
         _credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
         let (credentials, token) = self.acquire_latest_credentials_and_token(id).await?;
-        {
+        let route = {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.refresh_failure_count = 0;
-            }
-        }
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            entry.refresh_failure_count = 0;
+            entry.route.clone()
+        };
         Ok(CallContext {
             id,
             credentials,
             token,
+            route,
             sticky_hit: None,
         })
+    }
+
+    /// 测试钩子：在绑定提交的锁外校验与持锁复核之间装一道闸门。
+    ///
+    /// 绑定方会在此 `wait()`，测试线程借此确定性地插入并发编辑；不设闸门时
+    /// 直接通过，生产路径零影响。
+    #[cfg(test)]
+    pub(crate) fn install_bind_gate_for_test(&self, gate: Arc<proxy_pool::BindGate>) {
+        *self.test_bind_gate.lock() = Some(gate);
+    }
+
+    /// 绑定路径调用：闸门存在则"报告已到达"并等待测试放行。
+    ///
+    /// 到达/等待由 `BindGate::arrive_and_wait` 一体完成：**先登记到达计数再唤醒**，
+    /// 因此多个 bind 并发到达不会互相覆盖唤醒（详见 `BindGate` 的 doc）。
+    #[cfg(test)]
+    pub(crate) async fn pass_bind_gate(&self) {
+        let gate = self.test_bind_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.arrive_and_wait().await;
+        }
+    }
+
+    /// 生产构建里它是空操作；`#[cfg(test)]` 让"测试专用"这件事在类型层面成立，
+    /// 而不是靠一段永远不成立的条件分支。
+    #[cfg(not(test))]
+    pub(crate) async fn pass_bind_gate(&self) {}
+
+    /// 测试钩子：安装管理写闸门（"锁外预建完成、取 save lock 之前"）。
+    #[cfg(test)]
+    pub(crate) fn install_admin_gate_for_test(&self, gate: Arc<proxy_pool::AdminWriteGate>) {
+        *self.test_admin_gate.lock() = Some(gate);
+    }
+
+    /// 测试钩子：安装代理池写事务的写盘闸门（"持 save lock、已释放 entries/
+    /// proxies、正要写盘"）。
+    #[cfg(test)]
+    pub(crate) fn install_pool_write_gate_for_test(&self, gate: Arc<proxy_pool::PoolWriteGate>) {
+        *self.test_pool_write_gate.lock() = Some(gate);
+    }
+
+    /// 测试钩子：安装刷新落盘的"取 save lock 之前"闸门。
+    #[cfg(test)]
+    pub(crate) fn install_refresh_persist_gate_for_test(
+        &self,
+        gate: Arc<proxy_pool::PoolWriteGate>,
+    ) {
+        *self.test_refresh_persist_gate.lock() = Some(gate);
+    }
+
+    /// 测试钩子：安装路由回收观测器（记录回收时 save 锁是否被持有）。
+    #[cfg(test)]
+    pub(crate) fn install_prune_observer_for_test(&self, observer: Arc<proxy_pool::PruneObserver>) {
+        *self.test_prune_observer.lock() = Some(observer);
+    }
+
+    /// 管理写路径调用：闸门存在则"报告已到达"并等待测试放行。
+    #[cfg(test)]
+    pub(crate) async fn pass_admin_gate(&self) {
+        let gate = self.test_admin_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.arrived.notify_one();
+            let _permit = gate.release.acquire().await;
+        }
+    }
+
+    /// 生产构建里它是空操作，无字段、无分支。
+    #[cfg(not(test))]
+    pub(crate) async fn pass_admin_gate(&self) {}
+
+    /// 测试钩子：安装新增凭据闸门（网络验证之后、取 save lock 之前）。
+    #[cfg(test)]
+    pub(crate) fn install_add_gate_for_test(&self, gate: Arc<proxy_pool::AdminWriteGate>) {
+        *self.test_add_gate.lock() = Some(gate);
+    }
+
+    /// 新增凭据路径调用：闸门存在则"报告已到达"并等待测试放行。
+    #[cfg(test)]
+    pub(crate) async fn pass_add_gate(&self) {
+        let gate = self.test_add_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.arrived.notify_one();
+            let _permit = gate.release.acquire().await;
+        }
+    }
+
+    /// 生产构建里它是空操作。
+    #[cfg(not(test))]
+    pub(crate) async fn pass_add_gate(&self) {}
+
+    /// 测试钩子：把某凭据的 route 替换为给定实例（用于注入 h2c 测试路由）。
+    #[cfg(test)]
+    pub(crate) fn install_route_for_test(&self, id: u64, route: Arc<Route>) {
+        if let Some(entry) = self.entries.lock().iter_mut().find(|entry| entry.id == id) {
+            entry.route = route;
+        }
+    }
+
+    /// 测试观测点：某凭据当前 route 的指针身份。
+    #[cfg(test)]
+    pub(crate) fn route_ptr_for_test(&self, id: u64) -> Option<*const Route> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| Arc::as_ptr(&entry.route))
+    }
+
+    /// 测试观测点：某凭据当前 route 的 `Arc`（用于比较网络身份与复用关系）。
+    #[cfg(test)]
+    pub(crate) fn route_arc_for_test(&self, id: u64) -> Option<Arc<Route>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.route.clone())
+    }
+
+    /// 测试观测点：注册表里某个 key 的 route `Arc`。
+    #[cfg(test)]
+    pub(crate) fn registered_route_for_test(&self, key: &RouteKey) -> Option<Arc<Route>> {
+        self.pool.lock().probe(key)
+    }
+
+    /// 测试观测点：池条目的 ID 列表，**只取 pool 锁**。
+    ///
+    /// 与 `list_proxies` 的差别是被观测性刻意收窄的：`list_proxies` 还要取 entries
+    /// 统计引用数，因此在"entries 被别处持有"时它会同步阻塞——用它做观测会让
+    /// "实现把锁持有了"表现为用例挂死，而不是断言失败。本观测点只碰 pool，
+    /// 所以它能与 entries 的持有状态解耦。
+    #[cfg(test)]
+    pub(crate) fn pool_proxy_ids_for_test(&self) -> Vec<String> {
+        self.pool
+            .lock()
+            .proxies
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    /// 测试钩子：把 OAuth 刷新指向 loopback mock（跨模块测试用）。
+    #[cfg(test)]
+    pub(crate) fn install_refresh_url_for_test(&self, url: String) {
+        *self.test_refresh_url.lock() = Some(url);
+    }
+
+    /// 测试钩子：把 profile discovery（ListAvailableProfiles）指向 loopback mock。
+    #[cfg(test)]
+    pub(crate) fn install_profile_lookup_url_for_test(&self, url: String) {
+        *self.test_profile_lookup_url.lock() = Some(url);
+    }
+
+    /// 测试观测点：profile discovery 实际发起过多少次请求。
+    #[cfg(test)]
+    pub(crate) fn profile_lookup_requests_for_test(&self) -> usize {
+        self.test_profile_lookup_request_count
+            .load(Ordering::SeqCst)
+    }
+
+    /// 测试钩子：把 usage/balance（getUsageLimits）指向 loopback mock。
+    #[cfg(test)]
+    pub(crate) fn install_usage_limits_url_for_test(&self, url: String) {
+        *self.test_usage_limits_url.lock() = Some(url);
+    }
+
+    /// 测试钩子：只跑一轮后台维护。
+    ///
+    /// `maintain_once` 本身是 `pub(super)`（只在 `token_manager` 子树可见），
+    /// 跨模块 BDD 需要这个等价入口；生产构建里不存在。
+    #[cfg(test)]
+    pub(crate) async fn maintain_once_for_test(&self) {
+        self.maintain_once().await;
+    }
+
+    /// 测试观测点：运行时状态（刷新锁、失败计数、在途计数、状态版本）。
+    #[cfg(test)]
+    pub(crate) fn runtime_state_for_test(
+        &self,
+        id: u64,
+    ) -> Option<(Arc<TokioMutex<()>>, u32, u64, u64)> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| {
+                (
+                    entry.refresh_lock.clone(),
+                    entry.failure_count,
+                    entry.in_flight_count,
+                    entry.state_revision,
+                )
+            })
+    }
+
+    /// 测试观测点：某凭据的 balanced 负载与其时间基准（`(load, load_updated_at_ms)`）。
+    ///
+    /// 管理写"原地改字段"必须原样保留这两项；条目被重建时它们会回到默认值。
+    #[cfg(test)]
+    pub(crate) fn runtime_load_for_test(&self, id: u64) -> Option<(f64, u64)> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| (entry.load, entry.load_updated_at_ms))
+    }
+
+    /// 序列化快照：把运行时禁用状态投影到凭据字段上。
+    fn snapshot_credentials(&self) -> Vec<KiroCredentials> {
+        let entries = self.entries.lock();
+        proxy_pool::snapshot_entries(&entries)
     }
 
     /// 将凭据列表回写到源文件
@@ -2058,22 +2527,10 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            tracing::debug!("单对象凭据不回写，修改仅在内存生效");
-            return Ok(false);
-        }
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => {
-                tracing::debug!("无凭据保存路径，修改仅在内存生效");
-                return Ok(false);
-            }
+        let path = match self.persistence_target() {
+            Some(path) => path,
+            None => return Ok(false),
         };
-
         // The entire synchronous critical section must leave Tokio workers, including waiting for
         // the parking_lot mutex. Entering block_in_place after lock() would still starve a worker.
         let persist = || -> anyhow::Result<()> {
@@ -2082,45 +2539,19 @@ impl MultiTokenManager {
                 self.test_persist_save_lock_attempts
                     .fetch_add(1, Ordering::SeqCst);
                 self.test_persist_save_lock_attempted.notify_waiters();
-            }
-            let _save_guard = self.credentials_save_lock.lock();
-            let credentials: Vec<KiroCredentials> = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .map(|entry| {
-                        let mut credential = entry.credentials.clone();
-                        credential.canonicalize_auth_method();
-                        credential.disabled = entry.disabled;
-                        credential.disabled_reason = entry.disabled.then(|| {
-                            entry
-                                .disabled_reason
-                                .unwrap_or(DisabledReason::Manual)
-                                .name()
-                                .to_string()
-                        });
-                        credential
-                    })
-                    .collect()
-            };
-
-            #[cfg(test)]
-            if let Some(hook) = self.test_persist_snapshot_hook.lock().clone() {
-                if hook.snapshots.fetch_add(1, Ordering::SeqCst) == 0 {
-                    hook.snapshot_taken
-                        .send(())
-                        .expect("test must wait for the first credentials snapshot");
-                    hook.allow_write
-                        .lock()
-                        .recv()
-                        .expect("test must release the first credentials write");
-                } else {
-                    hook.second_snapshot_taken.notify_waiters();
+                // 闸门位于**取 save lock 之前**：这一刻正是"落盘尚未开始"的边界，
+                // 测试在此直接断言 entries/proxies 都没被持有（锁序契约）。
+                if let Some(gate) = self.test_refresh_persist_gate.lock().clone() {
+                    // 在闸门处实测两把锁是否空闲：这是"落盘前 entries/proxies 已
+                    // 释放"的直接证据，不是靠读代码推断。
+                    let entries_free = self.entries.try_lock().is_some();
+                    let pool_free = self.pool.try_lock().is_some();
+                    gate.observe_locks(entries_free, pool_free);
+                    gate.arrive_and_wait();
                 }
             }
-
-            let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))
+            let _save_guard = self.credentials_save_lock.lock();
+            self.persist_credentials_locked(&path)
         };
 
         let is_multi_thread_runtime = tokio::runtime::Handle::try_current()
@@ -2134,6 +2565,75 @@ impl MultiTokenManager {
 
         tracing::debug!(path = ?path, "已回写凭据到文件");
         Ok(true)
+    }
+
+    /// 可回写的目标路径；单对象格式/无路径返回 `None`（并记录原因）。
+    fn persistence_target(&self) -> Option<PathBuf> {
+        // 仅多凭据格式（含封套）才回写
+        if !self.is_multiple_format {
+            tracing::debug!(
+                kind = "persistence_target",
+                "单对象凭据不回写，修改仅在内存生效"
+            );
+            return None;
+        }
+        match &self.credentials_path {
+            Some(path) => Some(path.clone()),
+            None => {
+                tracing::debug!(
+                    kind = "persistence_target",
+                    "无凭据保存路径，修改仅在内存生效"
+                );
+                None
+            }
+        }
+    }
+
+    /// 落盘主体，**调用方必须已持有 `credentials_save_lock`**。
+    ///
+    /// 拆出这一层的唯一理由：`add_credential` 需要把"复核代理存在 + push 条目 +
+    /// 落盘"整体放进同一次 save lock 持有之内（I5），而 `persist_credentials`
+    /// 自己会取锁。对外签名保持不变。
+    fn persist_credentials_locked(&self, path: &Path) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let (credentials, proxies): (Vec<KiroCredentials>, Vec<ProxyEntry>) = {
+            let credentials = {
+                let entries = self.entries.lock();
+                proxy_pool::snapshot_entries(&entries)
+            };
+            // 先 entries 后 pool，且两段不嵌套（锁序契约）。
+            let proxies = self.pool.lock().proxies.clone();
+            (credentials, proxies)
+        };
+
+        #[cfg(test)]
+        if let Some(hook) = self.test_persist_snapshot_hook.lock().clone() {
+            if hook.snapshots.fetch_add(1, Ordering::SeqCst) == 0 {
+                hook.snapshot_taken
+                    .send(())
+                    .expect("test must wait for the first credentials snapshot");
+                hook.allow_write
+                    .lock()
+                    .recv()
+                    .expect("test must release the first credentials write");
+            } else {
+                hook.second_snapshot_taken.notify_waiters();
+            }
+        }
+
+        let json = if should_write_envelope(&proxies, &credentials) {
+            serde_json::to_string_pretty(&CredentialsEnvelope {
+                version: CREDENTIALS_ENVELOPE_VERSION,
+                proxies,
+                credentials,
+            })
+            .context("序列化凭据失败")?
+        } else {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        };
+        crate::common::atomic_file::write_atomically(path, json.as_bytes())
+            .with_context(|| format!("回写凭据文件失败: {:?}", path))
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -2278,9 +2778,7 @@ impl MultiTokenManager {
                 // tmp 文件名是硬编码的固定路径（非唯一名），单靠它本身不足以防并发写坏
                 // ——真正的原子性保证来自调用方持有的 stats_save_lock，把并发调用序列化
                 // 成串行的 truncate+write+rename，任意时刻只有一个线程在操作这个 tmp 路径。
-                let tmp_path = path.with_extension("json.tmp");
-                if let Err(e) =
-                    std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &path))
+                if let Err(e) = crate::common::atomic_file::write_atomically(&path, json.as_bytes())
                 {
                     tracing::warn!(error = %e, "保存统计缓存失败");
                     // 写失败：不推进 stats_saved_version，脏状态原样保留给 Drop 兜底重试。
@@ -2749,6 +3247,9 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        // 先拷出两份快照、各自取锁释放：entries 与 pool 的锁绝不嵌套，
+        // 这样与 `list_proxies` / `prune_routes`（先 pool 后 entries）不可能 ABBA。
+        let proxies = self.pool.lock().proxies.clone();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -2756,52 +3257,60 @@ impl MultiTokenManager {
         ManagerSnapshot {
             entries: entries
                 .iter()
-                .map(|e| CredentialEntrySnapshot {
-                    id: e.id,
-                    priority: e.credentials.priority,
-                    disabled: e.disabled,
-                    failure_count: e.failure_count,
-                    auth_method: if e.credentials.is_api_key_credential() {
-                        Some("api_key".to_string())
-                    } else {
-                        e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
-                            {
-                                "idc".to_string()
-                            } else {
-                                m.to_string()
-                            }
-                        })
-                    },
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: if e.credentials.is_api_key_credential() {
-                        None // API Key 凭据本地不维护过期时间（服务端策略未知）
-                    } else {
-                        e.credentials.expires_at.clone()
-                    },
-                    refresh_token_hash: if e.credentials.is_api_key_credential() {
-                        None
-                    } else {
-                        e.credentials.refresh_token.as_deref().map(sha256_hex)
-                    },
-                    api_key_hash: if e.credentials.is_api_key_credential() {
-                        e.credentials.kiro_api_key.as_deref().map(sha256_hex)
-                    } else {
-                        None
-                    },
-                    masked_api_key: if e.credentials.is_api_key_credential() {
-                        e.credentials.kiro_api_key.as_deref().map(mask_api_key)
-                    } else {
-                        None
-                    },
-                    email: e.credentials.email.clone(),
-                    success_count: e.success_count,
-                    last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
-                    refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|reason| reason.name().to_string()),
-                    endpoint: e.credentials.endpoint.clone(),
+                .map(|e| {
+                    let proxy_view = proxy_view_for(e, &proxies, self.proxy.as_ref());
+                    CredentialEntrySnapshot {
+                        id: e.id,
+                        priority: e.credentials.priority,
+                        disabled: e.disabled,
+                        failure_count: e.failure_count,
+                        auth_method: if e.credentials.is_api_key_credential() {
+                            Some("api_key".to_string())
+                        } else {
+                            e.credentials.auth_method.as_deref().map(|m| {
+                                if m.eq_ignore_ascii_case("builder-id")
+                                    || m.eq_ignore_ascii_case("iam")
+                                {
+                                    "idc".to_string()
+                                } else {
+                                    m.to_string()
+                                }
+                            })
+                        },
+                        has_profile_arn: e.credentials.profile_arn.is_some(),
+                        expires_at: if e.credentials.is_api_key_credential() {
+                            None // API Key 凭据本地不维护过期时间（服务端策略未知）
+                        } else {
+                            e.credentials.expires_at.clone()
+                        },
+                        refresh_token_hash: if e.credentials.is_api_key_credential() {
+                            None
+                        } else {
+                            e.credentials.refresh_token.as_deref().map(sha256_hex)
+                        },
+                        api_key_hash: if e.credentials.is_api_key_credential() {
+                            e.credentials.kiro_api_key.as_deref().map(sha256_hex)
+                        } else {
+                            None
+                        },
+                        masked_api_key: if e.credentials.is_api_key_credential() {
+                            e.credentials.kiro_api_key.as_deref().map(mask_api_key)
+                        } else {
+                            None
+                        },
+                        email: e.credentials.email.clone(),
+                        success_count: e.success_count,
+                        last_used_at: e.last_used_at.clone(),
+                        has_proxy: proxy_view.has_proxy,
+                        proxy_url: proxy_view.proxy_url,
+                        proxy_mode: proxy_view.proxy_mode.to_string(),
+                        proxy_id: e.credentials.proxy_id.clone(),
+                        proxy_name: proxy_view.proxy_name,
+                        effective_proxy_url: proxy_view.effective_proxy_url,
+                        refresh_failure_count: e.refresh_failure_count,
+                        disabled_reason: e.disabled_reason.map(|reason| reason.name().to_string()),
+                        endpoint: e.credentials.endpoint.clone(),
+                    }
                 })
                 .collect(),
             current_id,
@@ -2818,6 +3327,18 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // I6：因配置无效被禁用的凭据不能靠"启用"绕过。它的 route 在启动期
+            // 已回落为继承路由，启用后就会带着无效代理配置直连出流量（违反
+            // "不回退直连"）。拦截口径与 `reset_and_enable` 完全一致。
+            //
+            // F2(c)：判据是**运行时事实**（route 是否仍为构建失败后的回落），
+            // 不是落盘的 `disabled_reason`——后者是历史结论，管理员改好绑定后
+            // 它仍在文件里，按它拦截会让人永远无法从 UI 恢复（旧行为只能手改
+            // JSON）。配置确实仍然无效时 `route_build_failed` 仍为 true，I6
+            // 的保护不丢。
+            if !disabled && entry.config_currently_invalid() {
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
+            }
             entry.state_revision = entry.state_revision.wrapping_add(1);
             entry.set_reason(disabled.then_some(DisabledReason::Manual));
             if !disabled {
@@ -2862,7 +3383,8 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+            // 与 `set_disabled` 同一口径（F2）：看运行时事实，不看历史落盘值。
+            if entry.config_currently_invalid() {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
@@ -2937,7 +3459,7 @@ impl MultiTokenManager {
         {
             bail!("凭据在余额认证期间已删除或替换");
         }
-        let proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let usage_client = self.route_for_id(id)?.short.clone();
         #[cfg(not(test))]
         let usage_url = format!(
             "https://q.{}.amazonaws.com/getUsageLimits",
@@ -2954,7 +3476,7 @@ impl MultiTokenManager {
             &credentials,
             &self.config,
             &token,
-            proxy.as_ref(),
+            &usage_client,
         )
         .await?;
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2996,6 +3518,75 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        self.add_credential_impl(new_cred).await
+    }
+
+    /// 新增凭据验证阶段使用的路由。
+    ///
+    /// 池绑定必须解析成池里该条目的网络身份（并复用注册表已有的 `Arc`）；
+    /// 池里没有该 proxyId 时返回"代理不存在"，绝不回落到继承。
+    fn route_for_new_credential(&self, credential: &KiroCredentials) -> anyhow::Result<Arc<Route>> {
+        let key = match credential.proxy_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(proxy_id) => {
+                let config = self.pool.lock().proxy_config(proxy_id).ok_or_else(|| {
+                    anyhow::Error::new(ProxyPoolError::NotFound(format!("代理不存在: {proxy_id}")))
+                })?;
+                RouteKey::Proxy(config)
+            }
+            None => credential.effective_route_key(None, self.proxy.as_ref()),
+        };
+        // 复用注册表：验证与被采纳后的运行期必须是同一个 client（P3）。
+        let mut pool = self.pool.lock();
+        pool.route(&key, self.config.tls_backend)
+            .map_err(|error| anyhow::Error::new(proxy_unavailable_error(&error)))
+    }
+
+    /// 新增凭据的绑定校验：复用加载期同一份规则（`validate_document`）。
+    ///
+    /// 管理端入口已拒绝新旧表达同现，但 `add_credential` 是公开路径：任何调用
+    /// 路径都不得写出"下次启动被拒载"的凭据文件。悬空 `proxyId` 也在此拒绝，
+    /// 与加载期的错误口径一致。
+    fn validate_new_credential_binding(
+        &self,
+        credential: &KiroCredentials,
+    ) -> Result<(), ProxyPoolError> {
+        // 先判悬空：它比"字段互斥"更能说明用户想做什么（引用一个不存在的代理）。
+        let pool_has_proxy = credential
+            .proxy_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|proxy_id| {
+                self.pool
+                    .lock()
+                    .proxies
+                    .iter()
+                    .any(|proxy| proxy.id == proxy_id)
+            });
+        if pool_has_proxy == Some(false) {
+            return Err(ProxyPoolError::NotFound(format!(
+                "代理不存在: {}",
+                credential.proxy_id.as_deref().unwrap_or_default()
+            )));
+        }
+        validate_credential_binding(credential).map_err(ProxyPoolError::Invalid)?;
+        // 新增凭据是**写入边界**：内联 URL 的 scheme 白名单在这里校验（F3）。
+        // 加载期的旧内联配置不走这里，保持改动前的 reqwest 语义（无 scheme 的
+        // `host:port` 仍可用），两者口径不同是有意的。
+        if let Some(url) = credential
+            .proxy_url
+            .as_deref()
+            .filter(|url| !url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT))
+        {
+            crate::http_client::validate_proxy_scheme(url)
+                .map_err(|error| ProxyPoolError::Invalid(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn add_credential_impl(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        // 0. 绑定校验：与加载期同一份规则（冲突组合、悬空 proxyId）。
+        self.validate_new_credential_binding(&new_cred)?;
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -3055,10 +3646,17 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
+        //
+        // 验证必须经**该凭据真实绑定的**那条路：池绑定→池里该条目的网络身份
+        // （复用注册表已有的 Arc）、内联→内联、直连→Direct、继承→全局/系统。
+        // 传 `None` 当池身份会让 `route_key_for` 回落进继承，首个 OAuth 刷新
+        // 就绕过所选代理（I4）。
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            self.refresh_credentials(&new_cred).await?
+            let verification_route = self.route_for_new_credential(&new_cred)?;
+            self.refresh_credentials(&new_cred, &verification_route)
+                .await?
         };
 
         // 4. 分配新 ID
@@ -3087,47 +3685,94 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.proxy_id = new_cred.proxy_id;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
-        {
-            let mut entries = self.entries.lock();
-            // 必须先对每个条目做惰性衰减再取最小：load 是时点量，磁盘裸值分属不同时刻，
-            // 直接比裸值等于拿不同时点的数做比较。current_load 是纯函数，只读不写。
-            let now_unix_ms = self.now_unix_ms();
-            let load = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .map(|e| e.current_load(now_unix_ms))
-                .fold(f64::INFINITY, f64::min); // f64::min 对 (NaN,x) 返回 x，天然滤脏值
-            let load = if load.is_finite() { load } else { 0.0 };
-            let auth_retry_after_ms = (!validated_cred.is_api_key_credential()).then(|| {
-                AuthSchedule::Refreshed(
-                    self.now_ms()
-                        .saturating_add(maintenance::auth_delay_ms(&validated_cred, Utc::now())),
-                )
-            });
-            entries.push(CredentialEntry {
-                id: new_id,
-                credentials: validated_cred,
-                failure_count: 0,
-                refresh_failure_count: 0,
-                disabled: false,
-                disabled_reason: None,
-                success_count: 0,
-                load,
-                load_updated_at_ms: now_unix_ms,
-                in_flight_count: 0,
-                last_used_at: None,
-                profile_lookup_retry_after_ms: None,
-                profile_lookup_lock: Arc::new(TokioMutex::new(())),
-                state_revision: 0,
-                auth_retry_after_ms,
-                quota_retry_after_ms: None,
-            });
-        }
+        // 6. 复核代理 + push 条目 + 落盘：整段处于同一次 save lock 持有之内。
+        //
+        // 否则 delete_proxy 可以在"检查到代理存在"与"push 带该 proxyId 的条目"
+        // 之间把代理删掉（它统计引用时新条目还没 push），写出悬空绑定，
+        // 下次启动被 `validate_document` 拒载（I5）。
+        self.pass_add_gate().await;
+        let path = self.persistence_target();
+        let persist = || -> anyhow::Result<()> {
+            let _save = self.credentials_save_lock.lock();
+            // 锁内复核：此刻代理还在不在，以已发布的池为准。
+            let key = match validated_cred.proxy_id.as_deref() {
+                Some(proxy_id) => {
+                    let config = self.pool.lock().proxy_config(proxy_id).ok_or_else(|| {
+                        anyhow::Error::new(ProxyPoolError::Conflict(format!(
+                            "代理已被删除: {proxy_id}"
+                        )))
+                    })?;
+                    RouteKey::Proxy(config)
+                }
+                // 校验路由必须按该凭据的真实绑定解析（I4）：继承→全局/系统，
+                // 直连→Direct，内联→内联。传入全局代理，绝不静默回落。
+                None => validated_cred.effective_route_key(None, self.proxy.as_ref()),
+            };
+            let new_route = {
+                let mut pool = self.pool.lock();
+                pool.route(&key, self.config.tls_backend)
+                    .map_err(|error| anyhow::Error::new(proxy_unavailable_error(&error)))?
+            };
+            {
+                let mut entries = self.entries.lock();
+                // 必须先对每个条目做惰性衰减再取最小：load 是时点量，磁盘裸值分属不同时刻，
+                // 直接比裸值等于拿不同时点的数做比较。current_load 是纯函数，只读不写。
+                let now_unix_ms = self.now_unix_ms();
+                let load = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .map(|e| e.current_load(now_unix_ms))
+                    .fold(f64::INFINITY, f64::min); // f64::min 对 (NaN,x) 返回 x，天然滤脏值
+                let load = if load.is_finite() { load } else { 0.0 };
+                let auth_retry_after_ms =
+                    (!validated_cred.is_api_key_credential()).then(|| {
+                        AuthSchedule::Refreshed(self.now_ms().saturating_add(
+                            maintenance::auth_delay_ms(&validated_cred, Utc::now()),
+                        ))
+                    });
+                entries.push(CredentialEntry {
+                    id: new_id,
+                    credentials: validated_cred.clone(),
+                    failure_count: 0,
+                    refresh_failure_count: 0,
+                    disabled: false,
+                    disabled_reason: None,
+                    success_count: 0,
+                    load,
+                    load_updated_at_ms: now_unix_ms,
+                    in_flight_count: 0,
+                    last_used_at: None,
+                    profile_lookup_retry_after_ms: None,
+                    profile_lookup_lock: Arc::new(TokioMutex::new(())),
+                    refresh_lock: Arc::new(TokioMutex::new(())),
+                    route: new_route,
+                    route_build_failed: false,
+                    state_revision: 0,
+                    auth_retry_after_ms,
+                    quota_retry_after_ms: None,
+                });
+            }
+            // 落盘也在同一把锁内（I5：复核与发布必须原子）。写盘失败时保留既有的
+            // "内存已生效但未落盘"边界——这条语义由既有用例
+            // `maintenance_admin_add_persistence_and_legacy_boundaries` 钉死，
+            // 本批不改；代理引用在锁内已复核过，因此不会写出悬空绑定。
+            if let Some(path) = &path {
+                self.persist_credentials_locked(path)?;
+            }
+            Ok(())
+        };
 
-        // 6. 持久化
-        self.persist_credentials()?;
+        let is_multi_thread_runtime = tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if is_multi_thread_runtime {
+            tokio::task::block_in_place(persist)?;
+        } else {
+            persist()?;
+        }
         self.save_stats();
 
         tracing::info!(credential_id = new_id, "成功添加凭据");
@@ -3327,6 +3972,10 @@ mod tests {
         fn now_unix_ms(&self) -> u64 {
             self.now_unix_ms.load(Ordering::SeqCst)
         }
+    }
+
+    fn test_system_route() -> Arc<Route> {
+        Route::build(RouteKey::System, Config::default().tls_backend).unwrap()
     }
 
     fn test_registry() -> Arc<ModelRegistry> {
@@ -6290,7 +6939,7 @@ mod tests {
             &credentials,
             &Config::default(),
             "unit-access-token",
-            None,
+            &reqwest::Client::new(),
         )
         .await
         .unwrap();
@@ -6322,7 +6971,7 @@ mod tests {
             &credentials,
             &Config::default(),
             "unit-access-token",
-            None,
+            &reqwest::Client::new(),
         )
         .await
         .unwrap_err();
@@ -7086,6 +7735,9 @@ mod tests {
             last_used_at: None,
             profile_lookup_retry_after_ms: None,
             profile_lookup_lock: next_lock.clone(),
+            refresh_lock: Arc::new(TokioMutex::new(())),
+            route: test_system_route(),
+            route_build_failed: false,
             state_revision: 0,
             auth_retry_after_ms: None,
             quota_retry_after_ms: None,
@@ -7109,6 +7761,9 @@ mod tests {
             last_used_at: None,
             profile_lookup_retry_after_ms: None,
             profile_lookup_lock: final_lock.clone(),
+            refresh_lock: Arc::new(TokioMutex::new(())),
+            route: test_system_route(),
+            route_build_failed: false,
             state_revision: 0,
             auth_retry_after_ms: None,
             quota_retry_after_ms: None,
@@ -7251,6 +7906,9 @@ mod tests {
                 last_used_at: None,
                 profile_lookup_retry_after_ms: None,
                 profile_lookup_lock: Arc::new(TokioMutex::new(())),
+                refresh_lock: Arc::new(TokioMutex::new(())),
+                route: test_system_route(),
+                route_build_failed: false,
                 state_revision: 0,
                 auth_retry_after_ms: None,
                 quota_retry_after_ms: None,
@@ -7332,6 +7990,9 @@ mod tests {
                 last_used_at: None,
                 profile_lookup_retry_after_ms: None,
                 profile_lookup_lock: Arc::new(TokioMutex::new(())),
+                refresh_lock: Arc::new(TokioMutex::new(())),
+                route: test_system_route(),
+                route_build_failed: false,
                 state_revision: 0,
                 auth_retry_after_ms: None,
                 quota_retry_after_ms: None,
@@ -7958,31 +8619,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_fresh_business_bypasses_unrelated_refresh_lock() {
-        let mut oauth = valid_access_credential("synthetic", 0);
-        oauth.profile_arn =
-            Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/test".into());
-        let api = KiroCredentials {
-            kiro_api_key: Some("synthetic-key".into()),
-            ..Default::default()
-        };
-        let manager = profile_test_manager(TestClock::new(), vec![oauth, api], None, true);
-        let _guard = manager.refresh_lock.lock().await;
-        for id in [1, 2] {
-            let acquired = tokio::time::timeout(
-                StdDuration::from_secs(1),
-                manager.acquire_latest_credentials_and_token(id),
-            )
-            .await;
-            assert!(
-                acquired.is_ok(),
-                "fresh OAuth and API key must not queue behind unrelated refresh HTTP"
-            );
-            assert!(acquired.unwrap().is_ok());
-        }
-    }
-
-    #[tokio::test]
     async fn maintenance_api_key_quota_requires_valid_balance_and_never_refreshes() {
         let clock = TestClock::new();
         let manager = profile_test_manager(
@@ -8021,13 +8657,14 @@ mod tests {
 
     #[test]
     fn maintenance_reason_mapping_legacy_and_invalid_config_priority() {
+        // F2：`InvalidConfig` 不再在这一组里——它已改为按**当前配置**重新判定。
+        // 落盘值只是历史结论，见下方两条专门断言。
         for reason in [
             "Manual",
             "QuotaExceeded",
             "InvalidRefreshToken",
             "TooManyRefreshFailures",
             "TooManyFailures",
-            "InvalidConfig",
             "unknown",
         ] {
             let mut credential = valid_access_credential("synthetic", 0);
@@ -8043,6 +8680,20 @@ mod tests {
                 })
             );
         }
+        // 落盘的 `InvalidConfig` 与当前配置无矛盾时（本用例的 social 凭据代理
+        // 字段为空、route 可构建）属于过期结论，加载期按当前配置清掉（F2）。
+        let mut credential = valid_access_credential("synthetic", 0);
+        credential.disabled = true;
+        credential.disabled_reason = Some("InvalidConfig".into());
+        let manager = profile_test_manager(TestClock::new(), vec![credential], None, true);
+        assert!(
+            !manager.snapshot().entries[0].disabled,
+            "配置此刻有效时，历史 InvalidConfig 必须被清除，否则永远无法从 UI 恢复"
+        );
+        assert!(manager.snapshot().entries[0].disabled_reason.is_none());
+
+        // 而"当前配置仍然无效"（authMethod=api_key 缺 kiroApiKey）必须继续被
+        // 标记为 InvalidConfig：加载期重新判定，不依赖落盘值。
         let credential = KiroCredentials {
             auth_method: Some("api_key".into()),
             disabled: true,
@@ -8092,7 +8743,7 @@ mod tests {
         credential.refresh_token = Some("r".repeat(120));
         let manager = profile_test_manager(TestClock::new(), vec![credential.clone()], None, true);
         let profile_error = manager
-            .list_available_profiles(&credential, "synthetic")
+            .list_available_profiles(&credential, "synthetic", &reqwest::Client::new())
             .await
             .unwrap_err();
         assert!(profile_error.to_string().contains("loopback"));

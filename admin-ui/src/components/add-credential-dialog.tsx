@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -10,7 +11,13 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
+import { useProxies } from '@/hooks/use-proxies'
 import { extractErrorMessage } from '@/lib/utils'
+import {
+  ProxyBindingSelect,
+  type InlineProxyFields,
+} from '@/components/proxy-binding-select'
+import type { ProxyBinding, ProxyMode } from '@/types/proxy'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -29,12 +36,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
-  const [proxyUrl, setProxyUrl] = useState('')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('inherit')
+  const [poolId, setPoolId] = useState('')
+  const [inline, setInline] = useState<InlineProxyFields>({ url: '', username: '', password: '' })
 
   const { mutate, isPending } = useAddCredential()
+  const { data: proxyData, isLoading: proxiesLoading } = useProxies()
 
   const resetForm = () => {
     setRefreshToken('')
@@ -46,13 +54,51 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret('')
     setPriority('0')
     setMachineId('')
-    setProxyUrl('')
-    setProxyUsername('')
-    setProxyPassword('')
     setEndpoint('')
+    setProxyMode('inherit')
+    setPoolId('')
+    setInline({ url: '', username: '', password: '' })
   }
 
   const isApiKey = authMethod === 'api_key'
+
+  /**
+   * 组装代理绑定。返回 null 表示已在界面上报错并中止提交。
+   *
+   * 继承/直连没有额外字段，池模式必须有选中条目；内联的密码按原样发送。
+   */
+  const buildBinding = (): ProxyBinding | null => {
+    switch (proxyMode) {
+      case 'inherit':
+        return { mode: 'inherit' }
+      case 'direct':
+        return { mode: 'direct' }
+      case 'pool':
+        if (!poolId) {
+          toast.error('请选择代理池条目')
+          return null
+        }
+        return { mode: 'pool', proxyId: poolId }
+      case 'inline': {
+        if (inline.url.trim() === '') {
+          toast.error('请输入内联代理地址')
+          return null
+        }
+        const hasUsername = inline.username !== ''
+        const hasPassword = inline.password !== ''
+        if (hasUsername !== hasPassword) {
+          toast.error('内联代理用户名与密码必须同时填写，或同时留空')
+          return null
+        }
+        return {
+          mode: 'inline',
+          url: inline.url,
+          username: hasUsername ? inline.username : undefined,
+          password: hasPassword ? inline.password : undefined,
+        }
+      }
+    }
+  }
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -75,6 +121,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
     }
 
+    // 代理只走新的 tagged 写法；旧三字段不再发送（两者同时出现后端 400）
+    const binding = buildBinding()
+    if (binding === null) return
+
     mutate(
       {
         authMethod,
@@ -86,9 +136,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        proxy: binding,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -109,6 +157,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
+          <DialogDescription>
+            填写认证信息与可选的代理来源；代理密码按原样保存。
+          </DialogDescription>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
@@ -277,37 +328,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
-            {/* 代理配置 */}
-            <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={isPending}
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
-                />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
-              </p>
-            </div>
+            {/* 代理来源：与“修改代理”共用同一个选择器 */}
+            <ProxyBindingSelect
+              idPrefix="add-credential-proxy"
+              mode={proxyMode}
+              onModeChange={setProxyMode}
+              proxies={proxyData?.proxies || []}
+              proxiesLoading={proxiesLoading}
+              poolId={poolId}
+              onPoolIdChange={setPoolId}
+              inline={inline}
+              onInlineChange={setInline}
+              disabled={isPending}
+            />
           </div>
 
           <DialogFooter>

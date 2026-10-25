@@ -12,6 +12,7 @@ pub mod common;
 pub mod credentials;
 pub mod events;
 pub mod profiles;
+pub mod proxy_pool;
 pub mod requests;
 pub mod token_refresh;
 pub mod usage_limits;

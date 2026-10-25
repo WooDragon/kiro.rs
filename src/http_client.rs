@@ -5,6 +5,8 @@
 //! - `build_idle_client`：idle/read 超时 + connect 超时（适合业务长流式响应）
 
 use reqwest::{Client, ClientBuilder, Proxy};
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -23,14 +25,463 @@ pub const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 930;
 pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// 代理配置
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+///
+/// `Debug` 手工实现而非派生：`password` 绝不能经 `{:?}` 进日志/错误链
+/// （凭据在管理端提交、启动日志与上游错误信息里都会经过这些路径）。
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
-    /// 代理地址，支持 http/https/socks5
+    /// 代理地址，支持 http/https/socks5/socks5h
     pub url: String,
     /// 代理认证用户名
     pub username: Option<String>,
     /// 代理认证密码
     pub password: Option<String>,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("url", &redact_proxy_url(&self.url))
+            .field("username", &self.username)
+            .field("has_password", &self.password.is_some())
+            .finish()
+    }
+}
+
+/// 无法安全脱敏时的固定占位：绝不拼接原文的任何片段。
+pub const INVALID_PROXY_URL_PLACEHOLDER: &str = "<invalid proxy url>";
+
+/// 把 URL 里的 userinfo 与敏感查询串抹掉，供日志/响应/Debug 使用。
+///
+/// 旧格式允许 `http://user:pass@host:port` 这种内联凭据，任何透出都必须脱敏。
+///
+/// 只有"能确定这不是秘密载体"时才输出内容：
+/// - 解析失败 → 占位符；
+/// - scheme 不在代理白名单 → 占位符（`admin:s3cret@10.0.0.1:1080` 会被
+///   `Url::parse` 当成 scheme = `admin`、userinfo 为空的合法 URL，原样输出就泄密）；
+/// - 没有主机名 → 占位符。
+///
+/// 特殊值 `direct` 不是 URL，由各调用方在调用本函数之前自行处理。
+pub fn redact_proxy_url(url: &str) -> String {
+    let Ok(mut redacted) = reqwest::Url::parse(url) else {
+        return INVALID_PROXY_URL_PLACEHOLDER.to_string();
+    };
+    if !SUPPORTED_PROXY_SCHEMES.contains(&redacted.scheme()) || redacted.host_str().is_none() {
+        return INVALID_PROXY_URL_PLACEHOLDER.to_string();
+    }
+    if !redacted.username().is_empty() || redacted.password().is_some() {
+        let _ = redacted.set_username("");
+        let _ = redacted.set_password(None);
+    }
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
+}
+
+/// 测试观测点：`Route` 构建次数（按 `RouteKey`）。
+///
+/// thread-local，因为 `cargo test` 的用例并行跑在不同线程上；每个用例自己
+/// `reset()` 后读自己的计数，不会互相污染。生产构建里整段不存在。
+#[cfg(test)]
+pub mod route_build_counter {
+    use super::RouteKey;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    thread_local! {
+        static COUNTS: RefCell<HashMap<RouteKey, usize>> = RefCell::new(HashMap::new());
+        /// 当前线程是否处在管理写的 `credentials_save_lock` 临界区内。
+        ///
+        /// 管理写事务的临界区是**同步**的（无 `.await`、无跨线程移交），所以
+        /// thread-local 就足够：`Route::build` 若在里面发生，一定记在同一线程上。
+        static IN_SAVE_LOCK: Cell<bool> = const { Cell::new(false) };
+        static BUILDS_IN_SAVE_LOCK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn record(key: &RouteKey) {
+        COUNTS.with(|counts| {
+            *counts.borrow_mut().entry(key.clone()).or_insert(0) += 1;
+        });
+        if IN_SAVE_LOCK.with(Cell::get) {
+            BUILDS_IN_SAVE_LOCK.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    /// 某个 key 被构建的次数。
+    pub fn count(key: &RouteKey) -> usize {
+        COUNTS.with(|counts| counts.borrow().get(key).copied().unwrap_or(0))
+    }
+
+    /// 清空当前线程的计数。
+    pub fn reset() {
+        COUNTS.with(|counts| counts.borrow_mut().clear());
+        BUILDS_IN_SAVE_LOCK.with(|count| count.set(0));
+    }
+
+    /// 管理写临界区守卫：进入时把本线程标记为「持 save lock」。
+    ///
+    /// 退出（含 panic 展开）时恢复。用于 F1 的观测点：`update_proxy` / `bind`
+    /// 在锁内构建 route 会立刻被记到 [`builds_in_save_lock`] 上。
+    pub struct SaveLockScope(());
+
+    impl SaveLockScope {
+        pub fn enter() -> Self {
+            let previous = IN_SAVE_LOCK.with(|flag| flag.replace(true));
+            debug_assert!(!previous, "save lock 临界区不得嵌套（guard 唯一）");
+            Self(())
+        }
+    }
+
+    impl Drop for SaveLockScope {
+        fn drop(&mut self) {
+            IN_SAVE_LOCK.with(|flag| flag.set(false));
+        }
+    }
+
+    /// 当前线程在 save lock 临界区内发生的 `Route` 构建次数。
+    pub fn builds_in_save_lock() -> usize {
+        BUILDS_IN_SAVE_LOCK.with(Cell::get)
+    }
+}
+
+/// 测试观测点：每个 `(RouteKey, client 角色)` 实际应用了哪些 reqwest 选项。
+///
+/// 记录点**就在施加该选项的那一行旁边**（`apply_proxy` / `apply_no_proxy` /
+/// `apply_h2_keepalive`），不是另写一份与 builder 平行的声明——否则记录与实际
+/// 会分叉，断言就恒绿了（P2 的旧测试正是这么失效的）。
+///
+/// thread-local，与 [`route_build_counter`] 同一隔离方式：`cargo test` 的用例
+/// 跑在不同线程上，各自读自己的记录。生产构建里整段不存在。
+#[cfg(test)]
+pub mod route_option_log {
+    use super::{ClientRole, RouteKey};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// 某个 client 实际被施加的代理/保活选项。
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AppliedOptions {
+        /// 显式 `/ 继承了代理`（`builder.proxy(..)`）
+        pub proxy: bool,
+        /// 显式直连（`builder.no_proxy()`）
+        pub no_proxy: bool,
+        /// H2 keep-alive 三件套（interval + timeout + while_idle）
+        pub keepalive: bool,
+    }
+
+    thread_local! {
+        static OPTIONS: RefCell<HashMap<(RouteKey, ClientRole), AppliedOptions>> =
+            RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn record(
+        key: &RouteKey,
+        role: ClientRole,
+        mutate: impl FnOnce(&mut AppliedOptions),
+    ) {
+        OPTIONS.with(|options| {
+            mutate(options.borrow_mut().entry((key.clone(), role)).or_default());
+        });
+    }
+
+    /// 某路由某个 client 实际应用到的选项；从未构建过则为 `None`。
+    pub fn options(key: &RouteKey, role: ClientRole) -> Option<AppliedOptions> {
+        OPTIONS.with(|options| options.borrow().get(&(key.clone(), role)).copied())
+    }
+
+    pub fn reset() {
+        OPTIONS.with(|options| options.borrow_mut().clear());
+    }
+}
+
+/// 一对 client 里的哪一个：idle = 业务长响应，short = 短请求。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientRole {
+    Idle,
+    Short,
+}
+
+/// 「这是哪个路由的哪种 client」的**测试期作用域**。
+///
+/// 生产构建里这个模块整段不存在——三个 `apply_*` helper 在这种情况下不接受
+/// 作用域参数，因此不留零尺寸参数、不留永假分支、不留 `let _ = ()` 之类噪音。
+/// 测试构建里它是 thread-local：`Route::build_with` 在构建前 `enter()`，三个
+/// helper 在施加选项的那一行旁边 `record_*()`，构建结束 `exit()`。
+/// thread-local 与 [`route_build_counter`] 同一隔离方式（用例各跑各的线程）。
+#[cfg(test)]
+mod build_scope {
+    use super::{ClientRole, RouteKey};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<(RouteKey, ClientRole)>> = const { RefCell::new(None) };
+    }
+
+    /// 进入某个路由某个 client 的构建作用域，并登记一条**全 false** 的空记录。
+    ///
+    /// 空记录本身就是断言对象：System / Global 这类"不施加任何代理专属选项"
+    /// 的分支，正是靠这条默认值来证明"没有多设什么"。若只依赖 `apply_*` 里的
+    /// 记录，System 会根本没有条目、断言只能退化成 `None`——那测不出"多加了
+    /// 一个 no_proxy"这类回归。
+    pub(super) fn enter(scope: (RouteKey, ClientRole)) {
+        let (key, role) = scope.clone();
+        CURRENT.with(|current| *current.borrow_mut() = Some(scope));
+        crate::http_client::route_option_log::record(&key, role, |_| {});
+    }
+
+    pub(super) fn exit() {
+        CURRENT.with(|current| *current.borrow_mut() = None);
+    }
+
+    pub(super) fn with_current(mutate: impl FnOnce(&RouteKey, ClientRole)) {
+        CURRENT.with(|current| {
+            if let Some((key, role)) = current.borrow().as_ref() {
+                mutate(key, *role);
+            }
+        });
+    }
+}
+
+/// 施加显式代理（含可选 basic auth）。记录点在 `.proxy(..)` 之后同一段代码内。
+fn apply_proxy(mut builder: ClientBuilder, config: &ProxyConfig) -> anyhow::Result<ClientBuilder> {
+    let mut proxy = Proxy::all(&config.url)?;
+
+    // 设置代理认证
+    if let (Some(username), Some(password)) = (&config.username, &config.password) {
+        proxy = proxy.basic_auth(username, password);
+    }
+
+    builder = builder.proxy(proxy);
+    tracing::debug!(
+        proxy_url = %redact_proxy_url(&config.url),
+        "HTTP Client 使用代理"
+    );
+    #[cfg(test)]
+    build_scope::with_current(|key, role| {
+        crate::http_client::route_option_log::record(key, role, |options| options.proxy = true);
+    });
+    Ok(builder)
+}
+
+/// 施加显式直连。记录点在 `no_proxy()` 之后同一段代码内。
+fn apply_no_proxy(mut builder: ClientBuilder) -> ClientBuilder {
+    builder = builder.no_proxy();
+    #[cfg(test)]
+    build_scope::with_current(|key, role| {
+        crate::http_client::route_option_log::record(key, role, |options| options.no_proxy = true);
+    });
+    builder
+}
+
+/// 施加代理专属的 H2 keep-alive 三件套。记录点在三个 setter 之后同一段代码内。
+///
+/// 生产路径下 `http2_keep_alive_while_idle` 恒为 `true`——它是 P7 的承重点，
+/// 不是可选项。
+fn apply_h2_keepalive(
+    mut builder: ClientBuilder,
+    interval: Duration,
+    timeout: Duration,
+) -> ClientBuilder {
+    builder = builder
+        .http2_keep_alive_interval(interval)
+        .http2_keep_alive_timeout(timeout)
+        .http2_keep_alive_while_idle(true);
+    #[cfg(test)]
+    build_scope::with_current(|key, role| {
+        crate::http_client::route_option_log::record(key, role, |options| options.keepalive = true);
+    });
+    builder
+}
+
+/// 一次请求走哪条网络路径。
+///
+/// 只承载**网络身份**：池条目的 id/name 不进这里，因此给代理改名不会改变
+/// key、不会新建 client（P3）。代理专属的 keep-alive 只作用于 `Proxy`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RouteKey {
+    /// 未配置全局代理时的「继承」：系统默认行为（含环境变量代理）
+    System,
+    /// 已配置全局 `config.proxyUrl` 时的「继承」。
+    ///
+    /// 必须与改动前 `build_client(Some(proxy), ..)` / `build_idle_client(Some(proxy), ..)`
+    /// 逐项一致：显式使用该代理、**不带**代理专属 keep-alive、不调用 `no_proxy()`。
+    /// 与 `Proxy` 刻意不合并：同一个 URL 作全局代理与作池代理是两种 client 参数，
+    /// 网络身份虽同、client 语义不同。
+    Global(ProxyConfig),
+    /// 显式直连，即使进程环境里配了代理
+    Direct,
+    /// 指定的代理
+    Proxy(ProxyConfig),
+}
+
+/// 代理路由的 HTTP/2 keep-alive：先于 reqwest 默认 90s 空闲回收探测，
+/// 把被静默掐断的隧道在一次往返内剔除（P7）。PING 由 H2 层应答，
+/// 与上游生成快慢无关，不会误杀慢而健康的长流。
+const PROXY_H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const PROXY_H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 随凭据常驻的一对 client。构造后不可变，靠 `Arc` 计数回收。
+///
+/// 每个请求只做一次 `Arc::clone`——不取锁、不建 client、不碰磁盘（P1）。
+pub struct Route {
+    key: RouteKey,
+    /// 业务长响应（流式/非流式 generate）
+    pub idle: Client,
+    /// 短请求（MCP/WebSearch/OAuth/profile/usage）
+    pub short: Client,
+}
+
+impl Route {
+    /// 按 key 构建一对 client。
+    ///
+    /// 直连/系统路由的参数与改动前逐字相同；只有代理路由叠加 keep-alive（P2）。
+    pub fn build(key: RouteKey, tls_backend: TlsBackend) -> anyhow::Result<Arc<Self>> {
+        Self::build_with(key, tls_backend, false, None)
+    }
+
+    /// 测试专用：在完全相同的选项集合上，额外打开 h2c prior-knowledge / 覆盖
+    /// keep-alive 间隔。本地夹具只能用明文 H2 观测连接复用与 PING 剔除——
+    /// 生产路径（`build`）不受影响，两者共用同一段构建代码。
+    #[cfg(test)]
+    pub fn build_for_test(
+        key: RouteKey,
+        tls_backend: TlsBackend,
+        h2_prior_knowledge: bool,
+        keepalive: Option<(Duration, Duration)>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build_with(key, tls_backend, h2_prior_knowledge, keepalive)
+    }
+
+    fn build_with(
+        key: RouteKey,
+        tls_backend: TlsBackend,
+        h2_prior_knowledge: bool,
+        keepalive: Option<(Duration, Duration)>,
+    ) -> anyhow::Result<Arc<Self>> {
+        #[cfg(test)]
+        route_build_counter::record(&key);
+        // 构建期**不做** scheme 白名单校验（F3）：这是改动前的语义。
+        //
+        // 分界的原因：
+        // - `Global` 与「加载期读到的旧内联配置」是**既有配置**，必须与改动前
+        //   逐字一致。reqwest 的 `IntoProxy` 会接受无 scheme 的 `host:port`
+        //   （补 `http://` 重试）以及 `socks4`/`socks4a`；在这里拦白名单会让
+        //   这些一直可用的部署在升级后启动失败，属破坏性回归。
+        // - 而**新写入**的配置（新建/编辑池条目、新增凭据的内联输入）由各自
+        //   的写边界严格校验（`validate_pool_url` / `validate_proxy_scheme`），
+        //   那里的 URL 由 UI 构造、格式确定，收紧是对的。
+        // 校验放在写边界而不是构建边界的另一个好处：`Route::build` 也服务启动
+        // 加载路径，两种输入的合法性口径不同，不能共用同一道闸。
+        // 每个分支的选项集合与 `git show master:src/http_client.rs` 的
+        // `build_client` / `build_idle_client` 对应分支逐项一致：
+        // - System  = `build_*client(None, ..)`        → 无 proxy / 无 no_proxy / 无 keep-alive
+        // - Global  = `build_*client(Some(proxy), ..)` → 有 proxy / 无 no_proxy / 无 keep-alive
+        // - Direct  = 本次新增的显式直连               → 有 no_proxy / 无 proxy / 无 keep-alive
+        // - Proxy   = 本次新增的池代理                 → 有 proxy / 无 no_proxy / 有 keep-alive
+        // 该对照由 `bdd_route_options_match_legacy_builders` 逐项锁死（P2）。
+        let idle = {
+            #[cfg(test)]
+            build_scope::enter((key.clone(), ClientRole::Idle));
+            let client = match &key {
+                RouteKey::System => {
+                    build_idle_client(None, UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)?
+                }
+                RouteKey::Global(proxy) => {
+                    build_idle_client(Some(proxy), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)?
+                }
+                RouteKey::Direct => build_direct_client(
+                    Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
+                    true,
+                    tls_backend,
+                )?,
+                RouteKey::Proxy(proxy) => build_proxied_client(
+                    proxy,
+                    Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
+                    true,
+                    tls_backend,
+                    h2_prior_knowledge,
+                    keepalive,
+                )?,
+            };
+            #[cfg(test)]
+            build_scope::exit();
+            client
+        };
+        let short = {
+            #[cfg(test)]
+            build_scope::enter((key.clone(), ClientRole::Short));
+            let client = match &key {
+                RouteKey::System => build_client(None, SHORT_REQUEST_TIMEOUT_SECS, tls_backend)?,
+                RouteKey::Global(proxy) => {
+                    build_client(Some(proxy), SHORT_REQUEST_TIMEOUT_SECS, tls_backend)?
+                }
+                RouteKey::Direct => build_direct_client(
+                    Duration::from_secs(SHORT_REQUEST_TIMEOUT_SECS),
+                    false,
+                    tls_backend,
+                )?,
+                RouteKey::Proxy(proxy) => build_proxied_client(
+                    proxy,
+                    Duration::from_secs(SHORT_REQUEST_TIMEOUT_SECS),
+                    false,
+                    tls_backend,
+                    h2_prior_knowledge,
+                    keepalive,
+                )?,
+            };
+            #[cfg(test)]
+            build_scope::exit();
+            client
+        };
+        Ok(Arc::new(Self { key, idle, short }))
+    }
+
+    /// 该路由的网络身份。生产路径不读它（凭据条目自己持有路由指针），
+    /// 只有测试断言与排障日志用得上。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn key(&self) -> &RouteKey {
+        &self.key
+    }
+
+    /// 该路由是否真的经代理出站（用于日志与测试断言）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_proxied(&self) -> bool {
+        matches!(self.key, RouteKey::Proxy(_) | RouteKey::Global(_))
+    }
+}
+
+impl fmt::Debug for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Route")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 短请求总超时（秒），与改动前 `client_for(Short)` 的取值一致。
+pub const SHORT_REQUEST_TIMEOUT_SECS: u64 = 720;
+
+/// 支持的代理协议（**新写入路径**的白名单）。
+///
+/// `Proxy::all` 本身不拒绝 ftp 这类 scheme（要到发请求时才失败），因此新配置
+/// 的写边界必须显式校验，让"配置无效"在管理端提交时就暴露。
+///
+/// 这道校验**不**用在 `Route::build` 上：那里还要服务既有部署的全局代理与旧
+/// 内联配置，口径必须与改动前一致（见 `Route::build_with` 的注释，F3）。
+const SUPPORTED_PROXY_SCHEMES: [&str; 4] = ["http", "https", "socks5", "socks5h"];
+
+/// 新写入代理 URL 的 scheme 白名单校验（管理端提交边界）。
+pub fn validate_proxy_scheme(url: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| anyhow::anyhow!("代理 URL 无法解析: {error}"))?;
+    if !SUPPORTED_PROXY_SCHEMES.contains(&parsed.scheme()) {
+        anyhow::bail!(
+            "不支持的代理协议 \"{}\"，只允许 http/https/socks5/socks5h",
+            parsed.scheme()
+        );
+    }
+    Ok(())
 }
 
 impl ProxyConfig {
@@ -66,8 +517,16 @@ fn base_builder(
     proxy: Option<&ProxyConfig>,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<ClientBuilder> {
-    let mut builder = Client::builder();
+    let builder = apply_tls(Client::builder(), tls_backend)?;
 
+    if let Some(proxy_config) = proxy {
+        return apply_proxy(builder, proxy_config);
+    }
+
+    Ok(builder)
+}
+
+fn apply_tls(mut builder: ClientBuilder, tls_backend: TlsBackend) -> anyhow::Result<ClientBuilder> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -83,20 +542,59 @@ fn base_builder(
             }
         }
     }
-
-    if let Some(proxy_config) = proxy {
-        let mut proxy = Proxy::all(&proxy_config.url)?;
-
-        // 设置代理认证
-        if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
-            proxy = proxy.basic_auth(username, password);
-        }
-
-        builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
-    }
-
     Ok(builder)
+}
+
+/// 显式直连：`no_proxy()` 覆盖环境变量里的代理。
+///
+/// `total_timeout` 为 `Some` 时是短请求语义（全局总超时），`None` 时是业务
+/// idle 语义（read + connect 超时、无总死线），与 `build_client` /
+/// `build_idle_client` 的口径逐项对应。
+fn build_direct_client(
+    total_timeout: Duration,
+    idle_semantics: bool,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    // 顺序与改动前逐字等价：先 `no_proxy()` 再套 TLS（`apply_tls` 不改代理）。
+    let builder = apply_no_proxy(Client::builder());
+    let builder = apply_tls(builder, tls_backend)?;
+    let builder = if idle_semantics {
+        builder
+            .read_timeout(total_timeout)
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+    } else {
+        builder.timeout(total_timeout)
+    };
+    Ok(builder.build()?)
+}
+
+/// 代理路由的 client：与直连/系统口径相同，另加 H2 keep-alive。
+///
+/// 显式设置 `Proxy::all` 后 reqwest 自动停用系统代理，因此这里不需要 `no_proxy()`。
+fn build_proxied_client(
+    proxy: &ProxyConfig,
+    total_timeout: Duration,
+    idle_semantics: bool,
+    tls_backend: TlsBackend,
+    h2_prior_knowledge: bool,
+    keepalive: Option<(Duration, Duration)>,
+) -> anyhow::Result<Client> {
+    let (interval, timeout) =
+        keepalive.unwrap_or((PROXY_H2_KEEPALIVE_INTERVAL, PROXY_H2_KEEPALIVE_TIMEOUT));
+    let builder = apply_proxy(Client::builder(), proxy)?;
+    let builder = apply_tls(builder, tls_backend)?;
+    let mut builder = apply_h2_keepalive(builder, interval, timeout);
+    if h2_prior_knowledge {
+        builder = builder.http2_prior_knowledge();
+    }
+    let builder = if idle_semantics {
+        builder
+            .read_timeout(total_timeout)
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+    } else {
+        builder.timeout(total_timeout)
+    };
+    Ok(builder.build()?)
 }
 
 /// 构建短请求 HTTP Client（全局总超时）。
@@ -221,6 +719,62 @@ pub fn is_transient(err: &reqwest::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// J8：无法安全脱敏的旧值一律输出固定占位，绝不拼接原文片段。
+    ///
+    /// 事故形态：`admin:s3cret@10.0.0.1:1080` 被 `Url::parse` 当成
+    /// scheme = `admin`、userinfo 为空的合法 URL，原样输出就泄密。
+    ///
+    /// 反事实：还原"解析失败只保留 scheme"的实现，前四条断言变红
+    /// （`admin:s3cret@...` 返回原串、`pass@host` 返回 `pass@host` 变形）。
+    #[test]
+    fn redact_never_leaks_unparsable_or_non_proxy_values() {
+        for leaky in [
+            "admin:s3cret@10.0.0.1:1080",
+            "pass@host",
+            "user:pass@host:1080",
+            "ftp://u:p@h:1",
+            "socks5://",
+            "http://",
+        ] {
+            let output = redact_proxy_url(leaky);
+            assert_eq!(
+                output, INVALID_PROXY_URL_PLACEHOLDER,
+                "{leaky} 必须退化为固定占位"
+            );
+            assert!(!output.contains("s3cret"), "{leaky}");
+            assert!(!output.contains("pass"), "{leaky}");
+        }
+    }
+
+    /// 合法 URL 保持现有脱敏：去掉 userinfo、query、fragment，输出规范形态。
+    #[test]
+    fn redact_strips_userinfo_for_valid_proxy_urls() {
+        assert_eq!(
+            redact_proxy_url("http://u:p@h:1"),
+            "http://h:1/",
+            "userinfo 必须去掉"
+        );
+        assert_eq!(
+            redact_proxy_url("socks5h://u:p@proxy.example:1080/?token=abc#frag"),
+            "socks5h://proxy.example:1080/",
+            "query 与 fragment 必须去掉"
+        );
+        assert_eq!(
+            redact_proxy_url("http://proxy.example:3128"),
+            "http://proxy.example:3128/",
+            "无认证的地址保持可读"
+        );
+    }
+
+    /// `ProxyConfig` 的 Debug 复用同一个脱敏函数：不可解析的值同样不得泄漏。
+    #[test]
+    fn proxy_config_debug_never_leaks() {
+        let config = ProxyConfig::new("admin:s3cret@10.0.0.1:1080");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("s3cret"), "{debug}");
+        assert!(debug.contains(INVALID_PROXY_URL_PLACEHOLDER), "{debug}");
+    }
 
     // ─────────────────────────────────────────────────────────────────
     // Mock 上游 helper

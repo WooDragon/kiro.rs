@@ -69,8 +69,9 @@ async fn main() {
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
 
-    // 转换为按优先级排序的凭据列表
-    let mut credentials_list = credentials_config.into_sorted_credentials();
+    // 转换为按优先级排序的凭据列表 + 代理池
+    let (mut credentials_list, proxies) = credentials_config.into_parts();
+    credentials_list.sort_by_key(|c| c.priority);
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
@@ -135,8 +136,12 @@ async fn main() {
         proxy
     });
 
-    if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+    if let Some(proxy) = &proxy_config {
+        // 全局代理 URL 可能内联 userinfo，日志必须脱敏。
+        tracing::info!(
+            proxy_url = %http_client::redact_proxy_url(&proxy.url),
+            "已配置 HTTP 代理"
+        );
     }
 
     // 构建端点注册表
@@ -169,9 +174,10 @@ async fn main() {
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    let token_manager = MultiTokenManager::new_with_pool(
         config.clone(),
         credentials_list,
+        proxies,
         proxy_config.clone(),
         Some(credentials_path.into()),
         is_multiple_format,

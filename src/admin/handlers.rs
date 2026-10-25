@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, BindProxyRequest, CreateProxyRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpdateProxyRequest,
     },
 };
 
@@ -136,6 +136,62 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxies
+/// 列出代理池（不回传密码）
+pub async fn list_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_proxies())
+}
+
+/// POST /api/admin/proxies
+/// 新增池代理
+pub async fn create_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.create_proxy(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PATCH /api/admin/proxies/{id}
+/// 编辑池代理（字段缺省=保留，null=清除）
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(&id, payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxies/{id}
+/// 删除池代理（仍被引用时 409）
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(&id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/{id}/proxy
+/// 绑定凭据的代理来源
+pub async fn bind_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<BindProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.bind_credential_proxy(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
