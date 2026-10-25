@@ -2,14 +2,15 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        add_credential, bind_credential_proxy, create_proxy, delete_credential, delete_proxy,
+        force_refresh_token, get_all_credentials, get_credential_balance, get_load_balancing_mode,
+        list_proxies, reset_failure_count, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, update_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -25,6 +26,11 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `PUT /credentials/:id/proxy` - 绑定凭据代理来源
+/// - `GET /proxies` - 列出代理池
+/// - `POST /proxies` - 新增池代理
+/// - `PATCH /proxies/:id` - 编辑池代理
+/// - `DELETE /proxies/:id` - 删除池代理
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
@@ -44,6 +50,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/proxy", put(bind_credential_proxy))
+        .route("/proxies", get(list_proxies).post(create_proxy))
+        .route("/proxies/{id}", patch(update_proxy).delete(delete_proxy))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

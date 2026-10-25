@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Network } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,10 +27,34 @@ import {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  onEditProxy: (credential: CredentialStatusItem) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+}
+
+/**
+ * 代理来源的可读标签。
+ *
+ * 只用后端给出的 proxyMode/proxyName/effectiveProxyUrl，不再用 hasProxy 布尔值猜测。
+ */
+export function proxySourceLabel(credential: CredentialStatusItem): string {
+  switch (credential.proxyMode) {
+    case 'inherit':
+      return credential.effectiveProxyUrl
+        ? `继承全局 · ${credential.effectiveProxyUrl}`
+        : '继承全局（未配置全局代理）'
+    case 'direct':
+      return '明确直连'
+    case 'pool':
+      return `代理池 · ${credential.proxyName || credential.proxyId || '未知条目'}`
+    case 'inline':
+      return `高级内联 · ${credential.effectiveProxyUrl || credential.proxyUrl || '未知地址'}`
+    default:
+      // 未知模式不猜测语义，如实显示后端原值
+      return credential.proxyMode || '未知'
+  }
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -52,6 +76,7 @@ function formatLastUsed(lastUsedAt: string | null): string {
 export function CredentialCard({
   credential,
   onViewBalance,
+  onEditProxy,
   selected,
   onToggleSelect,
   balance,
@@ -281,12 +306,15 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
+            <div className="col-span-2" data-testid="credential-proxy-source">
+              <span className="text-muted-foreground">代理：</span>
+              <span className="font-medium">{proxySourceLabel(credential)}</span>
+              {credential.proxyMode === 'pool' && credential.effectiveProxyUrl && (
+                <span className="ml-1 font-mono text-xs text-muted-foreground">
+                  {credential.effectiveProxyUrl}
+                </span>
+              )}
+            </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -358,6 +386,14 @@ export function CredentialCard({
             >
               <Wallet className="h-4 w-4 mr-1" />
               查看余额
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onEditProxy(credential)}
+            >
+              <Network className="h-4 w-4 mr-1" />
+              修改代理
             </Button>
             <Button
               size="sm"

@@ -9,12 +9,16 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::model::proxy_pool::ProxyEntry;
+use crate::kiro::token_manager::{
+    MultiTokenManager, ProxyBindingRequest, ProxyPoolError, ProxyUpdateRequest,
+};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, BindProxyRequest,
+    CreateProxyRequest, CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ProxyItem, ProxyListResponse, SetLoadBalancingModeRequest, UpdateProxyRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -38,6 +42,15 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+}
+
+fn classify_proxy_error(error: ProxyPoolError) -> AdminServiceError {
+    match error {
+        ProxyPoolError::NotFound(msg) => AdminServiceError::NotFoundEntity(msg),
+        ProxyPoolError::Conflict(msg) => AdminServiceError::Conflict(msg),
+        ProxyPoolError::Invalid(msg) => AdminServiceError::InvalidCredential(msg),
+        ProxyPoolError::Storage(msg) => AdminServiceError::StorageNotWritable(msg),
+    }
 }
 
 impl AdminService {
@@ -84,6 +97,10 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_mode: entry.proxy_mode,
+                proxy_id: entry.proxy_id,
+                proxy_name: entry.proxy_name,
+                effective_proxy_url: entry.effective_proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -210,6 +227,14 @@ impl AdminService {
             )));
         }
 
+        // 新旧代理表达合流（互斥校验在入口完成）
+        let proxy_id = req
+            .proxy_binding_id()
+            .map_err(AdminServiceError::InvalidCredential)?;
+        let (proxy_url, proxy_username, proxy_password) = req
+            .apply_binding_fields()
+            .map_err(AdminServiceError::InvalidCredential)?;
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -228,9 +253,10 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            proxy_id,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             kiro_api_key: req.kiro_api_key,
@@ -305,6 +331,75 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    // ============ 代理池 ============
+
+    /// 列出代理池
+    pub fn list_proxies(&self) -> ProxyListResponse {
+        ProxyListResponse {
+            proxies: self
+                .token_manager
+                .list_proxies()
+                .into_iter()
+                .map(ProxyItem::from)
+                .collect(),
+        }
+    }
+
+    /// 新增池代理
+    pub async fn create_proxy(
+        &self,
+        req: CreateProxyRequest,
+    ) -> Result<ProxyListResponse, AdminServiceError> {
+        // id 一律由服务端生成（客户端传入的 `id` 字段被忽略）。
+        let entry = ProxyEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: req.name,
+            url: req.url,
+            username: req.username,
+            password: req.password,
+        };
+        self.token_manager
+            .create_proxy(entry)
+            .await
+            .map_err(classify_proxy_error)?;
+        Ok(self.list_proxies())
+    }
+
+    /// 编辑池代理
+    pub async fn update_proxy(
+        &self,
+        id: &str,
+        req: UpdateProxyRequest,
+    ) -> Result<ProxyListResponse, AdminServiceError> {
+        self.token_manager
+            .update_proxy(id, ProxyUpdateRequest::from(req))
+            .await
+            .map_err(classify_proxy_error)?;
+        Ok(self.list_proxies())
+    }
+
+    /// 删除池代理
+    pub async fn delete_proxy(&self, id: &str) -> Result<ProxyListResponse, AdminServiceError> {
+        self.token_manager
+            .delete_proxy(id)
+            .await
+            .map_err(classify_proxy_error)?;
+        Ok(self.list_proxies())
+    }
+
+    /// 绑定凭据的代理来源
+    pub async fn bind_credential_proxy(
+        &self,
+        id: u64,
+        req: BindProxyRequest,
+    ) -> Result<ProxyListResponse, AdminServiceError> {
+        self.token_manager
+            .bind_credential_proxy(id, ProxyBindingRequest::from(req))
+            .await
+            .map_err(classify_proxy_error)?;
+        Ok(self.list_proxies())
     }
 
     // ============ 余额缓存持久化 ============
@@ -415,7 +510,13 @@ impl AdminService {
     }
 
     /// 分类添加凭据错误
+    ///
+    /// 代理池相关的失败先按类型判定（关键字匹配认不出"代理不存在"/"代理不可用"，
+    /// 会落到 500）；其余错误仍走原有关键字分类，结果不变。
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(proxy_error) = e.downcast_ref::<ProxyPoolError>() {
+            return classify_proxy_error(proxy_error.clone());
+        }
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）

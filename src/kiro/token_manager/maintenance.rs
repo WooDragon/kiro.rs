@@ -138,21 +138,37 @@ impl MultiTokenManager {
         }
     }
 
+    /// 用该凭据已发布的路由 client 刷新 Token。
+    ///
+    /// 刷新是短请求，沿用 `route.short` 并显式叠加 60s 总超时，等价于改动前
+    /// 现建 `build_client(proxy, 60, ..)` 的口径。
     pub(super) async fn refresh_credentials(
         &self,
         credentials: &KiroCredentials,
+        route: &Route,
     ) -> anyhow::Result<KiroCredentials> {
-        let proxy = credentials.effective_proxy(self.proxy.as_ref());
         #[cfg(test)]
         {
             let url = self.test_refresh_url.lock().clone();
-            refresh_token_at(credentials, &self.config, proxy.as_ref(), url.as_deref()).await
+            refresh_token_with_client(
+                credentials,
+                &self.config,
+                &route.short,
+                url.as_deref(),
+                Some(60),
+            )
+            .await
         }
         #[cfg(not(test))]
-        refresh_token(credentials, &self.config, proxy.as_ref()).await
+        {
+            refresh_token_with_client(credentials, &self.config, &route.short, None, Some(60)).await
+        }
     }
 
-    /// 全局锁覆盖重读、HTTP 和内存 apply；保存始终在锁外。
+    /// 每凭据一把锁覆盖重读、HTTP 和内存 apply；保存始终在锁外。
+    ///
+    /// 锁在 entries 锁内克隆、释放 entries 后才 await，因此一个慢或死的代理
+    /// 只阻塞它自己的凭据（P5），也不会倒置 `save → entries → pool` 锁序。
     pub(super) async fn refresh_auth(
         &self,
         id: u64,
@@ -166,8 +182,16 @@ impl MultiTokenManager {
                 return Ok(false);
             }
         }
+        let lock = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.refresh_lock.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
         let (refreshed, restored) = {
-            let _guard = self.refresh_lock.lock().await;
+            let _guard = lock.lock().await;
             self.refresh_auth_locked(id, mode).await?
         };
         if refreshed {
@@ -184,12 +208,22 @@ impl MultiTokenManager {
         id: u64,
         mode: RefreshMode<'_>,
     ) -> anyhow::Result<(bool, bool)> {
-        let (current, identity, auth_disabled) = {
+        let (current, identity, auth_disabled, route) = {
             let entries = self.entries.lock();
             let entry = entries
                 .iter()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            // Major 1（fail-closed）：`entry.route` 是启动期构建失败的**回落**
+            // （继承路由/全局代理/系统直连）。经它刷新就是把凭据的秘密送出了
+            // 计划禁止的出口——业务选路已被 I6 拦住，但后台维护与强制刷新
+            // 从来没拦过，等于给脏配置开了一条后门。
+            //
+            // 判据只用 `route_build_failed`，不看 `disabled_reason`：额度耗尽 /
+            // 失败次数过多 / 手动禁用这些凭据的 route 是好的，刷新必须照常工作。
+            if entry.route_build_failed {
+                bail!("凭据 #{} 的代理配置构建失败，拒绝经回落路由刷新 Token", id);
+            }
             if let RefreshMode::Maintenance(expected) = &mode {
                 if !expected.matches(entry) {
                     bail!("凭据在维护期间已改变");
@@ -205,6 +239,7 @@ impl MultiTokenManager {
                 entry.credentials.clone(),
                 EntryIdentity::of(entry),
                 entry.disabled_reason.is_some_and(DisabledReason::is_auth),
+                entry.route.clone(),
             )
         };
         if current.is_api_key_credential() {
@@ -218,7 +253,7 @@ impl MultiTokenManager {
         if !force && !is_token_expired(&current) && !is_token_expiring_soon(&current) {
             return Ok((false, false));
         }
-        let result = self.refresh_credentials(&current).await;
+        let result = self.refresh_credentials(&current, &route).await;
         let still_current = self.entries.lock().iter().any(|entry| {
             entry.id == id
                 && identity.same_instance(entry)
@@ -345,6 +380,17 @@ impl MultiTokenManager {
             else {
                 return;
             };
+            // Major 1（fail-closed）：route 是启动期构建失败的回落时，这条凭据的
+            // 任何出站（认证刷新、余额查询）都会走全局代理/系统直连——计划明令
+            // 禁止。这里整体跳过，而不是让 `refresh_auth` 失败后再进 15 分钟退避：
+            // 配置没修好之前退避毫无意义，还会把日志刷成"认证失败"。
+            if entry.route_build_failed {
+                tracing::debug!(
+                    credential_id = id,
+                    "代理配置构建失败，跳过后台维护（不经回落路由出站）"
+                );
+                return;
+            }
             if entry
                 .auth_retry_after_ms
                 .is_some_and(|deadline| deadline.blocks(self.now_ms(), entry.disabled_reason))
@@ -660,7 +706,8 @@ mod tests {
         let manager = manager(clock.clone(), vec![oauth(1, true)]);
         server.attach(&manager);
         manager.report_quota_exhausted(1);
-        let guard = manager.refresh_lock.lock().await;
+        let guard = manager.entries.lock()[0].refresh_lock.clone();
+        let guard = guard.lock().await;
         let mut waiter = Box::pin(manager.maintain_once());
         poll_waiter_pending(waiter.as_mut()).await;
         let deadline = manager.now_ms() + RETRY_MS;

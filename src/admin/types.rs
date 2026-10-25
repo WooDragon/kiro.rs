@@ -50,11 +50,22 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
-    /// 是否配置了凭据级代理
+    /// 是否配置了任何形式的代理（保留旧字段）
     pub has_proxy: bool,
-    /// 代理 URL（用于前端展示）
+    /// 代理 URL（已脱敏；仅内联/直连时有值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理来源：inherit | direct | pool | inline
+    pub proxy_mode: String,
+    /// 池条目 ID（仅 pool 模式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+    /// 池条目名称（仅 pool 模式，便于前端直接展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
+    /// 该凭据实际使用的脱敏代理地址（不含密码，含继承来的全局代理）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_proxy_url: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -62,6 +73,128 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+}
+
+// ============ 代理池 ============
+
+/// 代理池列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyListResponse {
+    pub proxies: Vec<ProxyItem>,
+}
+
+/// 单个池代理（不回传密码）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyItem {
+    pub id: String,
+    pub name: String,
+    /// 已脱敏 URL
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    pub has_password: bool,
+    pub reference_count: usize,
+}
+
+/// 新增池代理请求
+///
+/// `id` 由服务端生成：客户端传入的 id 会落在 URL 路径里，`.`/`..`/空格/斜杠
+/// 这类值在浏览器路径解析中被改写，导致条目在 UI 里无法再定位、编辑或删除。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProxyRequest {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// 编辑池代理请求（PATCH：字段缺省=保留，null=清除，值=替换）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyRequest {
+    #[serde(default, deserialize_with = "double_option")]
+    pub name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub password: Option<Option<String>>,
+}
+
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl From<crate::kiro::token_manager::ProxyListItem> for ProxyItem {
+    fn from(item: crate::kiro::token_manager::ProxyListItem) -> Self {
+        Self {
+            id: item.id,
+            name: item.name,
+            url: item.url,
+            username: item.username,
+            has_password: item.has_password,
+            reference_count: item.reference_count,
+        }
+    }
+}
+
+impl From<UpdateProxyRequest> for crate::kiro::token_manager::ProxyUpdateRequest {
+    fn from(request: UpdateProxyRequest) -> Self {
+        Self {
+            name: request.name,
+            url: request.url,
+            username: request.username,
+            password: request.password,
+        }
+    }
+}
+
+impl From<BindProxyRequest> for crate::kiro::token_manager::ProxyBindingRequest {
+    fn from(request: BindProxyRequest) -> Self {
+        match request {
+            BindProxyRequest::Inherit => Self::Inherit,
+            BindProxyRequest::Direct => Self::Direct,
+            BindProxyRequest::Pool { proxy_id } => Self::Pool { proxy_id },
+            BindProxyRequest::Inline {
+                url,
+                username,
+                password,
+            } => Self::Inline {
+                url,
+                username,
+                password,
+            },
+        }
+    }
+}
+
+/// 绑定凭据代理请求（tagged by `mode`）
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum BindProxyRequest {
+    Inherit,
+    Direct,
+    Pool {
+        #[serde(rename = "proxyId")]
+        proxy_id: String,
+    },
+    Inline {
+        url: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+    },
 }
 
 // ============ 操作请求 ============
@@ -129,6 +262,13 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 绑定的代理池条目 ID（与上面三个内联字段互斥）
+    pub proxy_id: Option<String>,
+
+    /// 新的 tagged 绑定写法（`mode = inherit|direct|pool|inline`）
+    #[serde(default)]
+    pub proxy: Option<BindProxyRequest>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +277,63 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+/// 落盘的旧三字段形态：`(proxyUrl, proxyUsername, proxyPassword)`。
+pub type LegacyProxyFields = (Option<String>, Option<String>, Option<String>);
+
+impl AddCredentialRequest {
+    /// 旧三字段是否出现（`proxyUrl`/`proxyUsername`/`proxyPassword`）。
+    fn legacy_inline_present(&self) -> bool {
+        self.proxy_url.is_some() || self.proxy_username.is_some() || self.proxy_password.is_some()
+    }
+
+    /// 把新旧两种代理表达合流成单一 `proxyId` 字段，并拒绝同时出现。
+    ///
+    /// 新旧表达同时出现会写出加载期拒绝的绑定组合（`proxyId` + 旧字段），
+    /// 下次启动即 fail-fast，因此这里必须和 `validate_document` 的规则一致。
+    pub fn proxy_binding_id(&self) -> Result<Option<String>, String> {
+        if self.proxy.is_some() && (self.legacy_inline_present() || self.proxy_id.is_some()) {
+            return Err(
+                "proxy 与 proxyUrl/proxyUsername/proxyPassword/proxyId 不能同时提供".to_string(),
+            );
+        }
+        if self.proxy_id.is_some() && self.legacy_inline_present() {
+            return Err("proxyId 不能与 proxyUrl/proxyUsername/proxyPassword 同时提供".to_string());
+        }
+        Ok(match &self.proxy {
+            Some(BindProxyRequest::Pool { proxy_id }) => Some(proxy_id.clone()),
+            _ => self.proxy_id.clone(),
+        })
+    }
+
+    /// 新写法里的内联/直连/继承需要落到旧三字段上（内联三字段的落盘形态不变）。
+    ///
+    /// 新表达的内联代理与 `PUT /credentials/{id}/proxy` 共用
+    /// [`crate::kiro::model::proxy_pool::inline_proxy_config`] 校验；
+    /// 旧三字段的既有行为保持不变（`proxyUrl:"direct"` 仍然有效）。
+    pub fn apply_binding_fields(&self) -> Result<LegacyProxyFields, String> {
+        Ok(match &self.proxy {
+            Some(BindProxyRequest::Direct) => (Some("direct".to_string()), None, None),
+            Some(BindProxyRequest::Inline {
+                url,
+                username,
+                password,
+            }) => {
+                crate::kiro::model::proxy_pool::inline_proxy_config(
+                    url,
+                    username.as_deref(),
+                    password.as_deref(),
+                )?;
+                (Some(url.clone()), username.clone(), password.clone())
+            }
+            _ => (
+                self.proxy_url.clone(),
+                self.proxy_username.clone(),
+                self.proxy_password.clone(),
+            ),
+        })
+    }
 }
 
 fn default_auth_method() -> String {

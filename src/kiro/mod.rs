@@ -5,6 +5,18 @@ pub mod machine_id;
 pub mod model;
 pub mod parser;
 pub mod provider;
+#[cfg(test)]
+pub mod proxy_fixtures;
+#[cfg(test)]
+mod proxy_pool_bdd;
+#[cfg(test)]
+mod proxy_pool_bdd_concurrency;
+#[cfg(test)]
+mod proxy_pool_bdd_isolation;
+#[cfg(test)]
+mod proxy_pool_bdd_paths;
+#[cfg(test)]
+mod proxy_pool_bdd_protocols;
 pub mod token_manager;
 
 /// 日志 payload 截断上限：8 KB。

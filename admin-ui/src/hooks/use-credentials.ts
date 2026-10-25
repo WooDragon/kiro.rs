@@ -12,6 +12,7 @@ import {
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
+import { PROXIES_QUERY_KEY } from '@/hooks/use-proxies'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -85,6 +86,7 @@ export function useAddCredential() {
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: PROXIES_QUERY_KEY })
     },
   })
 }
@@ -96,6 +98,7 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: PROXIES_QUERY_KEY })
     },
   })
 }
