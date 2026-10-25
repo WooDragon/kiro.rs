@@ -186,7 +186,13 @@ pub fn inline_proxy_config(
         return Err("内联代理不接受 \"direct\"，请改用 mode=direct".to_string());
     }
     validate_auth_pair(username, password)?;
-    crate::http_client::validate_proxy_scheme(url).map_err(|error| error.to_string())?;
+    // 与池条目**同一套**严格规则（scheme 白名单之外还拒 userinfo / query /
+    // fragment / 非根路径）。少拒一条 userinfo，新写入的内联代理就会把密码
+    // 留在 `proxyUrl` 字段里（`redact_proxy_url` 只是展示脱敏，落盘的是原文），
+    // 且与独立 username/password 字段叠加会变成对同一代理的双重认证。
+    //
+    // 加载期的旧内联配置不经过这里，继续沿用 reqwest 语义（F3 的分界不变）。
+    validate_pool_url(url)?;
     let mut config = ProxyConfig::new(url);
     if let (Some(username), Some(password)) = (username, password) {
         config = config.with_auth(username, password);
@@ -643,6 +649,54 @@ mod tests {
         let config = inline_proxy_config("socks5h://h:1", Some("u"), Some("p")).expect("成对认证");
         assert_eq!(config.username.as_deref(), Some("u"));
         assert_eq!(config.password.as_deref(), Some("p"));
+    }
+
+    /// 新写入的内联代理必须与池条目**同一套**严格 URL 规则。
+    ///
+    /// 缺陷形态：内联只查 scheme + 认证成对，于是
+    /// `http://user:pass@host:port` 能进 `proxyUrl` 字段——密码
+    /// 原文落盘，且与独立 username/password 同时存在时对代理做双重认证。
+    ///
+    /// 前置条件断言：同一组输入在 `validate_pool_url` 上确实被拒（证明比较的
+    /// 是"两处结论一致"，而不是"两处都无脑放行/拒绝"）。
+    ///
+    /// 反事实（已现场验证）：把 `inline_proxy_config` 的校验换回
+    /// `validate_proxy_scheme`，本条在 userinfo 用例处红（返回 Ok）。
+    #[test]
+    fn inline_proxy_url_rules_match_pool_rules() {
+        let rejected = [
+            "http://user:pass@host:3128",
+            "http://user@host:3128",
+            "http://host:3128/?x=1",
+            "http://host:3128/#f",
+            "http://host:3128/path",
+            "ftp://host:21",
+            "127.0.0.1:7890",
+            " http://host:3128",
+        ];
+        for url in rejected {
+            assert!(
+                validate_pool_url(url).is_err(),
+                "前置条件：池规则必须拒绝 {url}"
+            );
+            assert!(
+                inline_proxy_config(url, None, None).is_err(),
+                "内联必须与池同一结论，{url} 应被拒绝"
+            );
+        }
+        let accepted = [
+            "socks5://127.0.0.1:1080",
+            "socks5h://proxy.internal:1080",
+            "http://10.0.0.5:3128",
+            "https://[::1]:8443",
+        ];
+        for url in accepted {
+            assert!(validate_pool_url(url).is_ok(), "前置条件：池接受 {url}");
+            assert!(
+                inline_proxy_config(url, None, None).is_ok(),
+                "内联必须与池同一结论，{url} 应被接受"
+            );
+        }
     }
 
     /// J1：新增路径与加载路径共用同一份绑定互斥规则。

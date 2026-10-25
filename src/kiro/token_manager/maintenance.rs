@@ -214,6 +214,16 @@ impl MultiTokenManager {
                 .iter()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            // Major 1（fail-closed）：`entry.route` 是启动期构建失败的**回落**
+            // （继承路由/全局代理/系统直连）。经它刷新就是把凭据的秘密送出了
+            // 计划禁止的出口——业务选路已被 I6 拦住，但后台维护与强制刷新
+            // 从来没拦过，等于给脏配置开了一条后门。
+            //
+            // 判据只用 `route_build_failed`，不看 `disabled_reason`：额度耗尽 /
+            // 失败次数过多 / 手动禁用这些凭据的 route 是好的，刷新必须照常工作。
+            if entry.route_build_failed {
+                bail!("凭据 #{} 的代理配置构建失败，拒绝经回落路由刷新 Token", id);
+            }
             if let RefreshMode::Maintenance(expected) = &mode {
                 if !expected.matches(entry) {
                     bail!("凭据在维护期间已改变");
@@ -370,6 +380,17 @@ impl MultiTokenManager {
             else {
                 return;
             };
+            // Major 1（fail-closed）：route 是启动期构建失败的回落时，这条凭据的
+            // 任何出站（认证刷新、余额查询）都会走全局代理/系统直连——计划明令
+            // 禁止。这里整体跳过，而不是让 `refresh_auth` 失败后再进 15 分钟退避：
+            // 配置没修好之前退避毫无意义，还会把日志刷成"认证失败"。
+            if entry.route_build_failed {
+                tracing::debug!(
+                    credential_id = id,
+                    "代理配置构建失败，跳过后台维护（不经回落路由出站）"
+                );
+                return;
+            }
             if entry
                 .auth_retry_after_ms
                 .is_some_and(|deadline| deadline.blocks(self.now_ms(), entry.disabled_reason))

@@ -42,7 +42,9 @@ impl fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyConfig")
             .field("url", &redact_proxy_url(&self.url))
-            .field("username", &self.username)
+            // 用户名同样是认证材料的另一半（不少代理把口令塞在用户名段，
+            // 或用户名本身可反推内网账号），`{:?}` 会经日志/错误链外泄。
+            .field("has_username", &self.username.is_some())
             .field("has_password", &self.password.is_some())
             .finish()
     }

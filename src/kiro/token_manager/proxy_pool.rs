@@ -376,12 +376,18 @@ struct PoolCommit {
 }
 
 /// 写盘成功后要提交的内存变更。
+///
+/// 这里是**唯一**的发布点：事务构造阶段只查表 / 构建，绝不注册（Minor 3）。
+/// 写盘失败时注册表必须与调用前完全一致——否则会残留一个没有任何池条目引用、
+/// 却带着新代理地址与密码的 client，直到下一次成功写触发的 prune 才被收走。
 #[derive(Default)]
 struct PoolPublish {
     /// 新增或替换一个池条目，并注册它的 route
     upsert: Option<(ProxyEntry, RouteKey, Arc<Route>)>,
     /// 删除一个池条目
     remove: Option<String>,
+    /// 只注册 route（绑定路径：池条目没变，但要确保该网络身份在注册表里）
+    routes: Vec<(RouteKey, Arc<Route>)>,
     /// 改绑凭据（绑定字段 + route 指针 + state_revision）
     rebinds: Vec<CredentialRebind>,
 }
@@ -678,27 +684,25 @@ impl MultiTokenManager {
             };
 
             let route = {
-                let mut pool = self.pool.lock();
+                // 只查表 / 构建，**不**注册：注册必须等写盘成功（Minor 3）。
+                // 写盘失败时若已注册，注册表里会残留带新代理（含密码）的 client，
+                // 且没有任何池条目引用它，要等下一次成功写触发的 prune 才收。
+                let pool = self.pool.lock();
                 match pool.probe(&candidate_key) {
                     // 注册表里已有：直接用（可能是别的写者刚发布的同一个 Arc）。
                     Some(existing) => existing,
                     None => match &prebuilt {
-                        // 最常见：候选身份与锁外预建时一致，直接发布那个 Arc —— 本次
+                        // 最常见：候选身份与锁外预建时一致，直接用那个 Arc —— 本次
                         // 事务不再构建第二次（F1）。
                         Some((prebuilt_key, prebuilt_route)) if prebuilt_key == &candidate_key => {
-                            pool.publish(candidate_key.clone(), prebuilt_route.clone())
+                            prebuilt_route.clone()
                         }
                         // 罕见并发回退：锁外预建之后，另一个写者改了网络身份，或本次
                         // 提交算出的身份与预建的不同。此时没有可复用的 Arc，只能在
-                        // 锁内构建一次并立刻注册，避免发布一个未注册的 client。
-                        _ => {
-                            let built =
-                                Route::build(candidate_key.clone(), self.config.tls_backend)
-                                    .map_err(|error| {
-                                        ProxyPoolError::Invalid(format!("代理不可用: {error}"))
-                                    })?;
-                            pool.publish(candidate_key.clone(), built)
-                        }
+                        // 锁内构建一次。
+                        _ => Route::build(candidate_key.clone(), self.config.tls_backend).map_err(
+                            |error| ProxyPoolError::Invalid(format!("代理不可用: {error}")),
+                        )?,
                     },
                 }
             };
@@ -893,23 +897,22 @@ impl MultiTokenManager {
                 None => candidate_key.clone(),
             };
             let route = {
-                let mut pool = self.pool.lock();
+                // 与 update_proxy 同口径：这里只查表 / 构建，注册留给写盘成功
+                // 之后（Minor 3）。绑定失败时注册表不得残留新代理的 client。
+                let pool = self.pool.lock();
                 match pool.probe(&published_key) {
                     Some(existing) => existing,
                     None => {
                         let (prebuilt_key, prebuilt_route) = &prebuilt;
                         if prebuilt_key == &published_key {
                             // 锁外构建的那个 Arc 就是本次要发布的路由（F1）。
-                            pool.publish(published_key.clone(), prebuilt_route.clone())
+                            prebuilt_route.clone()
                         } else {
                             // 罕见并发回退：绑定期间池条目被并发改成了另一个网络
-                            // 身份，锁外预建的不再适用。只在锁内构建一次并注册。
-                            let built =
-                                Route::build(published_key.clone(), self.config.tls_backend)
-                                    .map_err(|error| {
-                                        ProxyPoolError::Invalid(format!("代理不可用: {error}"))
-                                    })?;
-                            pool.publish(published_key.clone(), built)
+                            // 身份，锁外预建的不再适用。只在锁内构建一次。
+                            Route::build(published_key.clone(), self.config.tls_backend).map_err(
+                                |error| ProxyPoolError::Invalid(format!("代理不可用: {error}")),
+                            )?
                         }
                     }
                 }
@@ -954,8 +957,11 @@ impl MultiTokenManager {
                         proxy_url,
                         proxy_username,
                         proxy_password,
-                        route,
+                        route: route.clone(),
                     }],
+                    // 绑定不改池条目，但新网络身份仍要进注册表——注册发生在
+                    // `commit_pool_write` 写盘成功之后（Minor 3）。
+                    routes: vec![(published_key, route)],
                     ..Default::default()
                 },
             }
@@ -981,7 +987,8 @@ impl MultiTokenManager {
     fn commit_pool_write(&self, commit: PoolCommit) -> Result<(), ProxyPoolError> {
         self.write_document(&commit.credentials, &commit.proxies)?;
 
-        // 发布池条目 + 注册 route（只取 pool）
+        // 发布池条目 + 注册 route（只取 pool）。写盘已经成功，所以这里是
+        // 唯一的注册时机——事务构造阶段只构建不注册（Minor 3）。
         if let Some((entry, key, route)) = commit.publish.upsert {
             let mut pool = self.pool.lock();
             if let Some(slot) = pool.proxies.iter_mut().find(|slot| slot.id == entry.id) {
@@ -991,13 +998,16 @@ impl MultiTokenManager {
             }
             pool.publish(key, route);
         }
+        for (key, route) in commit.publish.routes {
+            self.pool.lock().publish(key, route);
+        }
         if let Some(id) = commit.publish.remove {
             self.pool.lock().proxies.retain(|entry| entry.id != id);
         }
 
         if !commit.publish.rebinds.is_empty() {
-            // route 已随 submit 时的 get-or-build 注册进池（或在 upsert 里刚发布），
-            // 这里只取 entries 一把锁，绝不再取 pool——两把锁不嵌套。
+            // route 已在上面（upsert / routes）随写盘成功发布进池，这里只取
+            // entries 一把锁，绝不再取 pool——两把锁不嵌套。
             let mut entries = self.entries.lock();
             for rebind in commit.publish.rebinds {
                 let Some(entry) = entries.iter_mut().find(|entry| entry.id == rebind.id) else {

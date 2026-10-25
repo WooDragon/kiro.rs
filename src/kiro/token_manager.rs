@@ -842,7 +842,10 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
-    /// 是否配置了任何形式的代理（含继承与池绑定）
+    /// 该凭据是否**自己**配了代理覆盖（inline / pool / direct 为 true，
+    /// inherit 为 false）。注意 `direct` 也算 true——这是旧语义，与"实际是否
+    /// 经代理出站"无关，后者看 `effective_proxy_url`。判据是绑定模式，
+    /// 不含继承（继承用的是全局代理，不归该凭据所有）。
     pub has_proxy: bool,
     /// 代理 URL（已脱敏；仅内联/直连时有值）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1041,13 @@ impl ProfileLookupIdentity {
 enum ProfileLookupOutcome {
     Ready,
     IdentityChanged,
+    /// 该凭据的 route 是启动期构建失败的回落（全局代理/系统直连）。
+    ///
+    /// 不复用 `IdentityChanged`：那个变体的语义是"这次 lookup 属于旧的凭据世代，
+    /// 换一把新快照重试"，而这里凭据完全没变——重试会再跑一遍、照样被测所拦，
+    /// 只是把一句错话重复两遍再换一句错的错误类型。`IdentityChanged` 还会让上层
+    /// 把该凭据加入 `selection_excluded_ids` 并静默换号，掩盖真正的配置问题。
+    RouteUnavailable,
 }
 
 /// 统计数据持久化防抖间隔
@@ -2111,6 +2121,15 @@ impl MultiTokenManager {
                     return Ok((Self::request_credentials_snapshot(latest), latest_token));
                 }
                 ProfileLookupOutcome::IdentityChanged => continue,
+                // Major 1（fail-closed）：profile discovery 会用 `entry.route`
+                // 出站。route 是构建失败的回落时，重试没有意义（再跑一遍照样
+                // 被拦），也不该复述"identity changed"——凭据一个字节都没变。
+                ProfileLookupOutcome::RouteUnavailable => {
+                    return Err(anyhow::anyhow!(
+                        "凭据 #{} 的代理配置构建失败，拒绝经回落路由查询 profile",
+                        id
+                    ));
+                }
             }
         }
         Err(ProfileIdentityChangedError.into())
@@ -2152,6 +2171,22 @@ impl MultiTokenManager {
                     .any(|entry| entry.id == id && Arc::ptr_eq(&entry.profile_lookup_lock, &lock))
             {
                 return ProfileLookupOutcome::IdentityChanged;
+            }
+            // Major 1（fail-closed）：与 `refresh_auth_locked` 同一判据——只用
+            // `route_build_failed`，不看 `disabled_reason`。额度耗尽/失败过多/
+            // 手动禁用的凭据 route 是好的，profile discovery 必须照常工作。
+            if self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.route_build_failed)
+            {
+                tracing::debug!(
+                    credential_id = id,
+                    "代理配置构建失败，跳过 profile 查询（不经回落路由出站）"
+                );
+                return ProfileLookupOutcome::RouteUnavailable;
             }
             if current
                 .profile_arn
@@ -2461,6 +2496,28 @@ impl MultiTokenManager {
     pub(crate) fn profile_lookup_requests_for_test(&self) -> usize {
         self.test_profile_lookup_request_count
             .load(Ordering::SeqCst)
+    }
+
+    /// 测试钩子：直接驱动一次 profile discovery，且**不**经过业务选路。
+    ///
+    /// 为什么需要它：`route_build_failed == true` 的凭据在 `build_routes_for_entries`
+    /// 里同时被置为 `InvalidConfig` 禁用，正常 `acquire_context` 根本不会选中它，
+    /// 于是"discovery 会不会经回落路由出站"这条路径在业务入口上不可达——测试
+    /// 会在拦截被删掉时仍然绿（恒绿假象）。这里绕过选路直达被保护的那条路径，
+    /// 前置条件由调用方用快照断言（确实 disabled + `InvalidConfig`）。
+    ///
+    /// 返回 `Err` 表示被拦截（fail-closed 生效），`Ok` 表示真的执行了查询。
+    #[cfg(test)]
+    pub(crate) async fn discover_profile_via_route_for_test(&self, id: u64) -> anyhow::Result<()> {
+        let current = self.credentials_for_id(id)?;
+        let identity = ProfileLookupIdentity::from_credentials(&current);
+        match self.discover_profile_arn(id, identity).await {
+            ProfileLookupOutcome::RouteUnavailable => Err(anyhow::anyhow!(
+                "凭据 #{} 的代理配置构建失败，拒绝经回落路由查询 profile",
+                id
+            )),
+            ProfileLookupOutcome::Ready | ProfileLookupOutcome::IdentityChanged => Ok(()),
+        }
     }
 
     /// 测试钩子：把 usage/balance（getUsageLimits）指向 loopback mock。
@@ -3337,7 +3394,10 @@ impl MultiTokenManager {
             // JSON）。配置确实仍然无效时 `route_build_failed` 仍为 true，I6
             // 的保护不丢。
             if !disabled && entry.config_currently_invalid() {
-                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
+                anyhow::bail!(
+                    "凭据 #{} 因配置无效被禁用，请通过代理绑定修正配置（手改配置文件需重启生效）",
+                    id
+                );
             }
             entry.state_revision = entry.state_revision.wrapping_add(1);
             entry.set_reason(disabled.then_some(DisabledReason::Manual));
@@ -3385,7 +3445,10 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             // 与 `set_disabled` 同一口径（F2）：看运行时事实，不看历史落盘值。
             if entry.config_currently_invalid() {
-                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
+                anyhow::bail!(
+                    "凭据 #{} 因配置无效被禁用，请通过代理绑定修正配置（手改配置文件需重启生效）",
+                    id
+                );
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -3428,6 +3491,14 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在"))?;
             if background.is_some_and(|expected| !expected.matches(entry)) {
                 bail!("过期的余额查询");
+            }
+            // Major 1（fail-closed）：余额查询链路既会做 profile discovery 也会用
+            // `entry.route` 发 getUsageLimits。route 是构建失败的回落时，两条路
+            // 都会把该凭据的秘密送进计划禁止的出口（全局代理/系统直连）。
+            // 判据只用 `route_build_failed`——额度耗尽/失败过多/手动禁用的
+            // 凭据 route 是好的，后台额度恢复必须照常工作。
+            if entry.route_build_failed {
+                bail!("凭据 #{} 的代理配置构建失败，拒绝经回落路由查询余额", id);
             }
             EntryIdentity::of(entry)
         };

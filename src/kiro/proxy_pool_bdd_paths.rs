@@ -97,6 +97,37 @@ fn socks5h_url(proxy: &LocalProxy) -> String {
     proxy.url.replacen("socks5://", "socks5h://", 1)
 }
 
+/// 带全局代理（`config.proxyUrl` 的等价物）的 manager。
+///
+/// 用来构造 Major 1 的场景：专属代理配坏 → `entry.route` 回落成**继承路由**，
+/// 而继承路由在这里就是这条全局代理。于是"经回落路由出站"是可观测的
+/// （夹具看到连接、目标收到请求），而不是只靠 DNS 失败反推。
+fn manager_with_global_proxy(
+    dir: &TempDir,
+    credentials: Vec<KiroCredentials>,
+    global_proxy: &str,
+) -> Arc<MultiTokenManager> {
+    Arc::new(
+        MultiTokenManager::new_with_pool(
+            Config::default(),
+            credentials,
+            Vec::new(),
+            Some(crate::http_client::ProxyConfig::new(socks5h_url_of(
+                global_proxy,
+            ))),
+            Some(dir.path()),
+            true,
+            Arc::new(ModelRegistry::builtin()),
+        )
+        .unwrap(),
+    )
+}
+
+/// 把已构造好的代理 URL 转成 `socks5h://`（保留 host:port）。
+fn socks5h_url_of(url: &str) -> String {
+    url.replacen("socks5://", "socks5h://", 1)
+}
+
 /// 每个路径的目标主机名都不可在本地解析：只有经代理（代理解析 + 重定向到本地
 /// 服务）才可达。
 fn unroutable_host(tag: &str, port: u16) -> String {
@@ -379,6 +410,171 @@ async fn bdd_path_usage_limits_never_fall_back_when_proxy_is_dead() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Major 1 续：余额查询 / profile discovery 同样 fail-closed
+// ─────────────────────────────────────────────────────────────
+
+/// Admin 主动查余额（`get_usage_limits_for`）在代理配置构建失败时**零出站**。
+///
+/// 缺陷形态：`get_usage_limits_inner` 的整条链路（profile discovery +
+/// `route_for_id(id)?.short`）都用 `entry.route` 出站，而构建失败时那是启动期的
+/// 回落路由。后台维护已在 `maintain_entry` 被拦，但 Admin 主动查询绕过它。
+///
+/// 对照臂：正常凭据的同类查询照常经所选代理发出（证明拦的是脏配置而非功能）。
+///
+/// 反事实（已现场验证）：删掉 `get_usage_limits_inner` 的 `route_build_failed`
+/// 拦截，本用例在"回落出口零出站"处红（实际 1）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bdd_major1_usage_query_on_failed_route_is_fail_closed() {
+    let dir = TempDir::new();
+    let target = TargetServer::spawn(USAGE_BODY).await;
+    // 全局代理 = 可达夹具：若拦截失效，回落就从这里出站并被观测到。
+    let fallback_socks = spawn_socks5_redirect(target.addr).await;
+
+    let mut broken = with_profile(social_credential(1, None));
+    broken.proxy_url = Some("://".to_string());
+    let manager = manager_with_global_proxy(&dir, vec![broken], &fallback_socks.url);
+    manager.install_usage_limits_url_for_test(unroutable_host("usage-broken", target.addr.port()));
+    manager.install_profile_lookup_url_for_test(unroutable_host(
+        "usage-broken-profile",
+        target.addr.port(),
+    ));
+
+    // 前置条件：凭据确实处于被构建失败禁用的状态。
+    let snapshot = manager.snapshot();
+    assert!(snapshot.entries[0].disabled, "前置条件：必须已被禁用");
+    assert_eq!(
+        snapshot.entries[0].disabled_reason.as_deref(),
+        Some("InvalidConfig"),
+        "前置条件：禁用原因必须是 InvalidConfig"
+    );
+
+    let error = manager
+        .get_usage_limits_for(1)
+        .await
+        .expect_err("构建失败的代理配置不得查余额");
+    assert!(
+        error.to_string().contains("构建失败"),
+        "错误必须说明拒绝原因: {error}"
+    );
+    assert_eq!(
+        fallback_socks.stats.connections(),
+        0,
+        "不得经回落路由（此处=全局代理）出站"
+    );
+    assert_eq!(target.connections(), 0, "余额服务必须零出站");
+
+    // 对照臂：正常凭据照常经所选代理查询。
+    let dir_ok = TempDir::new();
+    let target_ok = TargetServer::spawn(USAGE_BODY).await;
+    let socks_ok = spawn_socks5_redirect(target_ok.addr).await;
+    let manager_ok = manager_bound_to(
+        &dir_ok,
+        vec![with_profile(social_credential(1, Some("p1")))],
+        &socks5h_url(&socks_ok),
+    );
+    manager_ok
+        .install_usage_limits_url_for_test(unroutable_host("usage-healthy", target_ok.addr.port()));
+    manager_ok
+        .get_usage_limits_for(1)
+        .await
+        .expect("对照臂：正常凭据必须能查余额");
+    assert!(
+        socks_ok.stats.connections() >= 1,
+        "对照臂：查询必须经所选代理出站"
+    );
+    assert!(
+        target_ok.connections() >= 1,
+        "对照臂：余额服务必须收到请求，实际 {}",
+        target_ok.connections()
+    );
+}
+
+/// profile discovery 在代理配置构建失败时不得出站。
+///
+/// 形态：凭据没有 `profile_arn`，因此 discovery **本来会**发请求。
+///
+/// 为什么走 `discover_profile_via_route_for_test` 而不是 `acquire_context`：
+/// `route_build_failed` 的凭据同时被置为 `InvalidConfig` 禁用，业务选路根本
+/// 不会选中它——经业务入口测这条路径，删掉拦截照样绿（恒绿假象，已实测确认）。
+/// 因此这里直达被保护的那条路径，并用快照钉死前置条件（确实 disabled）。
+///
+/// 反事实（已现场验证）：删掉 `discover_profile_arn` 的 `route_build_failed`
+/// 拦截，本用例在 `expect_err` 处红（返回 Ok），且
+/// `profile_lookup_requests_for_test` 从 0 变 1、回落出口 connections 从 0 变 1。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bdd_major1_profile_discovery_on_failed_route_is_fail_closed() {
+    let dir = TempDir::new();
+    let target = TargetServer::spawn(PROFILE_BODY).await;
+    let fallback_socks = spawn_socks5_redirect(target.addr).await;
+
+    let mut broken = social_credential(1, None);
+    broken.profile_arn = None;
+    broken.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+    broken.proxy_url = Some("://".to_string());
+    let manager = manager_with_global_proxy(&dir, vec![broken], &fallback_socks.url);
+    manager
+        .install_profile_lookup_url_for_test(unroutable_host("profile-broken", target.addr.port()));
+
+    // 前置条件：已被禁用（这是"配坏代理"的既有后果），且没有 ARN。
+    let snapshot = manager.snapshot();
+    assert!(snapshot.entries[0].disabled, "前置条件：必须已被禁用");
+    assert_eq!(
+        snapshot.entries[0].disabled_reason.as_deref(),
+        Some("InvalidConfig"),
+        "前置条件：禁用原因必须是 InvalidConfig"
+    );
+
+    let error = manager
+        .discover_profile_via_route_for_test(1)
+        .await
+        .expect_err("构建失败的代理配置不得执行 profile discovery");
+    assert!(
+        error.to_string().contains("构建失败"),
+        "错误必须说明拒绝原因: {error}"
+    );
+    assert_eq!(
+        manager.profile_lookup_requests_for_test(),
+        0,
+        "profile discovery 必须零出站"
+    );
+    assert_eq!(
+        fallback_socks.stats.connections(),
+        0,
+        "不得经回落路由（此处=全局代理）出站"
+    );
+    assert_eq!(target.connections(), 0, "profile 服务必须零出站");
+
+    // 对照臂：正常凭据（无 ARN）照常执行 discovery 并经所选代理出站。
+    let dir_ok = TempDir::new();
+    let target_ok = TargetServer::spawn(PROFILE_BODY).await;
+    let socks_ok = spawn_socks5_redirect(target_ok.addr).await;
+    let mut healthy = social_credential(1, Some("p1"));
+    healthy.profile_arn = None;
+    healthy.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+    let manager_ok = manager_bound_to(&dir_ok, vec![healthy], &socks5h_url(&socks_ok));
+    manager_ok.install_profile_lookup_url_for_test(unroutable_host(
+        "profile-healthy",
+        target_ok.addr.port(),
+    ));
+
+    manager_ok
+        .discover_profile_via_route_for_test(1)
+        .await
+        .expect("对照臂：正常凭据必须照常执行 discovery");
+
+    assert_eq!(
+        manager_ok.profile_lookup_requests_for_test(),
+        1,
+        "对照臂：正常凭据必须真的发出 profile 查询"
+    );
+    assert!(
+        target_ok.connections() >= 1,
+        "对照臂：profile 服务必须收到请求，实际 {}",
+        target_ok.connections()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
 // 后台维护：认证维护 + 额度恢复
 // ─────────────────────────────────────────────────────────────
 
@@ -462,6 +658,162 @@ async fn bdd_path_background_maintenance_never_falls_back_when_proxy_is_dead() {
 
     manager.maintain_once_for_test().await;
     assert_target_silent(&target);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Major 1：构建失败的代理配置必须 fail-closed
+// ─────────────────────────────────────────────────────────────
+
+/// 专属代理配坏（URL 解析不出来）+ token 已过期：后台维护**不得**产生任何出站。
+///
+/// 缺陷形态：`build_routes_for_entries` 把 `entry.route` 回落成继承路由并置
+/// `route_build_failed`，而 `maintain_entry → refresh_auth` 无条件用
+/// `entry.route` 出站——于是配坏代理的凭据照样能从全局代理/系统直连刷新
+/// token，正是计划明令禁止的「回退直连」。I6 只拦住了业务选路。
+///
+/// 对照臂：同一夹具下的正常凭据必须**照常**刷新（证明拦截只认
+/// `route_build_failed`，没误伤正常路径）。
+///
+/// 反事实（已现场验证）：删掉 `maintain_entry` 的 `route_build_failed` 提前
+/// 返回（以及 `refresh_auth_locked` 的同名拦截），本用例在
+/// "目标必须收到 0 个请求"处红（实际 1）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bdd_major1_failed_route_never_refreshes_through_fallback() {
+    let dir = TempDir::new();
+    let target = TargetServer::spawn(SOCIAL_REFRESH_BODY).await;
+    // 全局代理 = 可达夹具。继承路由因此指向它：如果拦截失效，回落就会从这里
+    // 出站并被器具观测到（而不是只靠 DNS 失败反推）。
+    let fallback_socks = spawn_socks5_redirect(target.addr).await;
+
+    // 配坏的内联代理：`://` 连 URL 都解析不出来 → 启动期回落到继承路由。
+    let mut broken = with_profile(social_credential(1, None));
+    broken.proxy_url = Some("://".to_string());
+    // 过期让后台**本来会**去刷新（否则"没刷新"证明不了拦截）。
+    broken.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+
+    let manager = manager_with_global_proxy(&dir, vec![broken], &fallback_socks.url);
+    manager.install_refresh_url_for_test(unroutable_host("maint-broken", target.addr.port()));
+    manager.install_usage_limits_url_for_test(unroutable_host(
+        "maint-broken-usage",
+        target.addr.port(),
+    ));
+
+    // 前置条件：这条凭据确实处于 fail-closed 状态，且 token 确实已过期。
+    let snapshot = manager.snapshot();
+    assert!(
+        snapshot.entries[0].disabled,
+        "前置条件：配坏代理必须在启动期被禁用"
+    );
+    assert_eq!(
+        snapshot.entries[0].disabled_reason.as_deref(),
+        Some("InvalidConfig"),
+        "前置条件：禁用原因必须是 InvalidConfig"
+    );
+    // 前置条件：凭据确实带过期时间，否则"没刷新"可能只是因为压根不需要刷新。
+    // snapshot 不暴露 expires_at，因此这里用换绑前可知的构造事实断言：
+    // 上面那个 expires_at 是当场写死的过去时间，`is_token_expired` 必为真。
+    assert!(
+        manager.route_ptr_for_test(1).is_some(),
+        "前置条件：凭据存在"
+    );
+
+    manager.maintain_once_for_test().await;
+    assert_eq!(
+        fallback_socks.stats.connections(),
+        0,
+        "配坏代理的凭据不得经回落路由（此处=全局代理）出站"
+    );
+    assert_eq!(
+        target.connections(),
+        0,
+        "配坏代理的凭据不得经回落路由（全局代理/系统直连）出站"
+    );
+    // 前置条件：拦截之后凭据仍是 InvalidConfig，没被别的路径改成成功状态。
+    assert_eq!(
+        manager.snapshot().entries[0].disabled_reason.as_deref(),
+        Some("InvalidConfig"),
+        "凭据必须保持 InvalidConfig"
+    );
+
+    // 对照臂：正常凭据的后台维护照常发请求（拦的是脏配置，不是后台维护本身）。
+    // 目标主机名只有经 SOCKS 夹具才可达，因此对照臂必须真的绑定一个可用代理——
+    // 否则"0 请求"可能只是 DNS 解析失败，证明不了任何事。
+    let dir_ok = TempDir::new();
+    let target_ok = TargetServer::spawn(SOCIAL_REFRESH_BODY).await;
+    let socks_ok = spawn_socks5_redirect(target_ok.addr).await;
+    let mut healthy = with_profile(social_credential(1, Some("p1")));
+    healthy.expires_at = Some((chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339());
+    let manager_ok = manager_bound_to(&dir_ok, vec![healthy], &socks5h_url(&socks_ok));
+    manager_ok
+        .install_refresh_url_for_test(unroutable_host("maint-healthy", target_ok.addr.port()));
+    assert!(
+        !manager_ok.snapshot().entries[0].disabled,
+        "前置条件：对照臂的凭据必须可用"
+    );
+    manager_ok.maintain_once_for_test().await;
+    assert!(
+        socks_ok.stats.connections() >= 1,
+        "对照臂：后台维护必须经所选代理出站"
+    );
+    assert!(
+        target_ok.connections() >= 1,
+        "对照臂：正常凭据的后台维护必须照常出站，实际 {}",
+        target_ok.connections()
+    );
+}
+
+/// 强制刷新同样 fail-closed：构建失败时不得经回落路由出站。
+///
+/// 反事实（已现场验证）：删掉 `refresh_auth_locked` 的 `route_build_failed`
+/// 拦截，本用例在 `expect_err` 处红（刷新成功，目标收到 1 个请求）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bdd_major1_forced_refresh_on_failed_route_is_rejected() {
+    let dir = TempDir::new();
+    let target = TargetServer::spawn(SOCIAL_REFRESH_BODY).await;
+    let mut broken = with_profile(social_credential(1, None));
+    broken.proxy_url = Some("://".to_string());
+    broken.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+    let manager = manager_with(&dir, vec![broken], vec![]);
+    manager.install_refresh_url_for_test(unroutable_host("force-broken", target.addr.port()));
+
+    let error = manager
+        .force_refresh_token_for(1)
+        .await
+        .expect_err("构建失败的代理配置不得强制刷新");
+    assert!(
+        error.to_string().contains("构建失败"),
+        "错误必须说明拒绝原因: {error}"
+    );
+    assert_eq!(target.connections(), 0, "拒绝时必须零出站");
+}
+
+/// 其它禁用原因（额度耗尽/失败过多）不属于 fail-closed 范围：刷新照旧工作。
+///
+/// 这条钉死"别误伤"：判据只能是 `route_build_failed`，不能是
+/// `disabled_reason.is_some()`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bdd_major1_quota_disabled_credential_still_refreshes() {
+    let dir = TempDir::new();
+    let target = TargetServer::spawn(SOCIAL_REFRESH_BODY).await;
+    // 目标主机名只有经 SOCKS 夹具才可达：出站为 0 与"没有可解析出口"必须能区分。
+    let socks = spawn_socks5_redirect(target.addr).await;
+    let mut credential = with_profile(social_credential(1, Some("p1")));
+    credential.expires_at = Some((chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339());
+    let manager = manager_bound_to(&dir, vec![credential], &socks5h_url(&socks));
+    manager.install_refresh_url_for_test(unroutable_host("quota-ok", target.addr.port()));
+
+    manager.report_quota_exhausted(1);
+    assert_eq!(
+        manager.snapshot().entries[0].disabled_reason.as_deref(),
+        Some("QuotaExceeded"),
+        "前置条件：必须先真的被额度禁用"
+    );
+
+    manager.maintain_once_for_test().await;
+    assert!(
+        target.connections() >= 1,
+        "额度禁用与代理配置无关，后台刷新必须照常出站"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────

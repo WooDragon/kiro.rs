@@ -1345,8 +1345,13 @@ fn bdd_secrets_are_redacted_everywhere() {
     assert!(!debug.contains("pw2"), "Debug 不得含认证密码: {debug}");
     assert!(debug.contains("has_password: true"), "实际 Debug: {debug}");
     assert!(!debug.contains("alice"), "Debug 不得含内联用户名: {debug}");
+    // Minor 5：认证用户名同样是秘密材料，`proxy_pool.rs` 的构建失败告警会
+    // 把整个 key（含 `ProxyConfig`）打进日志，这里必须脱敏成布尔。
+    assert!(!debug.contains("bob"), "Debug 不得含认证用户名: {debug}");
+    assert!(debug.contains("has_username: true"), "实际 Debug: {debug}");
     let without = format!("{:?}", ProxyConfig::new("http://proxy.example:3128"));
     assert!(without.contains("has_password: false"));
+    assert!(without.contains("has_username: false"));
 
     let redacted = redact_proxy_url("http://alice:s3cret@proxy.example:3128/?token=abc#frag");
     assert!(!redacted.contains("alice"));
@@ -2054,6 +2059,79 @@ async fn bdd_i3_bind_write_failure_keeps_binding_and_route() {
     );
 }
 
+/// Minor 3：`update_proxy` / `bind` 写盘失败时，注册表里不得留下新网络身份的
+/// client。
+///
+/// 缺陷形态：事务构造阶段就 `pool.publish`，写盘失败后注册表残留一个带新代理
+/// （含密码）的 client，池里却没有任何条目引用它——要等下一次成功写触发的
+/// prune 才收。`create_proxy` 是写盘后才发布的，这里对齐它。
+///
+/// 前置条件断言：失败注入点确实在写盘（返回的是 Storage 错误），且失败之后
+/// 原池条目 / 原绑定仍然可用（不是把整个 manager 写坏了）。
+///
+/// 反事实（已现场验证）：把 update/bind 的 `pool.publish` 挪回事务构造阶段，
+/// 两条断言各自在 `probe(...) is None` 处红。
+#[tokio::test]
+async fn bdd_minor3_failed_write_publishes_no_route() {
+    let dir = TempDir::new();
+    let target = H2TargetServer::spawn().await;
+    let socks_a = spawn_socks5_redirect(target.addr).await;
+    let socks_b = spawn_socks5_redirect(target.addr).await;
+    let socks_c = spawn_socks5_redirect(target.addr).await;
+
+    let mut cred = api_key_credential(1);
+    cred.proxy_id = Some("a".into());
+    let manager = manager(&dir, vec![cred], vec![pool_entry("a", &socks_a.url)]);
+
+    let key_b = RouteKey::Proxy(ProxyConfig::new(&socks_b.url));
+    let key_c = RouteKey::Proxy(ProxyConfig::new(&socks_c.url));
+    // 前置条件：这两个身份此刻都还不在注册表里。
+    assert!(manager.registered_route_for_test(&key_b).is_none());
+    assert!(manager.registered_route_for_test(&key_c).is_none());
+
+    // 让后续写盘必然失败（目录换成文件，rename 与原地写都失败）。
+    std::fs::remove_file(dir.path()).unwrap();
+    std::fs::create_dir(dir.path()).unwrap();
+    std::fs::write(dir.path().join("blocker"), b"x").unwrap();
+
+    let error = manager
+        .update_proxy(
+            "a",
+            ProxyUpdateRequest {
+                url: Some(Some(socks_b.url.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("写盘必然失败");
+    assert!(error.to_string().contains("回写凭据文件失败"), "{error}");
+    assert!(
+        manager.registered_route_for_test(&key_b).is_none(),
+        "update_proxy 写盘失败后注册表不得残留新代理的 client"
+    );
+
+    let error = manager
+        .bind_credential_proxy(
+            1,
+            ProxyBindingRequest::Inline {
+                url: socks_c.url.clone(),
+                username: None,
+                password: None,
+            },
+        )
+        .await
+        .expect_err("写盘必然失败");
+    assert!(error.to_string().contains("回写凭据文件失败"), "{error}");
+    assert!(
+        manager.registered_route_for_test(&key_c).is_none(),
+        "bind 写盘失败后注册表不得残留新内联代理的 client"
+    );
+
+    // 前置条件：失败没有破坏既有状态——原池条目仍在，绑定仍是原来的池条目。
+    assert_eq!(manager.list_proxies().len(), 1);
+    assert_eq!(manager.snapshot().entries[0].proxy_mode, "pool");
+}
+
 // ─────────────────────────────────────────────────────────────
 // I4：新增凭据的验证刷新必须经所选代理
 // ─────────────────────────────────────────────────────────────
@@ -2225,6 +2303,15 @@ async fn bdd_i6_set_disabled_false_rejects_invalid_config_credential() {
         .set_disabled(1, false)
         .expect_err("InvalidConfig 凭据不得被启用");
     assert!(error.to_string().contains("配置无效"), "{error}");
+    // Minor 9：文案不能要求重启——改绑成功即可恢复，只有手改文件才需要重启。
+    assert!(
+        !error.to_string().contains("请修正配置后重启服务"),
+        "文案不得笼统要求重启: {error}"
+    );
+    assert!(
+        error.to_string().contains("通过代理绑定修正配置"),
+        "文案必须指出可恢复的路径: {error}"
+    );
     assert!(
         manager.snapshot().entries[0].disabled,
         "拒绝启用后必须保持禁用"
@@ -2892,7 +2979,7 @@ async fn bdd_f1_bind_unregistered_key_builds_zero_routes_inside_save_lock() {
 ///
 /// 反事实（已现场验证）：把 `set_disabled` 的拦截判据改回
 /// `entry.disabled_reason == Some(InvalidConfig)`（并让 bind 不清 reason），
-/// 本用例在"改绑后必须能启用"处红：`凭据 #1 因配置无效被禁用，请修正配置后重启服务`。
+/// 本用例在"改绑后必须能启用"处红：`凭据 #1 因配置无效被禁用，请通过代理绑定修正配置（手改配置文件需重启生效）`。
 /// F2 用：可刷新的 social 凭据 + 旧内联代理 URL。
 fn social_credential_with_inline(url: &str) -> KiroCredentials {
     KiroCredentials {
@@ -3136,6 +3223,58 @@ async fn bdd_f3_new_inline_binding_without_scheme_is_rejected() {
             crate::kiro::token_manager::ProxyPoolError::Invalid(_)
         ),
         "{error:?}"
+    );
+}
+
+/// 新写入的内联代理走池 URL 的严格规则：带 userinfo 的 URL 必须被拒。
+///
+/// 缺陷形态（Minor 4）：内联只查 scheme + 认证成对，于是
+/// `http://user:pw@host:port` 能写进 `proxyUrl`——秘密原文落盘，且与独立
+/// username/password 一起用时会双重认证。
+///
+/// 前置条件断言：被拒绝后凭据仍处于绑定前状态、磁盘字节不变；`set_disabled`
+/// 也拦不住的那条路径（新增内联）同样被拒。
+///
+/// 反事实（已现场验证）：把 `inline_proxy_config` 的校验换回
+/// `validate_proxy_scheme`，本条在 `expect_err` 处红（绑定成功）。
+#[tokio::test]
+async fn bdd_minor4_inline_userinfo_is_rejected_by_bind() {
+    let dir = TempDir::new();
+    let manager = manager(&dir, vec![api_key_credential(1)], Vec::new());
+    let before = manager.snapshot().entries[0].proxy_mode.clone();
+
+    for url in [
+        "http://user:pass@proxy.example:3128",
+        "http://user@proxy.example:3128",
+        "http://proxy.example:3128/?x=1",
+        "http://proxy.example:3128/#f",
+        "http://proxy.example:3128/path",
+    ] {
+        let error = manager
+            .bind_credential_proxy(
+                1,
+                ProxyBindingRequest::Inline {
+                    url: url.into(),
+                    username: None,
+                    password: None,
+                },
+            )
+            .await
+            .expect_err("带 userinfo/query/fragment/path 的内联 URL 必须被拒");
+        assert!(
+            matches!(
+                error,
+                crate::kiro::token_manager::ProxyPoolError::Invalid(_)
+            ),
+            "{url}: {error:?}"
+        );
+    }
+
+    // 前置条件：被拒之后绑定字段没被动过。
+    assert_eq!(
+        manager.snapshot().entries[0].proxy_mode,
+        before,
+        "拒绝时不得改动绑定"
     );
 }
 

@@ -16,23 +16,64 @@
 //! tmp 文件在**创建时**就收紧到 0600（unix），而不是写完再 `set_permissions`：
 //! 凭据文件含 refreshToken / clientSecret / 代理密码，先 `File::create` 再收紧
 //! 会让这些秘密在窗口期内以 umask 权限（通常 0644）存在于磁盘上，崩溃时还会
-//! 残留。目标文件已存在时，rename 之前把原权限复制到 tmp，保持现有行为。
+//! 残留。原文件的权限在 **rename 之后**才复制到最终路径——rename 之前就把 tmp
+//! 放宽回 0644，等于把秘密暴露在"已写好、还没换上去"的窗口里。
+//!
+//! # 符号链接
+//!
+//! 目标是符号链接时先解析到真实目标，再在真实目标所在目录做 tmp + rename。
+//! 这样成功路径（rename）与失败回退路径（`fs::write`）语义一致——都更新真实
+//! 目标、都保留链接本身；否则 rename 会把目录项里的链接替换成普通文件，真实
+//! 目标反而永远不更新。
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 新建 tmp 文件时的权限：只有属主可读写。
 #[cfg(unix)]
 const TMP_FILE_MODE: u32 = 0o600;
 
+/// 解析真实写入目标：目标是符号链接时返回它指向的真实路径。
+///
+/// 成功路径是 rename（替换目录项），失败回退路径是 `fs::write`（跟随链接）。
+/// 不先解析的话，两条路径语义相反：rename 会把链接换成一个普通文件，链接
+/// 指向的真实目标永远不更新。解析之后两者都写真实目标、都保留链接本身。
+///
+/// 悬空链接（目标文件不存在）时 `canonicalize` 会失败，此时按 POSIX 语义
+/// 把链接的相对目标解析到链接所在目录——写入要么落在链接真正指向的位置，
+/// 要么因为该位置不可写而失败，绝不静默把链接替换成普通文件。
+fn resolve_write_target(path: &Path) -> PathBuf {
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return path.to_path_buf();
+    }
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match std::fs::read_link(path) {
+        Ok(link) if link.is_absolute() => link,
+        Ok(link) => match path.parent() {
+            Some(dir) => dir.join(link),
+            None => link,
+        },
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// 原子写入 `bytes` 到 `path`。
 ///
 /// - tmp 与目标同目录：生产在 Docker 里跑，目录可能是独立挂载卷，
 ///   用系统临时目录会跨设备 rename 失败（EXDEV），把"偶发写坏"变成"永远写不了"。
-/// - tmp 创建即 0600；目标已存在时复制其权限（保留原权限）。
+/// - tmp 创建即 0600，且**保持** 0600 直到 rename 完成；原文件权限在 rename
+///   之后才复制到最终路径（见模块文档的权限一节）。
+/// - `path` 是符号链接时写到它指向的真实目标（见 [`resolve_write_target`]）。
 /// - rename 失败（如单文件 bind mount 不允许替换目录项）时退回原地写并告警，
 ///   保证不劣于改动前。
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let target = resolve_write_target(path);
+    let path = target.as_path();
     let tmp_path = path.with_extension("json.tmp");
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
 
@@ -51,9 +92,6 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         #[cfg(test)]
         test_hooks::on_tmp_created(&tmp_path);
         file.write_all(bytes)?;
-        if let Some(permissions) = permissions {
-            std::fs::set_permissions(&tmp_path, permissions)?;
-        }
         file.flush()
     })();
 
@@ -82,7 +120,22 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
 
     match rename_tmp(&tmp_path, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // 权限在 rename **之后**才放宽回原模式：rename 之前就把含秘密的
+            // tmp 设成 0644，等于让窗口期内的内容全局可读（Minor 6）。
+            if let Some(permissions) = permissions
+                && let Err(error) = std::fs::set_permissions(path, permissions)
+            {
+                // 内容已经落盘，这里失败只影响权限保真；tmp 仍是 0600，
+                // 比"悄悄放宽权限"更接近调用方的期望。
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "写入完成但恢复原文件权限失败，文件保持 0600"
+                );
+            }
+            Ok(())
+        }
         Err(rename_error) => {
             tracing::warn!(
                 path = %path.display(),
@@ -133,6 +186,8 @@ fn rename_tmp(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
     if let Some(error) = test_faults::fail_rename() {
         return Err(error);
     }
+    #[cfg(test)]
+    test_hooks::on_before_rename(tmp_path);
     std::fs::rename(tmp_path, path)
 }
 
@@ -267,6 +322,33 @@ mod test_hooks {
         f(map)
     }
 
+    pub(super) fn on_before_rename(tmp_path: &Path) {
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(tmp_path) {
+            use std::os::unix::fs::PermissionsExt;
+            with_observed(|map| {
+                map.insert(rename_key(tmp_path), meta.permissions().mode() & 0o777);
+            });
+        }
+        #[cfg(not(unix))]
+        with_observed(|map| {
+            map.insert(rename_key(tmp_path), 0);
+        });
+    }
+
+    /// rename 时刻观测值与创建时刻观测值分开存：同一 tmp 路径要能同时被
+    /// 两条断言读到（Minor 6 要证明"创建即 0600 且到 rename 时仍是 0600"）。
+    fn rename_key(tmp_path: &Path) -> PathBuf {
+        let mut key = tmp_path.to_path_buf();
+        key.as_mut_os_string().push("::pre-rename");
+        key
+    }
+
+    /// 取出并清空某条 tmp 路径在 rename 时刻的权限（Minor 6 观测点）。
+    pub(super) fn take_pre_rename(tmp_path: &Path) -> Option<u32> {
+        with_observed(|map| map.remove(&rename_key(tmp_path)))
+    }
+
     pub(super) fn on_tmp_created(tmp_path: &Path) {
         #[cfg(unix)]
         if let Ok(meta) = std::fs::metadata(tmp_path) {
@@ -290,6 +372,9 @@ mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 生产路径的 `PermissionsExt` 已经是 `#[cfg(unix)]`；测试侧必须同口径，
+    // 否则非 unix 目标上整个测试模块都编译不过。
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir() -> std::path::PathBuf {
@@ -309,6 +394,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn preserves_existing_permissions() {
         let dir = temp_dir();
@@ -399,6 +485,104 @@ mod tests {
         write_atomically(&path, b"new").unwrap();
         let mode = test_hooks::take_observed(&tmp_path).expect("必须观测到 tmp 创建时刻");
         assert_eq!(mode, 0o600, "残留 tmp 在写入秘密之前必须被收紧");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 目标是符号链接：写入必须落在**真实目标**上，链接本身保留。
+    ///
+    /// 缺陷形态：`fs::metadata` 跟随链接拿到"原权限"，随后 rename 替换的是
+    /// 目录项里的链接本身——真目标永远拿不到新内容，而失败回退路径的
+    /// `fs::write` 却跟随链接写。两条路径语义相反。
+    ///
+    /// 前置条件断言：`symlink_metadata` 确认目标确实还是符号链接（而不是
+    /// 用例建错了），且中间文件确实是普通文件（否则"没被替换"是废话）。
+    ///
+    /// 反事实（已现场验证）：把 `write_atomically` 的目标改回未解析的 `path`
+    /// （即还原 rename 覆盖链接），本条在"目标内容必须更新"处红
+    /// （实际 `old`），且 `symlink_metadata` 变成普通文件。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_is_written_through_not_replaced() {
+        let dir = temp_dir();
+        let real = dir.join("real-credentials.json");
+        std::fs::write(&real, b"old").unwrap();
+        let link = dir.join("credentials.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // 前置条件：链接确实是链接，真目标确实是普通文件。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "前置条件：credentials.json 必须真的是符号链接"
+        );
+        assert!(std::fs::symlink_metadata(&real).unwrap().is_file());
+
+        write_atomically(&link, b"new").unwrap();
+
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"new",
+            "写入必须落在符号链接指向的真实目标上"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "链接必须仍是链接，不能被 rename 换成普通文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 目标是符号链接时，真实目标不是 0o600 也不能被悄悄放宽/收紧。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_keeps_real_target_permissions() {
+        let dir = temp_dir();
+        let real = dir.join("real-credentials.json");
+        std::fs::write(&real, b"old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("credentials.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, b"new").unwrap();
+
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "必须沿用真实目标的原权限");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 原文件 0644 时，tmp 在整个窗口期（含 rename 前一刻）必须是 0600，
+    /// 权限只在 rename 之后才落到最终路径。
+    ///
+    /// 缺陷形态：写完就 `set_permissions(tmp, 原权限)`，再 rename——含秘密的
+    /// tmp 在替换前有一段全局可读的窗口。
+    ///
+    /// 观测点由 `test_hooks::on_before_rename` 在 rename 调用前抓取，不靠 sleep。
+    ///
+    /// 反事实（已现场验证）：把 `set_permissions(tmp_path, ..)` 挪回 rename
+    /// 之前，本条在"rename 前 tmp 必须仍是 0600"处红（实际 0644）。
+    #[cfg(unix)]
+    #[test]
+    fn tmp_stays_owner_only_until_rename() {
+        let dir = temp_dir();
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let _ = test_hooks::take_pre_rename(&tmp_path);
+
+        write_atomically(&path, b"new").unwrap();
+
+        assert_eq!(
+            test_hooks::take_pre_rename(&tmp_path),
+            Some(0o600),
+            "rename 之前含秘密的 tmp 必须仍是 0600"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "rename 之后最终路径才恢复原权限");
         std::fs::remove_dir_all(&dir).ok();
     }
 
