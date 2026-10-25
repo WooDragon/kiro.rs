@@ -24,7 +24,9 @@
 //! 目标是符号链接时先解析到真实目标，再在真实目标所在目录做 tmp + rename。
 //! 这样成功路径（rename）与失败回退路径（`fs::write`）语义一致——都更新真实
 //! 目标、都保留链接本身；否则 rename 会把目录项里的链接替换成普通文件，真实
-//! 目标反而永远不更新。
+//! 目标反而永远不更新。解析是**逐跳走完整条链**的：多跳链、相对目标、悬空链
+//! 都落在链尾那个真实路径上，沿途链接一个都不动；链成环或无法读取则整体失败，
+//! 不存在"写回链接本身"的退路。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,33 +35,57 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 const TMP_FILE_MODE: u32 = 0o600;
 
-/// 解析真实写入目标：目标是符号链接时返回它指向的真实路径。
+/// 解析符号链接时允许的最大跳数。
+///
+/// 与 Linux 内核的 `MAXSYMLINKS` 同值：超过它就说明链上成环或者部署形态异常，
+/// 继续走只会无限循环。超限按失败处理，绝不退回原始路径。
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// 解析真实写入目标：沿符号链接逐跳走到一个**非符号链接**的路径。
 ///
 /// 成功路径是 rename（替换目录项），失败回退路径是 `fs::write`（跟随链接）。
 /// 不先解析的话，两条路径语义相反：rename 会把链接换成一个普通文件，链接
 /// 指向的真实目标永远不更新。解析之后两者都写真实目标、都保留链接本身。
 ///
-/// 悬空链接（目标文件不存在）时 `canonicalize` 会失败，此时按 POSIX 语义
-/// 把链接的相对目标解析到链接所在目录——写入要么落在链接真正指向的位置，
-/// 要么因为该位置不可写而失败，绝不静默把链接替换成普通文件。
-fn resolve_write_target(path: &Path) -> PathBuf {
-    let is_symlink = std::fs::symlink_metadata(path)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false);
-    if !is_symlink {
-        return path.to_path_buf();
+/// 不能用 `canonicalize`：它要求路径上每个分量都存在，悬空链与成环都会失败，
+/// 失败后再只看一跳就只解了链条的第一环——外层仍是链接，中间那环被 rename
+/// 换成普通文件，真目标拿不到内容。因此这里自己逐跳走：
+///
+/// - 每跳用 `symlink_metadata` 判定（不跟随），是链接就 `read_link`；
+/// - 相对目标按 POSIX 语义拼到**链接所在目录**，绝对目标直接采用；
+/// - 直到当前路径不是链接——悬空链的最后一跳就是一个尚不存在的普通路径，
+///   由随后的 rename 创建它，沿途链接全部保留；
+/// - 成环或超过 [`MAX_SYMLINK_HOPS`]、以及任何一次 `symlink_metadata` /
+///   `read_link` 失败，都返回 `Err`。**绝不退回调用方给的 `path`**：那等于
+///   rename 直接覆盖链接本身，正是本函数要消灭的缺陷。
+fn resolve_write_target(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            Ok(_) => return Ok(current),
+            // 链尾指向还不存在的路径：这正是「悬空链接」要写入的位置。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "无法判定写入目标是否为符号链接: {}",
+                    current.display()
+                )));
+            }
+        }
+        let link = std::fs::read_link(&current).map_err(|error| {
+            anyhow::Error::new(error).context(format!("读取符号链接失败: {}", current.display()))
+        })?;
+        current = if link.is_absolute() {
+            link
+        } else {
+            current.parent().unwrap_or(Path::new("")).join(link)
+        };
     }
-    if let Ok(resolved) = std::fs::canonicalize(path) {
-        return resolved;
-    }
-    match std::fs::read_link(path) {
-        Ok(link) if link.is_absolute() => link,
-        Ok(link) => match path.parent() {
-            Some(dir) => dir.join(link),
-            None => link,
-        },
-        Err(_) => path.to_path_buf(),
-    }
+    anyhow::bail!(
+        "符号链接解析超过 {MAX_SYMLINK_HOPS} 跳（疑似成环），拒绝写入: {}",
+        path.display()
+    )
 }
 
 /// 原子写入 `bytes` 到 `path`。
@@ -69,10 +95,12 @@ fn resolve_write_target(path: &Path) -> PathBuf {
 /// - tmp 创建即 0600，且**保持** 0600 直到 rename 完成；原文件权限在 rename
 ///   之后才复制到最终路径（见模块文档的权限一节）。
 /// - `path` 是符号链接时写到它指向的真实目标（见 [`resolve_write_target`]）。
+///   解析失败（成环 / 读取链接失败）直接上抛：此时没有任何安全写法，退回原地
+///   写会经 `fs::write` 跟随链接，和成功路径的语义也不一致。
 /// - rename 失败（如单文件 bind mount 不允许替换目录项）时退回原地写并告警，
 ///   保证不劣于改动前。
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let target = resolve_write_target(path);
+    let target = resolve_write_target(path)?;
     let path = target.as_path();
     let tmp_path = path.with_extension("json.tmp");
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
@@ -551,6 +579,129 @@ mod tests {
 
         let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "必须沿用真实目标的原权限");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 多跳链接链、链尾文件还不存在：写入必须落在链尾，沿途每一跳都保留为链接。
+    ///
+    /// 缺陷形态（单跳解析）：`canonicalize` 因为链尾缺失而失败，随后只 `read_link`
+    /// 第一跳，rename 把**第二跳**换成了普通文件——A 还在指向 B，B 已不是链接，
+    /// C 永远拿不到内容。
+    ///
+    /// 前置条件断言：A、B 确实是链接且指向下一跳，C 确实不存在（否则"写到链尾"
+    /// 与"写到 B"无法区分）。
+    ///
+    /// 反事实（已现场验证）：单跳版本下本用例红在"链上中间那跳必须仍是链接"
+    /// （实际 B 变普通文件、C 不存在）。
+    #[cfg(unix)]
+    #[test]
+    fn multi_hop_symlink_chain_creates_missing_final_target() {
+        let dir = temp_dir();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        let c = dir.join("c.json");
+        std::os::unix::fs::symlink("b.json", &a).unwrap();
+        std::os::unix::fs::symlink("c.json", &b).unwrap();
+
+        // 前置条件：两跳都是链接，链尾不存在。
+        assert!(std::fs::symlink_metadata(&a).unwrap().is_symlink());
+        assert!(std::fs::symlink_metadata(&b).unwrap().is_symlink());
+        assert!(!c.exists(), "前置条件：链尾 c.json 必须不存在");
+
+        write_atomically(&a, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&a).unwrap().is_symlink(),
+            "第一跳必须仍是链接"
+        );
+        assert!(
+            std::fs::symlink_metadata(&b).unwrap().is_symlink(),
+            "链上中间那跳必须仍是链接，不能被 rename 换成普通文件"
+        );
+        assert_eq!(
+            std::fs::read(&c).unwrap(),
+            b"new",
+            "写入必须落在链尾那个原本不存在的路径上"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 链接成环必须整体失败，且两条链接都不能被替换成普通文件。
+    ///
+    /// 缺陷形态（单跳解析）：`canonicalize` 因 ELOOP 失败，`read_link` 拿到对方
+    /// 名字后直接当成目标，rename 把其中一环替换成普通文件——环被"解开"成
+    /// 一个内容正确但结构已破坏的部署。
+    ///
+    /// 前置条件断言：A、B 互为链接（不是用例建成了普通文件）。
+    ///
+    /// 反事实（已现场验证）：单跳版本下本用例红在 `expect_err` 处
+    /// （实际返回 Ok，B 被写成普通文件）。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycle_is_rejected_and_leaves_links_intact() {
+        let dir = temp_dir();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::os::unix::fs::symlink("b.json", &a).unwrap();
+        std::os::unix::fs::symlink("a.json", &b).unwrap();
+
+        // 前置条件：两条互为链接。
+        assert_eq!(std::fs::read_link(&a).unwrap(), PathBuf::from("b.json"));
+        assert_eq!(std::fs::read_link(&b).unwrap(), PathBuf::from("a.json"));
+
+        let error = write_atomically(&a, b"new").expect_err("成环必须返回错误");
+
+        assert!(
+            error.to_string().contains("疑似成环"),
+            "错误必须说明是不可解析的链接链: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&a).unwrap().is_symlink(),
+            "解析失败不得改动 A"
+        );
+        assert!(
+            std::fs::symlink_metadata(&b).unwrap().is_symlink(),
+            "解析失败不得把 B 换成普通文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 相对目标的链接：相对的是**链接所在目录**，不是进程 cwd。
+    ///
+    /// 前置条件断言：A 在子目录里、目标确实不存在。
+    ///
+    /// 本用例在单跳版本下**同样通过**（旧代码的 `parent().join` 对单跳相对目标
+    /// 本来就是对的方向），它锁的是"未来谁把解析改成相对 cwd / 直接 `join` 而不
+    /// 看链接目录"这条回归；真正的缺陷边界由上面两条多跳/成环用例钉住。
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_resolves_against_its_own_directory() {
+        let dir = temp_dir();
+        let subdir = dir.join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let a = subdir.join("a.json");
+        let target = dir.join("target.txt");
+        std::os::unix::fs::symlink("../target.txt", &a).unwrap();
+
+        // 前置条件：链接存在且指向一条还不存在的路径。
+        assert!(std::fs::symlink_metadata(&a).unwrap().is_symlink());
+        assert!(!target.exists(), "前置条件：target.txt 必须不存在");
+
+        write_atomically(&a, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&a).unwrap().is_symlink(),
+            "链接必须仍是链接"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"new",
+            "相对目标必须按链接所在目录解析到上级目录"
+        );
+        assert!(
+            !subdir.join("target.txt").exists(),
+            "不得把相对目标误当成链接所在目录内的同名文件"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
