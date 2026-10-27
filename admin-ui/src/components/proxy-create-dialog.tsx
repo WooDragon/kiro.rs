@@ -21,7 +21,7 @@ import { PROXY_PROTOCOLS, type CreateProxyRequest } from '@/types/proxy'
 
 /** 封套升级提示：只在池为空、创建第一个代理时展示 */
 export const ENVELOPE_NOTICE =
-  '使用代理池后，凭据文件会升级为新格式；新版程序仍可读取旧格式，但旧版本程序与直接解析凭据文件的外部脚本无法读取新格式。删光代理池与所有绑定后会自动回到数组格式。'
+  '使用代理列表后，凭据文件会升级为新格式；新版程序仍可读取旧格式，但旧版本程序与直接解析凭据文件的外部脚本无法读取新格式。删光代理列表与所有绑定后会自动回到数组格式。'
 
 interface ProxyCreateDialogProps {
   open: boolean
@@ -100,6 +100,7 @@ export function ProxyCreateDialog({
           <DialogTitle>新增代理</DialogTitle>
           <DialogDescription>
             地址只填主机与端口；认证信息走独立字段。
+            添加后不会自动应用，需要在凭据中选择该代理。
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">

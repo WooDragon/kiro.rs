@@ -17,7 +17,11 @@ function renderDialog() {
 
 async function postBody() {
   await waitFor(() => expect(server.find('POST', '/credentials')).toHaveLength(1))
-  return server.find('POST', '/credentials')[0].body as Record<string, unknown>
+  const body = server.find('POST', '/credentials')[0].body as Record<string, unknown>
+  for (const field of ['proxyUrl', 'proxyUsername', 'proxyPassword']) {
+    expect(body).not.toHaveProperty(field)
+  }
+  return body
 }
 
 function preloadProxies() {
@@ -61,8 +65,8 @@ describe('新增凭据：代理绑定新写法', () => {
 
     await fillApiKey(user)
     await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
-    await waitFor(() => expect(screen.getByLabelText('选择池代理')).toBeInTheDocument())
-    await user.selectOptions(screen.getByLabelText('选择池代理'), 'p1')
+    await waitFor(() => expect(screen.getByLabelText('选择指定代理')).toBeInTheDocument())
+    await user.selectOptions(screen.getByLabelText('选择指定代理'), 'p1')
     await user.click(screen.getByRole('button', { name: '添加' }))
 
     const body = await postBody()
@@ -148,4 +152,51 @@ describe('新增凭据：代理绑定新写法', () => {
     release?.()
     await waitFor(() => expect(server.find('POST', '/credentials')).toHaveLength(1))
   })
+})
+
+it('未选指定代理拒绝新增并保留认证输入', async () => {
+  preloadProxies()
+  const user = userEvent.setup()
+  renderDialog()
+  await fillApiKey(user)
+  await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
+  expect(screen.getByText('从代理列表选择一条代理，仅作用于本凭据')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: '添加' }))
+  expect(await screen.findByText('请从代理列表选择一条代理')).toBeInTheDocument()
+  expect(server.find('POST', '/credentials')).toHaveLength(0)
+  expect(screen.getByLabelText(/Kiro API Key/)).toHaveValue('ksk_test')
+})
+
+it('模式名称、顺序与空列表说明不暗示自动分配', async () => {
+  server = installMockServer(() => ({ data: { proxies: [] } }))
+  const user = userEvent.setup()
+  renderDialog()
+  const select = screen.getByLabelText('代理来源') as HTMLSelectElement
+  expect(Array.from(select.options, (option) => [option.value, option.text])).toEqual([
+    ['inherit', '使用全局代理配置'], ['direct', '明确直连'],
+    ['pool', '使用指定代理'], ['inline', '高级：内联地址'],
+  ])
+  await user.selectOptions(select, 'pool')
+  expect(await screen.findByText('代理列表为空，请先在“代理列表”中新增条目')).toBeInTheDocument()
+  expect(screen.getByText('从代理列表选择一条代理，仅作用于本凭据')).toBeInTheDocument()
+})
+
+it('新增失败保留内联地址、认证原文及凭据输入', async () => {
+  server = installMockServer((request) => request.method === 'GET'
+    ? { data: { proxies: [] } }
+    : { status: 400, data: { error: { message: '保存失败' } } })
+  const user = userEvent.setup()
+  renderDialog()
+  await fillApiKey(user)
+  await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+  await user.type(screen.getByLabelText('内联代理地址'), 'http://draft:8080')
+  await user.type(screen.getByLabelText('内联代理用户名'), ' user ')
+  await user.type(screen.getByLabelText('内联代理密码'), ' password ')
+  await user.click(screen.getByRole('button', { name: '添加' }))
+  expect(await screen.findByText(/保存失败/)).toBeInTheDocument()
+  expect(screen.getByLabelText('代理来源')).toHaveValue('inline')
+  expect(screen.getByLabelText('内联代理地址')).toHaveValue('http://draft:8080')
+  expect(screen.getByLabelText('内联代理用户名')).toHaveValue(' user ')
+  expect(screen.getByLabelText('内联代理密码')).toHaveValue(' password ')
+  expect(screen.getByLabelText(/Kiro API Key/)).toHaveValue('ksk_test')
 })

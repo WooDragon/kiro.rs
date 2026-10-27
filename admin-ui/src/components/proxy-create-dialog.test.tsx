@@ -55,6 +55,7 @@ describe('新增代理对话框', () => {
       password: undefined,
     })
     expect(server.find('POST', '/proxies')[0].body).not.toHaveProperty('id')
+    expect(server.requests.filter((request) => request.method !== 'GET')).toHaveLength(1)
   })
 
   it('密码逐字发送：含空格不被 trim', async () => {
@@ -132,4 +133,15 @@ describe('新增代理对话框', () => {
 
     await waitFor(() => expect(server.find('POST', '/proxies')).toHaveLength(1))
   })
+})
+
+it.each([true, false])('首条/后续代理 first=%s 均说明不会自动应用，note仅用于升级警告', (first) => {
+  server = installMockServer(() => ({ data: { proxies: [] } }))
+  renderDialog(first)
+  expect(screen.getByText(/添加后不会自动应用，需要在凭据中选择该代理。/)).toBeInTheDocument()
+  expect(screen.queryAllByRole('note')).toHaveLength(first ? 1 : 0)
+  if (first) {
+    expect(screen.getByRole('note')).toHaveTextContent('旧版本程序与直接解析凭据文件的外部脚本无法读取新格式')
+    expect(screen.getByRole('note')).not.toHaveTextContent('代理池')
+  }
 })

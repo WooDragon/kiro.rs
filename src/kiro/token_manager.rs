@@ -877,6 +877,8 @@ pub struct CredentialEntrySnapshot {
 pub struct ManagerSnapshot {
     /// 凭据条目列表
     pub entries: Vec<CredentialEntrySnapshot>,
+    /// 运行时全局代理是否已配置
+    pub global_proxy_configured: bool,
     /// 当前活跃凭据 ID
     pub current_id: u64,
     /// 总凭据数量
@@ -3312,6 +3314,7 @@ impl MultiTokenManager {
         let available = entries.iter().filter(|e| !e.disabled).count();
 
         ManagerSnapshot {
+            global_proxy_configured: self.proxy.is_some(),
             entries: entries
                 .iter()
                 .map(|e| {

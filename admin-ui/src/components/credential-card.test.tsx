@@ -44,11 +44,11 @@ function renderCard(item: CredentialStatusItem) {
 }
 
 describe('凭据卡片的代理来源展示', () => {
-  it('hasProxy=true 但继承无全局代理时，不谎称有代理', () => {
+  it('无实际地址时只显示全局来源，不猜全局状态', () => {
     renderCard(credential({ hasProxy: true, proxyMode: 'inherit' }))
 
     expect(screen.getByTestId('credential-proxy-source')).toHaveTextContent(
-      '代理：继承全局（未配置全局代理）'
+      '代理：使用全局代理配置'
     )
   })
 
@@ -62,7 +62,7 @@ describe('凭据卡片的代理来源展示', () => {
     )
 
     expect(screen.getByTestId('credential-proxy-source')).toHaveTextContent(
-      '继承全局 · http://global-proxy:3128/'
+      '使用全局代理配置 · http://global-proxy:3128/'
     )
   })
 
@@ -78,7 +78,7 @@ describe('凭据卡片的代理来源展示', () => {
     )
 
     const cell = screen.getByTestId('credential-proxy-source')
-    expect(cell).toHaveTextContent('代理池 · 家庭 SOCKS')
+    expect(cell).toHaveTextContent('使用指定代理 · 家庭 SOCKS')
     expect(cell).toHaveTextContent('socks5h://127.0.0.1:1080/')
   })
 
@@ -104,3 +104,16 @@ describe('凭据卡片的代理来源展示', () => {
     expect(screen.getByRole('button', { name: /修改代理/ })).toBeInTheDocument()
   })
 })
+
+ it.each([true, false])('hasProxy=%s 且缺地址不能推断全局配置', (hasProxy) => {
+   renderCard(credential({ hasProxy, proxyMode: 'inherit' }))
+   expect(screen.getByTestId('credential-proxy-source')).toHaveTextContent(/^代理：使用全局代理配置$/)
+ })
+ it('内联缺地址时仅显示来源', () => {
+   renderCard(credential({ proxyMode: 'inline' }))
+   expect(screen.getByTestId('credential-proxy-source')).toHaveTextContent(/^代理：高级内联$/)
+ })
+ it('旧内联 proxyUrl 脱敏地址仍展示', () => {
+   renderCard(credential({ proxyMode: 'inline', proxyUrl: 'http://legacy:8080/' }))
+   expect(screen.getByTestId('credential-proxy-source')).toHaveTextContent('高级内联 · http://legacy:8080/')
+ })

@@ -43,14 +43,16 @@ export function proxySourceLabel(credential: CredentialStatusItem): string {
   switch (credential.proxyMode) {
     case 'inherit':
       return credential.effectiveProxyUrl
-        ? `继承全局 · ${credential.effectiveProxyUrl}`
-        : '继承全局（未配置全局代理）'
+        ? `使用全局代理配置 · ${credential.effectiveProxyUrl}`
+        : '使用全局代理配置'
     case 'direct':
       return '明确直连'
     case 'pool':
-      return `代理池 · ${credential.proxyName || credential.proxyId || '未知条目'}`
+      return `使用指定代理 · ${credential.proxyName || credential.proxyId || '未知条目'}`
     case 'inline':
-      return `高级内联 · ${credential.effectiveProxyUrl || credential.proxyUrl || '未知地址'}`
+      return credential.effectiveProxyUrl || credential.proxyUrl
+        ? `高级内联 · ${credential.effectiveProxyUrl || credential.proxyUrl}`
+        : '高级内联'
     default:
       // 未知模式不猜测语义，如实显示后端原值
       return credential.proxyMode || '未知'

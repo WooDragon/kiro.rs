@@ -24,7 +24,7 @@ interface ProxyPoolDialogProps {
 }
 
 /**
- * 代理池管理面板：列表 + 新增 + 编辑 + 删除。
+ * 代理列表管理面板：列表 + 新增 + 编辑 + 删除。
  *
  * 明确不展示“健康/可用”之类指标，也没有测试按钮——后端不提供探活，
  * 前端不伪造。
@@ -64,9 +64,10 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle>代理池</DialogTitle>
+            <DialogTitle>代理列表</DialogTitle>
             <DialogDescription>
-              池中的代理可被多个凭据共享；删除前需先解除全部绑定。
+              列表中的代理可被多个凭据共享；删除前需先解除全部绑定。
+              添加后不会自动应用，需要在凭据中选择该代理。
             </DialogDescription>
           </DialogHeader>
 
@@ -88,7 +89,7 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
                 加载失败：{extractErrorMessage(error)}
               </div>
             ) : proxies.length === 0 ? (
-              <div className="py-8 text-center text-muted-foreground">暂无代理</div>
+              <div className="py-8 text-center text-muted-foreground">代理列表为空</div>
             ) : (
               <ul className="divide-y">
                 {proxies.map((proxy) => (

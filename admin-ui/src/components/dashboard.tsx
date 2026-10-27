@@ -54,6 +54,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
+  const globalProxyConfigured = typeof data?.globalProxyConfigured === 'boolean'
+    ? data.globalProxyConfigured
+    : undefined
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -700,7 +703,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
               <Button onClick={() => setProxyPoolOpen(true)} size="sm" variant="outline">
                 <Network className="h-4 w-4 mr-2" />
-                代理池
+                代理列表
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
@@ -769,6 +772,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
+        globalProxyConfigured={globalProxyConfigured}
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
       />
@@ -779,11 +783,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setBatchImportDialogOpen}
       />
 
-      {/* 代理池管理 */}
+      {/* 代理列表管理 */}
       <ProxyPoolDialog open={proxyPoolOpen} onOpenChange={setProxyPoolOpen} />
 
       {/* 单凭据代理来源 */}
       <CredentialProxyDialog
+        globalProxyConfigured={globalProxyConfigured}
         credential={editingProxyCredentialItem}
         onClose={() => setEditingProxyCredential(null)}
       />

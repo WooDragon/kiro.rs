@@ -14,6 +14,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 运行时全局代理是否已配置
+    pub global_proxy_configured: bool,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }

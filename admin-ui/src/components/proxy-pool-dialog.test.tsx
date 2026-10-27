@@ -99,7 +99,7 @@ describe('代理池面板', () => {
     const user = userEvent.setup()
     renderPanel()
 
-    expect(await screen.findByText('暂无代理')).toBeInTheDocument()
+    expect(await screen.findByText('代理列表为空')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: /新增代理/ }))
 
     expect(await screen.findByRole('note')).toBeInTheDocument()
