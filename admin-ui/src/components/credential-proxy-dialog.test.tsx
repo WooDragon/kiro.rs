@@ -79,8 +79,8 @@ describe('凭据代理选择：四种模式发出的请求体', () => {
     renderDialog(credential())
 
     await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
-    await waitFor(() => expect(screen.getByLabelText('选择池代理')).toBeInTheDocument())
-    await user.selectOptions(screen.getByLabelText('选择池代理'), 'p1')
+    await waitFor(() => expect(screen.getByLabelText('选择指定代理')).toBeInTheDocument())
+    await user.selectOptions(screen.getByLabelText('选择指定代理'), 'p1')
     await user.click(screen.getByRole('button', { name: '保存' }))
 
     expect(await boundBody()).toEqual({ mode: 'pool', proxyId: 'p1' })
@@ -133,7 +133,7 @@ describe('凭据代理选择：界面与失败处理', () => {
       })
     )
 
-    expect(screen.getByText(/代理池 · 家庭 SOCKS/)).toBeInTheDocument()
+    expect(screen.getByText(/使用指定代理 · 家庭 SOCKS/)).toBeInTheDocument()
     expect(screen.getByText(/socks5h:\/\/127\.0\.0\.1:1080\//)).toBeInTheDocument()
     // 界面上不存在可提交的密码字面值，也没有星号占位
     expect(screen.queryByDisplayValue('******')).not.toBeInTheDocument()
@@ -147,7 +147,7 @@ describe('凭据代理选择：界面与失败处理', () => {
     await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
     await user.click(screen.getByRole('button', { name: '保存' }))
 
-    expect(await screen.findByText('请选择代理池条目')).toBeInTheDocument()
+    expect(await screen.findByText('请从代理列表选择一条代理')).toBeInTheDocument()
     expect(server.find('PUT', '/credentials/7/proxy')).toHaveLength(0)
   })
 
@@ -202,4 +202,60 @@ describe('凭据代理选择：界面与失败处理', () => {
     release?.()
     await waitFor(() => expect(server.find('PUT', '/credentials/7/proxy')).toHaveLength(1))
   })
+})
+
+it.each([
+  ['direct', undefined, '明确直连'],
+  ['inherit', false, '系统默认网络'],
+  ['inherit', true, '未提供实际地址'],
+  ['inherit', undefined, '未提供实际地址'],
+  ['pool', false, '未提供实际地址'],
+  ['inline', false, '未提供实际地址'],
+] as const)('已保存来源 %s / global=%s 缺地址时展示 %s', (mode, global, address) => {
+  preloadProxies()
+  renderWithQueryClient(<CredentialProxyDialog credential={credential({ proxyMode: mode })} globalProxyConfigured={global} onClose={() => {}} />)
+  expect(screen.getByTestId('effective-proxy-url')).toHaveTextContent(`实际地址：${address}`)
+})
+
+it('切换待提交模式不篡改已保存来源和实际地址', async () => {
+  preloadProxies()
+  const user = userEvent.setup()
+  renderDialog(credential({ proxyMode: 'direct' }))
+  await user.selectOptions(screen.getByLabelText('代理来源'), 'inherit')
+  expect(screen.getByText('当前来源：明确直连')).toBeInTheDocument()
+  expect(screen.getByTestId('effective-proxy-url')).toHaveTextContent('实际地址：明确直连')
+  expect(screen.getByText('全局代理状态暂不可用')).toBeInTheDocument()
+})
+
+it.each(['inherit', 'direct', 'pool', 'inline'])('保存值未变 %s 时不发送绑定请求', async (mode) => {
+  preloadProxies()
+  const user = userEvent.setup()
+  renderDialog(credential({ proxyMode: mode, proxyId: 'p1', proxyUrl: 'http://inline:8080/' }))
+  await user.click(screen.getByRole('button', { name: '保存' }))
+  expect(await screen.findByText('没有需要保存的更改')).toBeInTheDocument()
+  expect(server.find('PUT', '/credentials/7/proxy')).toHaveLength(0)
+})
+
+it.each(['inherit', 'direct', 'pool', 'inline'])('来源 %s 有实际地址时原样保留脱敏展示', (mode) => {
+  preloadProxies()
+  renderWithQueryClient(<CredentialProxyDialog credential={credential({ proxyMode: mode, effectiveProxyUrl: 'http://redacted:8080/' })} globalProxyConfigured={false} onClose={() => {}} />)
+  expect(screen.getByTestId('effective-proxy-url')).toHaveTextContent('实际地址：http://redacted:8080/')
+})
+
+it('编辑失败保留内联地址与认证原文', async () => {
+  server = installMockServer((request) => request.method === 'GET'
+    ? { data: { proxies: [] } }
+    : { status: 400, data: { error: { message: '保存失败' } } })
+  const user = userEvent.setup()
+  renderDialog(credential())
+  await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+  await user.type(screen.getByLabelText('内联代理地址'), 'http://draft:8080')
+  await user.type(screen.getByLabelText('内联代理用户名'), ' user ')
+  await user.type(screen.getByLabelText('内联代理密码'), ' password ')
+  await user.click(screen.getByRole('button', { name: '保存' }))
+  expect(await screen.findByText(/保存失败/)).toBeInTheDocument()
+  expect(screen.getByLabelText('代理来源')).toHaveValue('inline')
+  expect(screen.getByLabelText('内联代理地址')).toHaveValue('http://draft:8080')
+  expect(screen.getByLabelText('内联代理用户名')).toHaveValue(' user ')
+  expect(screen.getByLabelText('内联代理密码')).toHaveValue(' password ')
 })

@@ -114,6 +114,7 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
+            global_proxy_configured: snapshot.global_proxy_configured,
             credentials,
         }
     }

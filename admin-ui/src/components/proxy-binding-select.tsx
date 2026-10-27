@@ -7,11 +7,11 @@ import { PROTOCOL_LABELS, protocolOf } from '@/lib/proxies'
 const MODE_OPTIONS: { value: ProxyMode; label: string; hint: string }[] = [
   {
     value: 'inherit',
-    label: '继承全局',
-    hint: '使用全局配置；未配置全局代理时走系统默认',
+    label: '使用全局代理配置',
+    hint: '使用运行时全局代理配置',
   },
   { value: 'direct', label: '明确直连', hint: '该凭据不走任何代理' },
-  { value: 'pool', label: '代理池', hint: '引用代理池中的共享条目' },
+  { value: 'pool', label: '使用指定代理', hint: '从代理列表选择一条代理，仅作用于本凭据' },
   { value: 'inline', label: '高级：内联地址', hint: '旧写法，仅该凭据使用' },
 ]
 
@@ -23,6 +23,7 @@ export interface InlineProxyFields {
 }
 
 export interface ProxyBindingSelectProps {
+  globalProxyConfigured?: boolean
   mode: ProxyMode
   onModeChange: (mode: ProxyMode) => void
   /** 池列表 */
@@ -48,6 +49,7 @@ export interface ProxyBindingSelectProps {
  * 一份实现，避免两处各自演化出不同的选项或校验。
  */
 export function ProxyBindingSelect({
+  globalProxyConfigured,
   mode,
   onModeChange,
   proxies,
@@ -61,6 +63,11 @@ export function ProxyBindingSelect({
   idPrefix,
 }: ProxyBindingSelectProps) {
   const selectedMode = MODE_OPTIONS.find((option) => option.value === mode)
+  const globalProxyHint = globalProxyConfigured === true
+    ? '已配置全局代理'
+    : globalProxyConfigured === false
+      ? '未配置，使用系统默认网络'
+      : '全局代理状态暂不可用'
   const selectedProxy = proxies.find((proxy) => proxy.id === poolId)
 
   return (
@@ -82,13 +89,13 @@ export function ProxyBindingSelect({
         ))}
       </select>
       {selectedMode && (
-        <p className="text-xs text-muted-foreground">{selectedMode.hint}</p>
+        <p className="text-xs text-muted-foreground">{mode === 'inherit' ? globalProxyHint : selectedMode.hint}</p>
       )}
 
       {mode === 'pool' && (
         <div className="space-y-1">
           <select
-            aria-label="选择池代理"
+            aria-label="选择指定代理"
             value={poolId}
             onChange={(e) => onPoolIdChange(e.target.value)}
             disabled={disabled || proxiesLoading}
@@ -105,7 +112,7 @@ export function ProxyBindingSelect({
           </select>
           {!proxiesLoading && proxies.length === 0 && (
             <p className="text-xs text-muted-foreground">
-              代理池为空，请先在“代理池”中新增条目
+              代理列表为空，请先在“代理列表”中新增条目
             </p>
           )}
           {selectedProxy && (
@@ -123,7 +130,7 @@ export function ProxyBindingSelect({
       {mode === 'inline' && (
         <div className="space-y-2 rounded-md border border-dashed p-3">
           <p className="text-xs text-muted-foreground">
-            内联地址只作用于该凭据，不会进入代理池，也不会被其他凭据复用。
+            内联地址只作用于该凭据，不会进入代理列表，也不会被其他凭据复用。
           </p>
           <Input
             id={`${idPrefix}-inline-url`}

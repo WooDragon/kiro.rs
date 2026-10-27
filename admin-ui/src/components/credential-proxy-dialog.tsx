@@ -16,6 +16,7 @@ import type { CredentialStatusItem } from '@/types/api'
 import type { ProxyBinding, ProxyMode } from '@/types/proxy'
 
 interface CredentialProxyDialogProps {
+  globalProxyConfigured?: boolean
   /** 待编辑的凭据；null 表示关闭 */
   credential: CredentialStatusItem | null
   onClose: () => void
@@ -31,7 +32,7 @@ function initialMode(credential: CredentialStatusItem): ProxyMode {
   return 'inherit'
 }
 
-export function CredentialProxyDialog({ credential, onClose }: CredentialProxyDialogProps) {
+export function CredentialProxyDialog({ credential, onClose, globalProxyConfigured }: CredentialProxyDialogProps) {
   return (
     <Dialog open={credential !== null} onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
@@ -43,6 +44,7 @@ export function CredentialProxyDialog({ credential, onClose }: CredentialProxyDi
         </DialogHeader>
         {credential && (
           <CredentialProxyForm
+            globalProxyConfigured={globalProxyConfigured}
             key={credential.id}
             credential={credential}
             onDone={onClose}
@@ -54,11 +56,12 @@ export function CredentialProxyDialog({ credential, onClose }: CredentialProxyDi
 }
 
 interface CredentialProxyFormProps {
+  globalProxyConfigured?: boolean
   credential: CredentialStatusItem
   onDone: () => void
 }
 
-function CredentialProxyForm({ credential, onDone }: CredentialProxyFormProps) {
+function CredentialProxyForm({ credential, onDone, globalProxyConfigured }: CredentialProxyFormProps) {
   const { data, isLoading } = useProxies()
   const bindProxy = useBindCredentialProxy()
 
@@ -74,6 +77,13 @@ function CredentialProxyForm({ credential, onDone }: CredentialProxyFormProps) {
 
   const proxies = data?.proxies || []
   const wasInline = startMode === 'inline'
+  const effectiveAddress = credential.effectiveProxyUrl || (
+    credential.proxyMode === 'direct'
+      ? '明确直连'
+      : credential.proxyMode === 'inherit' && globalProxyConfigured === false
+        ? '系统默认网络'
+        : '未提供实际地址'
+  )
 
   /** 当前选择是否与打开时一致（用于避免无修改保存导致内联认证被清空） */
   const isUnchanged =
@@ -89,7 +99,7 @@ function CredentialProxyForm({ credential, onDone }: CredentialProxyFormProps) {
         return { mode: 'direct' }
       case 'pool':
         if (!poolId) {
-          toast.error('请选择代理池条目')
+          toast.error('请从代理列表选择一条代理')
           return null
         }
         return { mode: 'pool', proxyId: poolId }
@@ -152,19 +162,20 @@ function CredentialProxyForm({ credential, onDone }: CredentialProxyFormProps) {
           <div>
             当前来源：
             {credential.proxyMode === 'inherit'
-              ? '继承全局'
+              ? '使用全局代理配置'
               : credential.proxyMode === 'direct'
                 ? '明确直连'
                 : credential.proxyMode === 'pool'
-                  ? `代理池 · ${credential.proxyName || credential.proxyId}`
+                  ? `使用指定代理 · ${credential.proxyName || credential.proxyId}`
                   : '高级内联'}
           </div>
           <div className="font-mono" data-testid="effective-proxy-url">
-            实际地址：{credential.effectiveProxyUrl || '（无代理）'}
+            实际地址：{effectiveAddress}
           </div>
         </div>
 
         <ProxyBindingSelect
+          globalProxyConfigured={globalProxyConfigured}
           idPrefix="credential-proxy"
           mode={mode}
           onModeChange={setMode}

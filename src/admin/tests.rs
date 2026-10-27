@@ -71,6 +71,118 @@ fn api_key(extra: serde_json::Value) -> serde_json::Value {
     value
 }
 
+#[test]
+fn bdd_global_proxy_configured_matrix() {
+    let direct_credential = crate::kiro::model::credentials::KiroCredentials {
+        id: Some(1),
+        kiro_api_key: Some("ksk_bdd_direct".into()),
+        proxy_url: Some("direct".into()),
+        ..Default::default()
+    };
+    let inherited_credential = crate::kiro::model::credentials::KiroCredentials {
+        id: Some(1),
+        kiro_api_key: Some("ksk_bdd_inherit".into()),
+        ..Default::default()
+    };
+    let local_proxy = crate::http_client::ProxyConfig {
+        url: "http://127.0.0.1:8080".into(),
+        username: None,
+        password: None,
+    };
+    let cases = [
+        ("no proxy, no credentials", None, Vec::new(), false),
+        (
+            "proxy, no credentials",
+            Some(local_proxy.clone()),
+            Vec::new(),
+            true,
+        ),
+        (
+            "no proxy, direct credential",
+            None,
+            vec![direct_credential.clone()],
+            false,
+        ),
+        (
+            "proxy, direct credential",
+            Some(local_proxy.clone()),
+            vec![direct_credential],
+            true,
+        ),
+        (
+            "no proxy, inherited credential",
+            None,
+            vec![inherited_credential.clone()],
+            false,
+        ),
+        (
+            "proxy, inherited credential",
+            Some(local_proxy),
+            vec![inherited_credential],
+            true,
+        ),
+    ];
+
+    for (case, proxy, credentials, expected) in cases {
+        let dir = TempDir::new();
+        let expected_total = credentials.len();
+        let manager = Arc::new(
+            MultiTokenManager::new_with_pool(
+                Config::default(),
+                credentials,
+                Vec::new(),
+                proxy,
+                Some(dir.path()),
+                true,
+                Arc::new(ModelRegistry::builtin()),
+            )
+            .unwrap(),
+        );
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.global_proxy_configured, expected,
+            "{case}: snapshot"
+        );
+        let response = AdminService::new(manager, Vec::new()).get_all_credentials();
+        assert_eq!(
+            response.global_proxy_configured, expected,
+            "{case}: service response"
+        );
+        let serialized = serde_json::to_value(&response).expect("响应必须能序列化");
+
+        assert_eq!(
+            serialized.get("globalProxyConfigured"),
+            Some(&serde_json::json!(expected)),
+            "{case}: 全局代理状态必须序列化为 boolean"
+        );
+        assert_eq!(response.total, expected_total, "{case}: total");
+        assert_eq!(response.available, expected_total, "{case}: available");
+        assert_eq!(
+            serialized.get("total"),
+            Some(&serde_json::json!(expected_total)),
+            "{case}: total 必须保留"
+        );
+        assert_eq!(
+            serialized.get("available"),
+            Some(&serde_json::json!(expected_total)),
+            "{case}: available 必须保留"
+        );
+        assert_eq!(
+            serialized.get("currentId"),
+            Some(&serde_json::json!(response.current_id)),
+            "{case}: currentId 必须保留"
+        );
+        assert_eq!(
+            serialized
+                .get("credentials")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(expected_total),
+            "{case}: credentials 必须保留"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // J1：新表达与旧表达的所有同现组合都必须 400
 // ─────────────────────────────────────────────────────────────

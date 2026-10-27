@@ -2,6 +2,7 @@ import type { ProxyBinding as ProxyBindingPayload } from '@/types/proxy'
 
 // 凭据状态响应
 export interface CredentialsStatusResponse {
+  globalProxyConfigured: boolean
   total: number
   available: number
   currentId: number

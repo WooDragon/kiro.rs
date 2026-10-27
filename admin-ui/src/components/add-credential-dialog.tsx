@@ -20,13 +20,14 @@ import {
 import type { ProxyBinding, ProxyMode } from '@/types/proxy'
 
 interface AddCredentialDialogProps {
+  globalProxyConfigured?: boolean
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
-export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+export function AddCredentialDialog({ open, onOpenChange, globalProxyConfigured }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -75,7 +76,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         return { mode: 'direct' }
       case 'pool':
         if (!poolId) {
-          toast.error('请选择代理池条目')
+          toast.error('请从代理列表选择一条代理')
           return null
         }
         return { mode: 'pool', proxyId: poolId }
@@ -330,6 +331,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* 代理来源：与“修改代理”共用同一个选择器 */}
             <ProxyBindingSelect
+              globalProxyConfigured={globalProxyConfigured}
               idPrefix="add-credential-proxy"
               mode={proxyMode}
               onModeChange={setProxyMode}
