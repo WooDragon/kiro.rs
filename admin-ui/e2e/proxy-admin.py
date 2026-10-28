@@ -487,6 +487,9 @@ class ProxyAdminE2E(unittest.TestCase):
         for close in ("Escape", "取消", "关闭"):
             delete_button.click()
             dialog = session.dialog("删除代理")
+            # Visibility precedes Radix layer registration and mount autofocus.
+            expect(dialog).to_have_css("pointer-events", "auto")
+            expect(dialog.get_by_role("button", name="取消", exact=True)).to_be_focused()
             if close == "Escape":
                 session.page.keyboard.press("Escape")
             else:
