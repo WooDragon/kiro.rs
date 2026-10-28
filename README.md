@@ -146,6 +146,27 @@ curl http://127.0.0.1:8990/v1/messages \
   }'
 ```
 
+### Admin 浏览器端到端测试
+
+[代理管理测试脚本](admin-ui/e2e/proxy-admin.py) 使用真实 Rust 服务和浏览器验证代理管理流程，不替换 Admin API 响应。
+
+运行环境应已有能运行 `linux/arm64` 容器的 Docker、Python Playwright 及其匹配的 Chromium。`--binary` 应为兼容脚本所用 Alpine/musl 环境的 Linux ARM64 release 二进制。先按上文构建前端，再在 Linux ARM64 环境编译 release，确保二进制内嵌本次 `admin-ui/dist`。仅更新 dist 不会更新已有二进制。
+
+在仓库根目录运行：
+
+```bash
+python3 admin-ui/e2e/proxy-admin.py --help
+python3 admin-ui/e2e/proxy-admin.py \
+  --binary /absolute/path/to/linux-arm64/kiro-rs \
+  --artifacts /absolute/path/to/new-private-artifacts
+```
+
+`--artifacts` 应指向尚不存在的私有目录。脚本创建临时 dummy 配置和凭据，仅将测试服务端口发布到本机回环地址。脚本结束时回收自有容器和临时凭据目录，保留验收证据。
+
+测试覆盖代理增删改、四种来源绑定、密码保持／替换／清除、引用冲突、键盘焦点，以及三个视口和深浅主题的弹窗布局。新增凭据只打开、切换模式和取消，不提交。测试不验证代理连通性或上游推理；服务后台维护仍会运行，不保证零出站流量。浏览器测试与组件测试分别验证，截图仍需实际查看。
+
+artifact 目录包含 unittest 结果、真实 HTTP 记录、凭据文件快照、服务日志、PNG 截图和 Playwright `trace.zip`。可直接打开 PNG，并用 Playwright 的 trace viewer 查看 `trace.zip`。快照含用于验证持久化的 dummy 密码原文，不应改用真实凭据或将该目录公开。
+
 ### Docker
 
 也可以通过 Docker 启动：

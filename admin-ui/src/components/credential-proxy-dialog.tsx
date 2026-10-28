@@ -20,6 +20,7 @@ interface CredentialProxyDialogProps {
   /** 待编辑的凭据；null 表示关闭 */
   credential: CredentialStatusItem | null
   onClose: () => void
+  onCloseAutoFocus?: (event: Event) => void
 }
 
 /** 把凭据当前的代理来源还原成选择器初值 */
@@ -32,12 +33,12 @@ function initialMode(credential: CredentialStatusItem): ProxyMode {
   return 'inherit'
 }
 
-export function CredentialProxyDialog({ credential, onClose, globalProxyConfigured }: CredentialProxyDialogProps) {
+export function CredentialProxyDialog({ credential, onClose, globalProxyConfigured, onCloseAutoFocus }: CredentialProxyDialogProps) {
   return (
     <Dialog open={credential !== null} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
-        <DialogHeader>
-          <DialogTitle>修改代理</DialogTitle>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col gap-4 rounded-lg p-4 sm:p-6 sm:max-w-lg">
+        <DialogHeader className="shrink-0 pr-6">
+          <DialogTitle className="leading-normal">修改代理</DialogTitle>
           <DialogDescription>
             凭据 #{credential?.id}：选择该凭据实际使用的代理来源。
           </DialogDescription>
@@ -157,8 +158,8 @@ function CredentialProxyForm({ credential, onDone, globalProxyConfigured }: Cred
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
-      <div className="space-y-4 overflow-y-auto flex-1 pr-1 py-2">
-        <div className="rounded-md border p-3 text-xs text-muted-foreground space-y-1">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-1 py-2">
+        <div className="min-w-0 space-y-1 rounded-md border bg-muted/50 p-3 text-xs leading-relaxed text-muted-foreground [overflow-wrap:anywhere]">
           <div>
             当前来源：
             {credential.proxyMode === 'inherit'
@@ -199,7 +200,7 @@ function CredentialProxyForm({ credential, onDone, globalProxyConfigured }: Cred
         )}
       </div>
 
-      <DialogFooter>
+      <DialogFooter className="shrink-0 gap-2 border-t pt-4 sm:gap-0">
         <Button type="button" variant="outline" onClick={onDone} disabled={bindProxy.isPending}>
           取消
         </Button>
