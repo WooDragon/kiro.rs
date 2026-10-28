@@ -34,6 +34,7 @@ pub struct AppState {
     pub cc_streaming_mode: CcStreamingMode,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub model_registry: Arc<ModelRegistry>,
+    pub prompt_injection: Arc<parking_lot::RwLock<String>>,
 }
 
 impl AppState {
@@ -53,6 +54,7 @@ impl AppState {
             cc_streaming_mode,
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             model_registry,
+            prompt_injection: Arc::default(),
         }
     }
 

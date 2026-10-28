@@ -112,9 +112,11 @@ pub struct WebSearchResult {
 ///
 /// 条件：tools 有且只有一个，且 name 为 web_search
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
-    })
+    is_web_search_only(req.tools.as_deref())
+}
+
+pub(super) fn is_web_search_only(tools: Option<&[super::types::Tool]>) -> bool {
+    tools.is_some_and(|tools| tools.len() == 1 && tools[0].name == "web_search")
 }
 
 /// 从消息中提取搜索查询
@@ -636,6 +638,24 @@ async fn call_mcp_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websearch_tools_predicate_preserves_exact_single_tool_contract() {
+        for (value, expected) in [
+            (json!(null), false),
+            (json!([]), false),
+            (json!([{"name":"web_search","input_schema":{}}]), true),
+            (json!([{"name":"lookup","input_schema":{}}]), false),
+            (
+                json!([{"name":"web_search","input_schema":{}},{"name":"lookup","input_schema":{}}]),
+                false,
+            ),
+        ] {
+            let tools: Option<Vec<super::super::types::Tool>> =
+                serde_json::from_value(value).unwrap();
+            assert_eq!(is_web_search_only(tools.as_deref()), expected);
+        }
+    }
 
     #[test]
     fn test_has_web_search_tool_only_one() {

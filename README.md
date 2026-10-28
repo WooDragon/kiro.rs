@@ -180,6 +180,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `promptInjection` | string | `""` | 提示词注入，空值关闭；原输入最多 16,384 字节（UTF-8），设置与范围见[提示词注入](#提示词注入) |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `anthropicPromptCacheMode` | string | `auto` | Anthropic prompt cache 兼容模式：`off` / `passthrough` / `emulated` / `auto` |
@@ -208,6 +209,7 @@ docker-compose up
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
+   "promptInjection": "",
    "loadBalancingMode": "priority",
    "extractThinking": true,
    "ccStreamingMode": "prefix"
@@ -465,9 +467,35 @@ Anthropic 兼容端点（`/v1/*` 与 `/cc/v1/*`）会在响应头中附带 `requ
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/config/prompt-injection` - 获取已生效的提示词注入配置
+  - `PUT /api/admin/config/prompt-injection` - 保存提示词注入配置
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+
+### 提示词注入
+
+在 Admin UI 的 Dashboard 中打开“提示词注入”弹窗，在多行输入框中填写文本（如“请简洁回答”），点击“保存”后生效。“取消”不保存修改；“清空草稿”只清空输入框，仍需点击“保存”才关闭功能。读取或保存失败时，弹窗会显示明确错误；保存失败会保留草稿。
+
+`promptInjection` 默认空字符串，表示关闭。服务先校验原输入的 UTF-8 长度，上限为 16,384 字节；合法的全空白输入规范化为空字符串，其他文本原样保存，包括首尾空白和换行。
+
+保存成功后，后续请求立即使用新配置，包括已有会话的后续请求；当前在途请求继续使用旧快照。服务将配置保存到原 `--config` 指定的文件，重启后恢复。配置只作用于当前代理实例，不跨副本同步。
+
+**请求范围与缓存：**
+
+- `/v1/messages` 与 `/cc/v1/messages` 在转换前，为客户端 `messages` 中第一条 `role=user` 的首个文本添加前缀。每个请求只注入一次，不在每轮末尾追加；没有文本的内容数组会新增一个顶层 text 块。
+- 注入不改客户端 `system`、图片或 `tool_result` 内部内容。纯 WebSearch/MCP 旁路不注入，两入口的 `count_tokens` 也排除这类请求。
+- 请求转换、token 估算、`count_tokens` 与缓存使用同一份注入后的请求内容。修改提示词可能影响跨越注入位置的消息缓存；注入位置之前的 tools/system 缓存不必清除。配置变更不改变 conversation/sticky 会话标识。
+
+**Admin API：**两个接口共用既有 Admin 认证。PUT 请求体和 GET/PUT 成功响应均为以下格式，`promptInjection` 必填且为字符串；空字符串用于关闭功能。
+
+```json
+{"promptInjection": ""}
+```
+
+GET 返回已生效值，PUT 返回规范化后实际生效的值。输入超限返回 HTTP 400；持久化失败返回 HTTP 500，运行时继续使用旧值。保存沿用既有配置文件写入方式，不保证崩溃时原子保存。
+
+**效果与安全边界：**提示词不是上游强制指令，不保证上游服从、改变身份或消除拒答。管理员不应填写凭据；既有 payload debug 日志可能包含注入文本，此设置不是秘密存储。
 
 ## 注意事项
 

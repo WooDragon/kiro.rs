@@ -13,6 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
+import { PromptInjectionDialog } from '@/components/prompt-injection-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
@@ -29,6 +30,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [proxyPoolOpen, setProxyPoolOpen] = useState(false)
+  const [promptInjectionOpen, setPromptInjectionOpen] = useState(false)
   const [editingProxyCredential, setEditingProxyCredential] = useState<number | null>(null)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -556,6 +558,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
+            <PromptInjectionDialog open={promptInjectionOpen} onOpenChange={setPromptInjectionOpen}
+              trigger={<Button variant="outline" size="sm">提示词注入</Button>} />
             <Button
               variant="outline"
               size="sm"

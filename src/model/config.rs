@@ -34,6 +34,22 @@ pub enum CcStreamingMode {
     Streaming,
 }
 
+pub const MAX_PROMPT_INJECTION_BYTES: usize = 16_384;
+
+/// 先限制原始 UTF-8 字节数，再将合法全空白文本规范为关闭。
+pub fn normalize_prompt_injection(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        value.len() <= MAX_PROMPT_INJECTION_BYTES,
+        "promptInjection 不得超过 {} UTF-8 字节",
+        MAX_PROMPT_INJECTION_BYTES
+    );
+    Ok(if value.trim().is_empty() {
+        String::new()
+    } else {
+        value.to_owned()
+    })
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +123,9 @@ pub struct Config {
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    #[serde(default)]
+    pub prompt_injection: String,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -215,6 +234,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            prompt_injection: String::new(),
             extract_thinking: default_extract_thinking(),
             anthropic_prompt_cache_mode: PromptCacheMode::default(),
             cc_streaming_mode: CcStreamingMode::default(),
@@ -257,6 +277,7 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.prompt_injection = normalize_prompt_injection(&config.prompt_injection)?;
         config.config_path = Some(path.to_path_buf());
         Ok(config)
     }

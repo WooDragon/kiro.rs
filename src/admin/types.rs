@@ -395,6 +395,19 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+/// 提示词配置响应只包含实际生效的文本。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptInjectionResponse {
+    pub prompt_injection: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPromptInjectionRequest {
+    pub prompt_injection: String,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -9,8 +9,8 @@ use super::{
     handlers::{
         add_credential, bind_credential_proxy, create_proxy, delete_credential, delete_proxy,
         force_refresh_token, get_all_credentials, get_credential_balance, get_load_balancing_mode,
-        list_proxies, reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, update_proxy,
+        get_prompt_injection, list_proxies, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, set_prompt_injection, update_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -56,6 +56,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/prompt-injection",
+            get(get_prompt_injection).put(set_prompt_injection),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

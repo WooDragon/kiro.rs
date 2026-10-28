@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, BindProxyRequest, CreateProxyRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpdateProxyRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetPromptInjectionRequest,
+        SuccessResponse, UpdateProxyRequest,
     },
 };
 
@@ -136,6 +137,20 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_prompt_injection(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_prompt_injection())
+}
+
+pub async fn set_prompt_injection(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetPromptInjectionRequest>,
+) -> impl IntoResponse {
+    match state.service.set_prompt_injection(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

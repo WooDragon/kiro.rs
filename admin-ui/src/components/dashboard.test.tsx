@@ -152,6 +152,30 @@ describe('Dashboard 查询到代理来源选择器的真实连线', () => {
   })
 })
 
+it('导航提示词入口真实加载配置，键盘关闭后焦点回到触发器', async () => {
+  server = installMockServer((request) => {
+    if (request.url === '/credentials') return { data: response([], false) }
+    if (request.url === '/proxies') return { data: { proxies: [] } }
+    if (request.url === '/config/load-balancing') return { data: { mode: 'priority' } }
+    if (request.url === '/config/prompt-injection') return { data: { promptInjection: '全局前缀' } }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`)
+  })
+  const user = userEvent.setup()
+  renderWithQueryClient(<Dashboard onLogout={() => {}} />)
+  const trigger = await screen.findByRole('button', { name: '提示词注入' })
+  expect(trigger.closest('header')).not.toBeNull()
+  expect(server.find('GET', '/config/prompt-injection')).toHaveLength(0)
+  trigger.focus()
+  await user.keyboard('{Enter}')
+  const textarea = await screen.findByRole('textbox', { name: '注入提示词' })
+  await waitFor(() => expect(textarea).toHaveValue('全局前缀'))
+  await user.click(textarea)
+  await user.keyboard('{Escape}')
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  expect(trigger).toHaveFocus()
+  expect(server.find('PUT', '/config/prompt-injection')).toHaveLength(0)
+})
+
 it.each([false, true])('后台刷新等待期间保留已有状态与表单，随后 false→true editing=%s', async (editing) => {
   let refreshing = false
   let release!: (value: { data: unknown }) => void

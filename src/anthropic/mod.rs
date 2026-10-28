@@ -26,6 +26,7 @@ mod converter;
 mod handlers;
 mod middleware;
 mod prompt_cache;
+mod prompt_injection;
 mod router;
 mod stream;
 pub(crate) mod tool_call_leak;
