@@ -4001,7 +4001,7 @@ impl MultiTokenManager {
             .config
             .config_path()
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存 promptInjection"))?;
-        let mut config = Config::load(path)?;
+        let mut config = Config::load_existing(path)?;
         config.prompt_injection = normalized.clone();
         config.save()?;
         *self.prompt_injection.write() = normalized.clone();
@@ -4027,7 +4027,7 @@ impl MultiTokenManager {
             }
         };
 
-        let mut config = Config::load(&config_path)
+        let mut config = Config::load_existing(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.load_balancing_mode = mode.to_string();
         config

@@ -275,6 +275,12 @@ impl Config {
             return Ok(config);
         }
 
+        Self::load_existing(path)
+    }
+
+    /// 配置更新必须读取既有文件，不能用启动默认值重建丢失的配置。
+    pub(crate) fn load_existing<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let path = path.as_ref();
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.prompt_injection = normalize_prompt_injection(&config.prompt_injection)?;

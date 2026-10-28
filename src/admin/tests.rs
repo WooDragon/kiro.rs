@@ -121,8 +121,8 @@ fn bdd_prompt_injection_failed_save_never_publishes() {
     let path = dir.0.join("config.json");
     std::fs::write(&path, r#"{"promptInjection":"committed"}"#).unwrap();
     let manager = prompt_manager(Config::load(&path).unwrap());
-    // Missing parent permits Config::load defaulting, but forces the actual save to fail,
-    // even as root inside Docker. This is not a load failure masquerading as a save test.
+    // Startup still permits missing files, but updates must reject the missing config
+    // and preserve active settings even when the parent directory is also gone.
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(&dir.0).unwrap();
     assert!(Config::load(&path).is_ok());
@@ -170,6 +170,61 @@ fn bdd_prompt_injection_concurrent_writers_keep_file_and_runtime_consistent() {
     assert!(saved.prompt_injection.ends_with(":39"));
     assert_eq!(saved.prompt_injection, manager.get_prompt_injection());
     assert_eq!(saved.load_balancing_mode, manager.get_load_balancing_mode());
+}
+
+fn assert_missing_config_file_rejects_load_balancing(mode: &str) {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"port":9191,"loadBalancingMode":"priority","promptInjection":"committed"}"#,
+    )
+    .unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    assert!(dir.0.is_dir());
+
+    let result = manager.set_load_balancing_mode(mode.into());
+    assert_eq!(manager.get_load_balancing_mode(), "priority");
+    assert_eq!(manager.get_prompt_injection(), "committed");
+    assert!(!path.exists(), "must not recreate config for mode {mode}");
+    assert!(result.is_err(), "missing config must reject mode {mode}");
+}
+
+#[test]
+fn bdd_load_balancing_missing_config_file_never_publishes_or_recreates() {
+    assert_missing_config_file_rejects_load_balancing("balanced");
+}
+
+#[test]
+fn bdd_load_balancing_missing_config_file_unchanged_mode_never_recreates() {
+    assert_missing_config_file_rejects_load_balancing("priority");
+}
+
+#[test]
+fn bdd_missing_config_file_startup_defaults_but_updates_require_existing() {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    let startup = Config::load(&path).unwrap();
+    assert_eq!(startup.prompt_injection, "");
+    assert_eq!(startup.load_balancing_mode, "priority");
+    assert_eq!(startup.config_path(), Some(path.as_path()));
+    assert!(Config::load_existing(&path).is_err());
+    assert!(!path.exists());
+
+    std::fs::write(&path, r#"{"port":9191,"promptInjection":" \n\t"}"#).unwrap();
+    let existing = Config::load_existing(&path).unwrap();
+    assert_eq!(existing.port, 9191);
+    assert_eq!(existing.prompt_injection, "");
+    assert_eq!(existing.config_path(), Some(path.as_path()));
+    for invalid in [
+        "not json".to_string(),
+        serde_json::json!({"promptInjection":"x".repeat(16385)}).to_string(),
+    ] {
+        std::fs::write(&path, &invalid).unwrap();
+        assert!(Config::load_existing(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    }
 }
 
 #[test]
@@ -342,6 +397,27 @@ async fn bdd_prompt_injection_real_admin_validation() {
         assert_eq!(http.put(body).await.status().as_u16(), 422);
     }
     assert_eq!(http.get().await["promptInjection"], "");
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_missing_config_file_rejects_put_and_keeps_get() {
+    let http = PromptAdminHttp::start(true).await;
+    http.manager.set_prompt_injection("keep".into()).unwrap();
+    let path = http.dir.0.join("config.json");
+    std::fs::remove_file(&path).unwrap();
+    assert!(http.dir.0.is_dir());
+
+    let response = http
+        .put(serde_json::json!({"promptInjection":"must not publish"}))
+        .await;
+    assert_eq!(response.status().as_u16(), 500);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+        "internal_error"
+    );
+    assert_eq!(http.get().await["promptInjection"], "keep");
+    assert_eq!(http.manager.get_prompt_injection(), "keep");
+    assert!(!path.exists());
 }
 
 #[tokio::test]
