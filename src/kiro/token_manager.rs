@@ -2925,10 +2925,10 @@ impl MultiTokenManager {
         // 还是之后"的关键。
         //
         // ⚠️ 不变量（`save_stats` 的 doc comment 有完整推导，这里只放告警）：
-        // 本函数是当前唯一的标记点，且全部 6 个调用方
+        // 本函数是当前唯一的标记点，且全部 7 个调用方
         // （report_success/report_quota_exhausted/report_failure/
-        // report_refresh_failure/report_refresh_token_invalid/report_no_result，
-        // 最后一个由 #98 新增）都保证先释放 entries 锁、完成对 entries 的修改，
+        // report_refresh_failure/report_refresh_token_invalid/report_no_result/
+        // report_upstream_disabled）都保证先释放 entries 锁、完成对 entries 的修改，
         // 再调用本函数标记版本号。这个顺序
         // 是 `stats_saved_version` 清脏正确性的地基——新增任何调用点，都必须在
         // entries 修改**提交、锁释放之后**才调用本函数；一旦反过来（先标记后
@@ -3047,11 +3047,11 @@ impl MultiTokenManager {
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
+            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
@@ -3153,11 +3153,11 @@ impl MultiTokenManager {
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
+            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             entry.set_reason(Some(DisabledReason::QuotaExceeded));
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用

@@ -815,6 +815,91 @@ mod tests {
         }
     }
 
+    // Given 两笔真实预留，When 第一笔暂停、第二笔迟到失败，Then 预留归零且不改暂停原因。
+    fn assert_suspension_late_failure_releases_reservation(quota_exhausted: bool) {
+        let manager = manager(TestClock::new(), vec![oauth(1, false), oauth(2, false)]);
+        for _ in 0..2 {
+            assert!(
+                manager
+                    .reserve_existing_credential_excluding(1, None, &HashSet::new())
+                    .is_some()
+            );
+        }
+        assert_eq!(manager.entries.lock()[0].in_flight_count, 2);
+        assert!(manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended));
+        assert_eq!(manager.entries.lock()[0].in_flight_count, 1);
+        let revision = manager.entries.lock()[0].state_revision;
+        assert!(if quota_exhausted {
+            manager.report_quota_exhausted(1)
+        } else {
+            manager.report_failure(1)
+        });
+        {
+            let entries = manager.entries.lock();
+            assert_eq!(entries[0].in_flight_count, 0);
+            assert!(entries[0].disabled);
+            assert_eq!(
+                entries[0].disabled_reason,
+                Some(DisabledReason::TemporarilySuspended)
+            );
+            assert_eq!(entries[0].state_revision, revision);
+            assert_eq!(entries[0].failure_count, 0);
+        }
+        manager.set_disabled(1, false).unwrap();
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_count, 0);
+        assert!(!entries[0].disabled);
+        assert!(entries[0].disabled_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn suspension_late_ordinary_failure_releases_reservation() {
+        assert_suspension_late_failure_releases_reservation(false);
+    }
+
+    #[tokio::test]
+    async fn suspension_late_quota_failure_releases_reservation() {
+        assert_suspension_late_failure_releases_reservation(true);
+    }
+
+    #[tokio::test]
+    async fn request_completion_releases_exactly_one_reservation() {
+        // Given 两笔未暂停的预留，When 一笔完成，Then 另一笔仍在途；全部完成后归零。
+        for outcome in ["success", "failure", "quota"] {
+            let manager = manager(TestClock::new(), vec![oauth(1, false), oauth(2, false)]);
+            for _ in 0..2 {
+                assert!(
+                    manager
+                        .reserve_existing_credential_excluding(1, None, &HashSet::new())
+                        .is_some()
+                );
+            }
+            assert_eq!(manager.entries.lock()[0].in_flight_count, 2);
+            match outcome {
+                "success" => manager.report_success(1),
+                "failure" => assert!(manager.report_failure(1)),
+                "quota" => assert!(manager.report_quota_exhausted(1)),
+                _ => unreachable!(),
+            }
+            assert_eq!(manager.entries.lock()[0].in_flight_count, 1, "{outcome}");
+            {
+                let entries = manager.entries.lock();
+                assert_eq!(entries[0].success_count, u64::from(outcome == "success"));
+                assert_eq!(
+                    entries[0].failure_count,
+                    match outcome {
+                        "failure" => 1,
+                        "quota" => MAX_FAILURES_PER_CREDENTIAL,
+                        _ => 0,
+                    }
+                );
+                assert_eq!(entries[0].disabled, outcome == "quota");
+            }
+            manager.report_success(1);
+            assert_eq!(manager.entries.lock()[0].in_flight_count, 0, "{outcome}");
+        }
+    }
+
     #[tokio::test]
     async fn suspension_config_facts_and_manual_recovery() {
         for fault in ["missing-key", "bad-proxy", "none"] {
