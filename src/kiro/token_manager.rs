@@ -3119,14 +3119,13 @@ impl MultiTokenManager {
                     );
                 }
             }
-            if changed {
-                if let Some(next) = entries
+            if changed
+                && let Some(next) = entries
                     .iter()
                     .filter(|entry| !entry.disabled)
                     .min_by_key(|entry| entry.credentials.priority)
-                {
-                    *self.current_id.lock() = next.id;
-                }
+            {
+                *self.current_id.lock() = next.id;
             }
             (changed, entries.iter().any(|entry| !entry.disabled))
         };
