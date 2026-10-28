@@ -150,7 +150,7 @@ curl http://127.0.0.1:8990/v1/messages \
 
 [代理管理测试脚本](admin-ui/e2e/proxy-admin.py) 使用真实 Rust 服务和浏览器验证代理管理流程，不替换 Admin API 响应。
 
-运行环境应已有 Docker、Python Playwright 及其匹配的 Chromium。`--binary` 接受 Linux ARM64 release 二进制。先按上文构建前端，再在 Linux ARM64 环境编译 release，确保二进制内嵌本次 `admin-ui/dist`。仅更新 dist 不会更新已有二进制。
+运行环境应已有能运行 `linux/arm64` 容器的 Docker、Python Playwright 及其匹配的 Chromium。`--binary` 应为兼容脚本所用 Alpine/musl 环境的 Linux ARM64 release 二进制。先按上文构建前端，再在 Linux ARM64 环境编译 release，确保二进制内嵌本次 `admin-ui/dist`。仅更新 dist 不会更新已有二进制。
 
 在仓库根目录运行：
 

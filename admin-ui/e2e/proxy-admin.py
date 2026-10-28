@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Real Rust Admin browser E2E; requires Docker and installed Python Playwright.
+"""Real Rust Admin browser E2E; requires Docker able to run linux/arm64 containers
+and installed Python Playwright.
 
 Only dummy credentials are used. No credential submission, balance, refresh,
 probe, or inference is performed. Background service maintenance still runs;
@@ -24,7 +25,7 @@ from urllib.request import Request, urlopen
 from playwright.sync_api import expect, sync_playwright
 
 ADMIN_KEY = "dummy-proxy-admin-e2e"
-LONG_NAME = "长代理名称用于检验换行" * 10
+LONG_NAME = "长代理名称用于检验换行" + "LongProxyName" * 160
 LONG_URL = "http://" + "long-proxy-segment-" * 10 + ".invalid:3128"
 MODES = ["使用全局代理配置", "明确直连", "使用指定代理", "高级：内联地址"]
 OPTIONS = None
@@ -87,7 +88,7 @@ class Service:
         return json.loads(text)
 
     def start(self):
-        result = docker("run", "-d", "--read-only", "--tmpfs", "/tmp",
+        result = docker("run", "--platform", "linux/arm64", "-d", "--read-only", "--tmpfs", "/tmp",
                         "-p", "127.0.0.1::8990", "-w", "/fixture",
                         "-v", f"{OPTIONS.binary}:/kiro-rs:ro",
                         "-v", f"{self.directory}:/fixture:rw",
@@ -257,13 +258,15 @@ class BrowserSession:
             raise AssertionError(f"{method} {path}: {response.status}: {response.text()}")
         return response.request.post_data_json if response.request.post_data else None
 
-    def layout(self, dialog, label):
+    def layout(self, dialog, label, action_selector='button[type="submit"]'):
         dialog.evaluate("""root => [...root.querySelectorAll('*')].filter(node =>
           getComputedStyle(node).overflowY === 'auto').forEach(node => node.scrollTop = 0)""")
         self.shot(label + "-top")
-        measurements = dialog.evaluate("""root => {
+        measurements = dialog.evaluate("""(root, actionSelector) => {
           const box = root.getBoundingClientRect();
-          const submits = [...root.querySelectorAll('button[type="submit"]')];
+          const submits = [...root.querySelectorAll(actionSelector)];
+          const title = root.querySelector('h2');
+          const headerBefore = title.getBoundingClientRect().y;
           const footerBefore = submits.map(node => node.getBoundingClientRect().y);
           const headings = [...root.querySelectorAll('h1,h2,h3')].map(node => {
             const style = getComputedStyle(node);
@@ -279,8 +282,9 @@ class BrowserSession:
           return {box:{x:box.x,y:box.y,right:box.right,bottom:box.bottom},
             client:root.clientWidth, scroll:root.scrollWidth,
             footerBefore, footerAfter:submits.map(node => node.getBoundingClientRect().y),
+            headerBefore, headerAfter:title.getBoundingClientRect().y,
             width:innerWidth,height:innerHeight,headings,scrollers};
-        }""")
+        }""", action_selector)
         save_json(self.service.artifacts / f"{label}-layout.json", measurements)
         box = measurements["box"]
         assert box["x"] >= 8 and box["right"] <= measurements["width"] - 8, measurements
@@ -292,10 +296,12 @@ class BrowserSession:
             assert scroller["scrollWidth"] <= scroller["clientWidth"] + 1, scroller
         for before, after in zip(measurements["footerBefore"], measurements["footerAfter"]):
             assert abs(before - after) <= 1, measurements
-        for button in dialog.locator('button[type="submit"]').all():
+        assert abs(measurements["headerBefore"] - measurements["headerAfter"]) <= 1, measurements
+        for button in dialog.locator(action_selector).all():
             bounds = button.bounding_box()
             assert bounds and bounds["y"] >= box["y"] and bounds["y"] + bounds["height"] <= box["bottom"], bounds
         self.shot(label)
+        return measurements
 
     def restored_focus(self, target, label):
         # Accumulate, do not waive: final assertion stays red for every failure.
@@ -460,25 +466,42 @@ class ProxyAdminE2E(unittest.TestCase):
             document = service.snapshot(f"binding-{mode}")
             items = document["credentials"] if isinstance(document, dict) else document
             credential = next(item for item in items if item["id"] == 1)
-            if mode == "inline":
-                self.assertEqual(credential["proxyPassword"], " inline password ")
-            if mode == "pool":
-                self.assertEqual(credential["proxyId"], proxy_id)
+            # Credentials omit absent Option fields; direct uses the legacy URL sentinel.
+            expected_fields = {
+                "inherit": {},
+                "direct": {"proxyUrl": "direct"},
+                "pool": {"proxyId": proxy_id},
+                "inline": {"proxyUrl": "http://127.0.0.1:9",
+                           "proxyUsername": "dummy-inline",
+                           "proxyPassword": " inline password "},
+            }
+            proxy_fields = {key: value for key, value in credential.items()
+                            if key.startswith("proxy")}
+            self.assertEqual(proxy_fields, expected_fields[mode])
+            status, response = service.request("/api/admin/credentials")
+            self.assertEqual(status, 200)
+            saved = next(item for item in response["credentials"] if item["id"] == 1)
+            self.assertEqual(saved["proxyMode"], mode)
             self.unchanged_binding(session, service, mode)
 
     def unchanged_binding(self, session, service, mode):
         dialog = session.edit_binding()
         before = (service.directory / "credentials.json").read_bytes()
-        writes = len([event for event in session.events if event["kind"] == "response" and
-                      event["detail"].get("method") == "PUT"])
-        dialog.get_by_role("button", name="保存", exact=True).click()
-        expect(dialog).not_to_be_visible()
-        session.page.wait_for_timeout(250)
-        after_writes = len([event for event in session.events if event["kind"] == "response" and
-                           event["detail"].get("method") == "PUT"])
-        self.assertEqual(writes, after_writes)
-        self.assertEqual(before, (service.directory / "credentials.json").read_bytes())
-        service.snapshot(f"unchanged-{mode}")
+        def reject_write(request):
+            if (request.method == "PUT" and
+                    request.url == service.base + "/api/admin/credentials/1/proxy"):
+                session.record("unexpected-binding-write", {"url": request.url,
+                               "method": request.method}, True)
+                self.fail(f"Unchanged {mode} binding issued a PUT request")
+
+        session.page.on("request", reject_write)
+        try:
+            dialog.get_by_role("button", name="保存", exact=True).click()
+            expect(dialog).not_to_be_visible()
+            self.assertEqual(before, (service.directory / "credentials.json").read_bytes())
+            service.snapshot(f"unchanged-{mode}")
+        finally:
+            session.page.remove_listener("request", reject_write)
 
     def conflict_and_delete(self, session, service, proxy_id):
         pool = session.pool()
@@ -590,6 +613,7 @@ class ProxyAdminE2E(unittest.TestCase):
         pool = session.pool()
         expect(pool.get_by_text(LONG_NAME, exact=True)).to_be_visible()
         session.layout(pool, label + "-pool")
+        self.visual_delete(session, pool, label)
         pool.get_by_role("button", name="新增代理", exact=True).click()
         create = session.dialog("新增代理")
         session.layout(create, label + "-create")
@@ -613,6 +637,36 @@ class ProxyAdminE2E(unittest.TestCase):
         add.get_by_role("button", name="取消", exact=True).click()
         session.restored_focus(page.get_by_role("button", name="添加凭据", exact=True), label + "-add-close")
 
+    def visual_delete(self, session, pool, label):
+        before = (session.service.directory / "credentials.json").read_bytes()
+        trigger = pool.get_by_role("button", name="删除 " + LONG_NAME, exact=True)
+        trigger.click()
+        dialog = session.dialog("删除代理")
+        expect(dialog).to_have_css("pointer-events", "auto")
+        cancel = dialog.get_by_role("button", name="取消", exact=True)
+        expect(cancel).to_be_focused()
+        measurements = session.layout(dialog, label + "-delete", "button")
+        box = measurements["box"]
+        self.assertGreaterEqual(box["x"], 16)
+        self.assertLessEqual(box["right"], measurements["width"] - 16)
+        self.assertGreaterEqual(box["y"], 16)
+        self.assertLessEqual(box["bottom"], measurements["height"] - 16)
+        self.assertTrue(any(scroller["top"] > 0 for scroller in measurements["scrollers"]),
+                        "Long delete description must scroll inside a fixed header/footer")
+        for name in ("取消", "确认删除"):
+            button = dialog.get_by_role("button", name=name, exact=True)
+            expect(button).to_be_in_viewport()
+            expect(button).to_be_enabled()
+            self.assertTrue(button.evaluate("""node => {
+              const box = node.getBoundingClientRect();
+              return node.contains(document.elementFromPoint(box.x + box.width / 2,
+                box.y + box.height / 2));
+            }"""), f"{name} is obscured")
+        cancel.click()
+        expect(dialog).not_to_be_visible()
+        expect(trigger).to_be_focused()
+        self.assertEqual(before, (session.service.directory / "credentials.json").read_bytes())
+
     def visual_binding(self, session, label):
         dialog = session.edit_binding(2)
         expect(dialog.get_by_text("已配置全局代理", exact=True)).to_be_visible()
@@ -630,7 +684,8 @@ def main():
     global OPTIONS
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", required=True, type=Path,
-                        help="Linux ARM64 release kiro-rs with the current embedded Admin dist")
+                        help="Linux ARM64 release kiro-rs compatible with Alpine/musl in rust:1.92-alpine, "
+                             "with the current embedded Admin dist")
     parser.add_argument("--artifacts", required=True, type=Path,
                         help="New, nonexistent private output directory (never overwritten)")
     OPTIONS = parser.parse_args()

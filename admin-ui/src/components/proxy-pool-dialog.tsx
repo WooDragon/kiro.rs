@@ -175,22 +175,24 @@ export function ProxyPoolDialog({ open, onOpenChange, onCloseAutoFocus }: ProxyP
       <ProxyEditDialog proxy={editing} onClose={() => setEditing(null)} onCloseAutoFocus={restoreChildFocus} />
 
       <Dialog open={deleting !== null} onOpenChange={(next) => !next && closeDeleteDialog()}>
-        <DialogContent onCloseAutoFocus={restoreChildFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg p-4 sm:p-6">
+        <DialogContent onCloseAutoFocus={restoreChildFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col rounded-lg p-4 sm:p-6">
           <DialogHeader className="shrink-0 pr-6">
             <DialogTitle className="leading-normal">删除代理</DialogTitle>
+          </DialogHeader>
+          <div className="min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto [overflow-wrap:anywhere]">
             <DialogDescription>
               确定删除代理「{deleting?.name}」吗？此操作无法撤销。
             </DialogDescription>
-          </DialogHeader>
-          {deleteConflict && (
-            <p
-              role="alert"
-              className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
-            >
-              {deleteConflict}
-            </p>
-          )}
-          <DialogFooter>
+            {deleteConflict && (
+              <p
+                role="alert"
+                className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+              >
+                {deleteConflict}
+              </p>
+            )}
+          </div>
+          <DialogFooter className="shrink-0">
             <Button variant="outline" onClick={closeDeleteDialog} disabled={deleteProxy.isPending}>
               取消
             </Button>
