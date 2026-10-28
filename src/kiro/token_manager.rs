@@ -662,7 +662,7 @@ impl CredentialEntry {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub(super) enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -675,6 +675,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 上游明确暂停；继续认证维护，仅人工操作解除本地禁用。
+    TemporarilySuspended,
 }
 
 /// 统计数据持久化条目
@@ -1276,7 +1278,11 @@ impl MultiTokenManager {
                     credential_id = entry.id,
                     "凭据配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用"
                 );
-                entry.set_reason(Some(DisabledReason::InvalidConfig));
+                if entry.disabled_reason != Some(DisabledReason::TemporarilySuspended) {
+                    entry.set_reason(Some(DisabledReason::InvalidConfig));
+                } else {
+                    entry.state_revision = entry.state_revision.wrapping_add(1);
+                }
             }
         }
 
@@ -3091,6 +3097,45 @@ impl MultiTokenManager {
         }
         self.save_stats_debounced();
         result
+    }
+
+    /// 上游明确禁用先结清本次预留；人工决定优先，重复报告不改状态版本。
+    pub(super) fn report_upstream_disabled(&self, id: u64, reason: DisabledReason) -> bool {
+        let (changed, available) = {
+            let mut entries = self.entries.lock();
+            let mut changed = false;
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
+                if entry.disabled_reason != Some(DisabledReason::Manual)
+                    && entry.disabled_reason != Some(reason)
+                {
+                    entry.set_reason(Some(reason));
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    changed = true;
+                    tracing::warn!(
+                        credential_id = id,
+                        disabled_reason = reason.name(),
+                        "上游明确禁用凭据"
+                    );
+                }
+            }
+            if changed {
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|entry| !entry.disabled)
+                    .min_by_key(|entry| entry.credentials.priority)
+                {
+                    *self.current_id.lock() = next.id;
+                }
+            }
+            (changed, entries.iter().any(|entry| !entry.disabled))
+        };
+        if changed {
+            self.clear_sticky_sessions_for_credential(id);
+            self.persist_credentials_observed();
+        }
+        self.save_stats_debounced();
+        available
     }
 
     /// 报告指定凭据额度已用尽

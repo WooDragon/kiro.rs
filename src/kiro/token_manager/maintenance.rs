@@ -51,6 +51,7 @@ impl DisabledReason {
             Self::QuotaExceeded => "QuotaExceeded",
             Self::InvalidRefreshToken => "InvalidRefreshToken",
             Self::InvalidConfig => "InvalidConfig",
+            Self::TemporarilySuspended => "TemporarilySuspended",
         }
     }
 
@@ -61,6 +62,7 @@ impl DisabledReason {
             Some("QuotaExceeded") => Self::QuotaExceeded,
             Some("InvalidRefreshToken") => Self::InvalidRefreshToken,
             Some("InvalidConfig") => Self::InvalidConfig,
+            Some("TemporarilySuspended") => Self::TemporarilySuspended,
             _ => Self::Manual,
         }
     }
@@ -644,6 +646,327 @@ mod tests {
         }
     }
 
+    // Given a saved suspension, OAuth maintenance renews credentials without restoring routing.
+    #[tokio::test]
+    async fn suspension_refresh_preserves_reason_and_schedule() {
+        let server = Server::new().await;
+        server.state.ttl.store(300, Ordering::SeqCst);
+        let clock = TestClock::new();
+        let mut credential = oauth(1, true);
+        credential.disabled = true;
+        credential.disabled_reason = Some("TemporarilySuspended".into());
+        let manager = manager(clock.clone(), vec![credential]);
+        server.attach(&manager);
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 1);
+        assert_eq!(
+            manager.snapshot().entries[0].disabled_reason.as_deref(),
+            Some("TemporarilySuspended")
+        );
+        assert_eq!(
+            manager
+                .credentials_for_id(1)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new-access")
+        );
+        let deadline = refreshed_deadline(&manager);
+        assert!(manager.acquire_context(None).await.is_err());
+        clock.advance_ms(deadline - manager.now_ms() - 1);
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 1);
+        clock.advance_ms(1);
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 2);
+        assert_eq!(server.count("/getUsageLimits"), 0);
+        assert!(manager.entries.lock()[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn suspension_refresh_failure_backoff_and_stale_results() {
+        for permanent in [false, true] {
+            for suspend_before in [false, true] {
+                let server = Server::new().await;
+                if permanent {
+                    permanent_failure(&server);
+                } else {
+                    *server.state.status.lock() = StatusCode::SERVICE_UNAVAILABLE;
+                }
+                server.state.pause.store(true, Ordering::SeqCst);
+                let clock = TestClock::new();
+                let manager = manager(clock.clone(), vec![oauth(1, true)]);
+                server.attach(&manager);
+                if suspend_before {
+                    manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+                }
+                let worker = manager.clone();
+                let task = tokio::spawn(async move { worker.maintain_once().await });
+                server.wait_count("/token", 1).await;
+                if !suspend_before {
+                    manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+                }
+                server.state.release.add_permits(1);
+                task.await.unwrap();
+                let schedule = manager.entries.lock()[0].auth_retry_after_ms;
+                assert_eq!(schedule.is_some(), suspend_before);
+                assert_eq!(
+                    manager.entries.lock()[0].disabled_reason,
+                    Some(DisabledReason::TemporarilySuspended)
+                );
+                if suspend_before {
+                    assert!(
+                        matches!(schedule, Some(AuthSchedule::Failed(at)) if at == manager.now_ms() + RETRY_MS)
+                    );
+                    clock.advance_ms(RETRY_MS - 1);
+                    manager.maintain_once().await;
+                    assert_eq!(server.count("/token"), 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_inflight_refresh_merges_success_but_rejects_changed_identity() {
+        for change in ["suspend", "auth", "instance"] {
+            let server = Server::new().await;
+            server.state.pause.store(true, Ordering::SeqCst);
+            let manager = manager(TestClock::new(), vec![oauth(1, true)]);
+            server.attach(&manager);
+            let worker = manager.clone();
+            let task = tokio::spawn(async move { worker.maintain_once().await });
+            server.wait_count("/token", 1).await;
+            manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+            if change == "auth" {
+                manager.entries.lock()[0].credentials.refresh_token =
+                    Some("changed-material".into());
+            } else if change == "instance" {
+                let credential = manager.credentials_for_id(1).unwrap();
+                let fresh = profile_test_manager(TestClock::new(), vec![credential], None, true);
+                let entry = fresh.entries.lock().pop().unwrap();
+                manager.entries.lock()[0] = entry;
+                manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+            }
+            server.state.release.add_permits(1);
+            task.await.unwrap();
+            let entries = manager.entries.lock();
+            assert_eq!(
+                entries[0].disabled_reason,
+                Some(DisabledReason::TemporarilySuspended)
+            );
+            assert_eq!(
+                entries[0].credentials.access_token.as_deref() == Some("new-access"),
+                change == "suspend"
+            );
+            assert_eq!(
+                entries[0].auth_retry_after_ms.is_some(),
+                change == "suspend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_transition_releases_reservations_and_preserves_manual() {
+        for previous in [
+            None,
+            Some(DisabledReason::Manual),
+            Some(DisabledReason::QuotaExceeded),
+            Some(DisabledReason::InvalidRefreshToken),
+            Some(DisabledReason::TooManyFailures),
+            Some(DisabledReason::TooManyRefreshFailures),
+            Some(DisabledReason::InvalidConfig),
+        ] {
+            let manager = manager(TestClock::new(), vec![oauth(1, false), oauth(2, false)]);
+            {
+                let mut entries = manager.entries.lock();
+                entries[0].set_reason(previous);
+                entries[0].in_flight_count = 2;
+                entries[0].quota_retry_after_ms = Some(123);
+            }
+            manager.bind_sticky_session("suspended-session", 1);
+            let before = manager.entries.lock()[0].state_revision;
+            assert!(manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended));
+            let expected = if previous == Some(DisabledReason::Manual) {
+                previous
+            } else {
+                Some(DisabledReason::TemporarilySuspended)
+            };
+            let revision = manager.entries.lock()[0].state_revision;
+            assert_eq!(
+                revision,
+                before + u64::from(previous != Some(DisabledReason::Manual))
+            );
+            assert!(manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended));
+            let entries = manager.entries.lock();
+            assert_eq!(entries[0].state_revision, revision);
+            assert_eq!(entries[0].in_flight_count, 0);
+            assert_eq!(entries[0].disabled_reason, expected);
+            assert_eq!(entries[0].failure_count, 0);
+            assert_eq!(entries[0].refresh_failure_count, 0);
+            if previous != Some(DisabledReason::Manual) {
+                assert!(entries[0].quota_retry_after_ms.is_none());
+                assert!(
+                    !manager
+                        .sticky_sessions
+                        .lock()
+                        .contains_key("suspended-session")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_config_facts_and_manual_recovery() {
+        for fault in ["missing-key", "bad-proxy", "none"] {
+            let mut credential = KiroCredentials {
+                id: Some(1),
+                auth_method: Some("api_key".into()),
+                kiro_api_key: Some("synthetic-suspended".into()),
+                disabled: true,
+                disabled_reason: Some("TemporarilySuspended".into()),
+                ..Default::default()
+            };
+            if fault == "missing-key" {
+                credential.kiro_api_key = None;
+            }
+            if fault == "bad-proxy" {
+                credential.proxy_url = Some("http://[".into());
+            }
+            let manager = manager(TestClock::new(), vec![credential]);
+            let server = Server::new().await;
+            server.attach(&manager);
+            assert_eq!(
+                manager.snapshot().entries[0].disabled_reason.as_deref(),
+                Some("TemporarilySuspended"),
+                "{fault}"
+            );
+            assert_eq!(
+                manager.entries.lock()[0].route_build_failed,
+                fault == "bad-proxy"
+            );
+            manager.maintain_once().await;
+            assert_eq!(server.state.requests.lock().len(), 0);
+            assert!(manager.acquire_context(None).await.is_err());
+            if fault != "none" {
+                assert!(manager.set_disabled(1, false).is_err());
+                assert!(manager.reset_and_enable(1).is_err());
+            }
+            let mut repaired = manager.credentials_for_id(1).unwrap();
+            repaired.kiro_api_key = Some("synthetic-repaired".into());
+            repaired.proxy_url = Some("direct".into());
+            let manager = self::manager(TestClock::new(), vec![repaired]);
+            assert!(!manager.entries.lock()[0].route_build_failed);
+            assert!(manager.entries.lock()[0].disabled);
+            assert_eq!(
+                manager.entries.lock()[0].disabled_reason,
+                Some(DisabledReason::TemporarilySuspended)
+            );
+            manager.set_disabled(1, true).unwrap();
+            assert_eq!(
+                manager.entries.lock()[0].disabled_reason,
+                Some(DisabledReason::Manual)
+            );
+            manager.set_disabled(1, false).unwrap();
+            assert!(manager.entries.lock()[0].disabled_reason.is_none());
+            manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+            manager.reset_and_enable(1).unwrap();
+            assert!(manager.entries.lock()[0].disabled_reason.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_proxy_repair_updates_facts_without_unlocking() {
+        use super::super::proxy_pool::ProxyBindingRequest;
+        let directory =
+            std::env::temp_dir().join(format!("kiro-suspension-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("credentials.json");
+        std::fs::write(&path, "[]").unwrap();
+        let mut credential = oauth(1, true);
+        credential.disabled = true;
+        credential.disabled_reason = Some("TemporarilySuspended".into());
+        credential.proxy_url = Some("http://[".into());
+        let manager = profile_test_manager(TestClock::new(), vec![credential], Some(path), true);
+        let server = Server::new().await;
+        server.attach(&manager);
+        assert!(manager.entries.lock()[0].route_build_failed);
+        let revision = manager.entries.lock()[0].state_revision;
+        manager.maintain_once().await;
+        assert_eq!(server.state.requests.lock().len(), 0);
+        assert!(manager.force_refresh_token_for(1).await.is_err());
+        manager
+            .bind_credential_proxy(1, ProxyBindingRequest::Direct)
+            .await
+            .unwrap();
+        assert!(!manager.entries.lock()[0].route_build_failed);
+        assert!(manager.entries.lock()[0].state_revision > revision);
+        assert_eq!(
+            manager.entries.lock()[0].credentials.proxy_url.as_deref(),
+            Some("direct")
+        );
+        manager.maintain_once().await;
+        assert_eq!(server.count("/token"), 1);
+        assert_eq!(
+            manager.entries.lock()[0].disabled_reason,
+            Some(DisabledReason::TemporarilySuspended)
+        );
+        assert!(manager.acquire_context(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn suspension_persistence_retains_rotated_token_and_single_object_limit() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+        let directory =
+            std::env::temp_dir().join(format!("kiro-suspension-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        for multiple in [false, true] {
+            let path = directory.join(format!("{multiple}.json"));
+            std::fs::write(&path, if multiple { "[]" } else { "{}" }).unwrap();
+            let server = Server::new().await;
+            let manager = profile_test_manager(
+                TestClock::new(),
+                vec![oauth(1, true)],
+                Some(path.clone()),
+                multiple,
+            );
+            server.attach(&manager);
+            manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
+            manager.maintain_once().await;
+            assert_eq!(server.count("/token"), 1);
+            if multiple {
+                let loaded = CredentialsConfig::load(&path)
+                    .unwrap()
+                    .into_sorted_credentials();
+                assert_eq!(loaded[0].access_token.as_deref(), Some("new-access"));
+                assert_eq!(
+                    loaded[0].disabled_reason.as_deref(),
+                    Some("TemporarilySuspended")
+                );
+                let restarted = profile_test_manager(TestClock::new(), loaded, None, true);
+                assert_eq!(
+                    restarted.snapshot().entries[0].disabled_reason.as_deref(),
+                    Some("TemporarilySuspended")
+                );
+            } else {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn maintenance_waiter_preserves_concurrent_refresh_schedule() {
         for force in [true, false] {
@@ -1223,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_stale_quota_results_cannot_override_new_decisions() {
-        for change in ["manual", "enable-quota", "replace"] {
+        for change in ["manual", "enable-quota", "replace", "suspension"] {
             let server = Server::new().await;
             *server.state.usage.lock() = json!({"subscriptionInfo":{"subscriptionTitle":"old-subscription"},"usageBreakdownList":[{"currentUsageWithPrecision":0,"usageLimitWithPrecision":10}]});
             server.state.pause.store(true, Ordering::SeqCst);
@@ -1238,6 +1561,9 @@ mod tests {
                 "enable-quota" => {
                     manager.set_disabled(1, false).unwrap();
                     manager.report_quota_exhausted(1);
+                }
+                "suspension" => {
+                    manager.report_upstream_disabled(1, DisabledReason::TemporarilySuspended);
                 }
                 _ => {
                     let mut credential = manager.credentials_for_id(1).unwrap();
@@ -1263,6 +1589,12 @@ mod tests {
             );
             if change == "replace" {
                 assert!(entries[0].credentials.subscription_title.is_none());
+            }
+            if change == "suspension" {
+                assert_eq!(
+                    entries[0].disabled_reason,
+                    Some(DisabledReason::TemporarilySuspended)
+                );
             }
         }
     }
@@ -1339,7 +1671,12 @@ mod tests {
         let server = Server::new().await;
         *server.state.usage.lock() = json!({"usageBreakdownList":[{"currentUsageWithPrecision":0,"usageLimitWithPrecision":1}]});
         let mut credentials = vec![];
-        for (id, reason) in [(1, None), (2, Some("unknown")), (3, Some("QuotaExceeded"))] {
+        for (id, reason) in [
+            (1, None),
+            (2, Some("unknown")),
+            (3, Some("QuotaExceeded")),
+            (4, Some("TemporarilySuspended")),
+        ] {
             let mut credential = oauth(id, true);
             credential.disabled = true;
             credential.disabled_reason = reason.map(str::to_string);
@@ -1348,11 +1685,15 @@ mod tests {
         let manager = manager(TestClock::new(), credentials);
         server.attach(&manager);
         manager.maintain_once().await;
-        assert_eq!(server.count("/token"), 3);
+        assert_eq!(server.count("/token"), 4);
         assert_eq!(server.count("/getUsageLimits"), 1);
         let entries = manager.entries.lock();
         assert_eq!(entries[0].disabled_reason, Some(DisabledReason::Manual));
         assert_eq!(entries[1].disabled_reason, Some(DisabledReason::Manual));
         assert!(!entries[2].disabled);
+        assert_eq!(
+            entries[3].disabled_reason,
+            Some(DisabledReason::TemporarilySuspended)
+        );
     }
 }
