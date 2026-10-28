@@ -23,11 +23,12 @@ interface AddCredentialDialogProps {
   globalProxyConfigured?: boolean
   open: boolean
   onOpenChange: (open: boolean) => void
+  onCloseAutoFocus?: (event: Event) => void
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
-export function AddCredentialDialog({ open, onOpenChange, globalProxyConfigured }: AddCredentialDialogProps) {
+export function AddCredentialDialog({ open, onOpenChange, globalProxyConfigured, onCloseAutoFocus }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -155,16 +156,16 @@ export function AddCredentialDialog({ open, onOpenChange, globalProxyConfigured 
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
-        <DialogHeader>
-          <DialogTitle>添加凭据</DialogTitle>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col gap-4 rounded-lg p-4 sm:p-6 sm:max-w-lg">
+        <DialogHeader className="shrink-0 pr-6">
+          <DialogTitle className="leading-normal">添加凭据</DialogTitle>
           <DialogDescription>
             填写认证信息与可选的代理来源；代理密码按原样保存。
           </DialogDescription>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
-          <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-1 py-4">
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
@@ -345,7 +346,7 @@ export function AddCredentialDialog({ open, onOpenChange, globalProxyConfigured 
             />
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="shrink-0 gap-2 border-t pt-4 sm:gap-0">
             <Button
               type="button"
               variant="outline"

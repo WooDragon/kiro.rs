@@ -43,6 +43,18 @@ function renderCard(item: CredentialStatusItem) {
   )
 }
 
+it('长标题、代理名称与脱敏地址全文可读，不增加健康结论', () => {
+  const email = `${'long-account-'.repeat(12)}@example.test`
+  const proxyName = '长代理名称'.repeat(30)
+  const url = `http://${'long-host-'.repeat(20)}.test:3128/`
+  renderCard(credential({ email, proxyMode: 'pool', proxyName, effectiveProxyUrl: url }))
+  expect(screen.getByRole('heading', { name: new RegExp(email) })).toBeInTheDocument()
+  const source = screen.getByTestId('credential-proxy-source')
+  expect(source).toHaveTextContent(proxyName)
+  expect(source).toHaveTextContent(url)
+  expect(source).not.toHaveTextContent(/健康|探活/)
+})
+
 describe('凭据卡片的代理来源展示', () => {
   it('无实际地址时只显示全局来源，不猜全局状态', () => {
     renderCard(credential({ hasProxy: true, proxyMode: 'inherit' }))

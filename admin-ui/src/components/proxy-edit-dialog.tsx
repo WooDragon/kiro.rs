@@ -27,16 +27,17 @@ interface ProxyEditDialogProps {
   /** 待编辑的条目；null 表示关闭 */
   proxy: ProxyItem | null
   onClose: () => void
+  onCloseAutoFocus?: (event: Event) => void
 }
 
-export function ProxyEditDialog({ proxy, onClose }: ProxyEditDialogProps) {
+export function ProxyEditDialog({ proxy, onClose, onCloseAutoFocus }: ProxyEditDialogProps) {
   const updateProxy = useUpdateProxy()
   // 用 key 让每次打开都是全新表单，避免上一条目的输入残留
   return (
     <Dialog open={proxy !== null} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>编辑代理</DialogTitle>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col gap-4 rounded-lg p-4 sm:p-6 sm:max-w-lg">
+        <DialogHeader className="shrink-0 pr-6">
+          <DialogTitle className="leading-normal">编辑代理</DialogTitle>
           <DialogDescription>
             只改名称不会重建连接；改地址或认证会重建该代理的隧道。
           </DialogDescription>
@@ -134,93 +135,95 @@ function EditProxyForm({ proxy, pending, onSubmit, onCancel }: EditProxyFormProp
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <div className="space-y-2">
-        <label htmlFor="edit-proxy-name" className="text-sm font-medium">
-          名称
-        </label>
-        <Input
-          id="edit-proxy-name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          disabled={pending}
-        />
-      </div>
-
-      <div className="grid grid-cols-[9rem_1fr] gap-2">
+    <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-1 py-1">
         <div className="space-y-2">
-          <label htmlFor="edit-proxy-protocol" className="text-sm font-medium">
-            协议
+          <label htmlFor="edit-proxy-name" className="text-sm font-medium">
+            名称
           </label>
+          <Input
+            id="edit-proxy-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={pending}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[9rem_minmax(0,1fr)]">
+          <div className="space-y-2">
+            <label htmlFor="edit-proxy-protocol" className="text-sm font-medium">
+              协议
+            </label>
+            <select
+              id="edit-proxy-protocol"
+              value={protocol}
+              onChange={(e) => setProtocol(e.target.value)}
+              disabled={pending}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {PROXY_PROTOCOLS.map((option) => (
+                <option key={option} value={option}>
+                  {PROTOCOL_LABELS[option]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label htmlFor="edit-proxy-host" className="text-sm font-medium">
+              主机:端口
+            </label>
+            <Input
+              id="edit-proxy-host"
+              value={hostPort}
+              onChange={(e) => setHostPort(e.target.value)}
+              disabled={pending}
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <label htmlFor="edit-proxy-username" className="text-sm font-medium sm:col-span-2">
+            认证
+          </label>
+          <Input
+            id="edit-proxy-username"
+            placeholder="用户名"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={pending || passwordState === 'clear'}
+          />
           <select
-            id="edit-proxy-protocol"
-            value={protocol}
-            onChange={(e) => setProtocol(e.target.value)}
+            aria-label="密码操作"
+            value={passwordState}
+            onChange={(e) => handlePasswordStateChange(e.target.value as PasswordState)}
             disabled={pending}
             className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {PROXY_PROTOCOLS.map((option) => (
-              <option key={option} value={option}>
-                {PROTOCOL_LABELS[option]}
-              </option>
-            ))}
+            <option value="keep">保持不变</option>
+            <option value="replace">替换密码</option>
+            <option value="clear">清除认证</option>
           </select>
+          {passwordState === 'replace' && (
+            <Input
+              aria-label="新密码"
+              type="password"
+              placeholder="新密码（按原样保存）"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={pending}
+            />
+          )}
+          <p className="text-xs text-muted-foreground sm:col-span-2">
+            {passwordState === 'keep'
+              ? '留空不会清除已有密码。'
+              : passwordState === 'replace'
+                ? '密码按原样保存，不会去除空格；空密码即传空串。'
+                : '将同时清除用户名与密码。'}
+          </p>
         </div>
-        <div className="space-y-2">
-          <label htmlFor="edit-proxy-host" className="text-sm font-medium">
-            主机:端口
-          </label>
-          <Input
-            id="edit-proxy-host"
-            value={hostPort}
-            onChange={(e) => setHostPort(e.target.value)}
-            disabled={pending}
-          />
-        </div>
-      </div>
 
-      <div className="space-y-2">
-        <label htmlFor="edit-proxy-username" className="text-sm font-medium">
-          认证
-        </label>
-        <Input
-          id="edit-proxy-username"
-          placeholder="用户名"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          disabled={pending || passwordState === 'clear'}
-        />
-        <select
-          aria-label="密码操作"
-          value={passwordState}
-          onChange={(e) => handlePasswordStateChange(e.target.value as PasswordState)}
-          disabled={pending}
-          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <option value="keep">保持不变</option>
-          <option value="replace">替换密码</option>
-          <option value="clear">清除认证</option>
-        </select>
-        {passwordState === 'replace' && (
-          <Input
-            aria-label="新密码"
-            type="password"
-            placeholder="新密码（按原样保存）"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={pending}
-          />
-        )}
-        <p className="text-xs text-muted-foreground">
-          {passwordState === 'keep'
-            ? '留空不会清除已有密码。'
-            : passwordState === 'replace'
-              ? '密码按原样保存，不会去除空格；空密码即传空串。'
-              : '将同时清除用户名与密码。'}
-        </p>
       </div>
-
-      <DialogFooter>
+      <DialogFooter className="shrink-0 gap-2 border-t pt-4 sm:gap-0">
         <Button type="button" variant="outline" onClick={onCancel} disabled={pending}>
           取消
         </Button>

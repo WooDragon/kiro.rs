@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Plus, Pencil, Trash2, Loader2 } from 'lucide-react'
 import {
@@ -21,6 +21,7 @@ import { ProxyEditDialog } from '@/components/proxy-edit-dialog'
 interface ProxyPoolDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  onCloseAutoFocus?: (event: Event) => void
 }
 
 /**
@@ -29,17 +30,27 @@ interface ProxyPoolDialogProps {
  * 明确不展示“健康/可用”之类指标，也没有测试按钮——后端不提供探活，
  * 前端不伪造。
  */
-export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
+export function ProxyPoolDialog({ open, onOpenChange, onCloseAutoFocus }: ProxyPoolDialogProps) {
   const { data, isLoading, error } = useProxies()
   const deleteProxy = useDeleteProxy()
 
   const [createOpen, setCreateOpen] = useState(false)
+  const createTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const childTriggerRef = useRef<HTMLButtonElement | null>(null)
+  // 子弹窗是独立的受控 root，关闭时交还父列表中的开启按钮。
+  const restoreChildFocus = (event: Event) => {
+    if (!childTriggerRef.current?.isConnected) return
+    event.preventDefault()
+    childTriggerRef.current.focus()
+  }
   const [editing, setEditing] = useState<ProxyItem | null>(null)
   const [deleting, setDeleting] = useState<ProxyItem | null>(null)
   /** 删除 409 的冲突原因：必须留在界面上，不能只弹一个会消失的 toast */
   const [deleteConflict, setDeleteConflict] = useState<string | null>(null)
 
   const proxies = data?.proxies || []
+  const poolReady = !isLoading && !error && data !== undefined
+  const isEmptyPool = poolReady && proxies.length === 0
 
   const closeDeleteDialog = () => {
     setDeleting(null)
@@ -51,6 +62,7 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
     deleteProxy.mutate(deleting.id, {
       onSuccess: () => {
         toast.success('代理已删除')
+        childTriggerRef.current = createTriggerRef.current
         closeDeleteDialog()
       },
       onError: (err) => {
@@ -62,23 +74,28 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>代理列表</DialogTitle>
+        <DialogContent onCloseAutoFocus={onCloseAutoFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col rounded-lg p-4 sm:max-w-2xl sm:p-6">
+          <DialogHeader className="shrink-0 pr-6">
+            <DialogTitle className="leading-normal">代理列表</DialogTitle>
             <DialogDescription>
               列表中的代理可被多个凭据共享；删除前需先解除全部绑定。
-              添加后不会自动应用，需要在凭据中选择该代理。
             </DialogDescription>
           </DialogHeader>
 
-          <div className="flex justify-end">
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <p className="shrink-0 rounded-md border bg-muted/50 p-3 text-sm leading-relaxed text-muted-foreground">
+            添加后不会自动应用，需要在凭据中选择该代理。
+          </p>
+          <div className={isEmptyPool
+            ? 'shrink-0 space-y-4 rounded-lg border border-dashed px-4 py-8 text-center'
+            : 'flex shrink-0 justify-end'}>
+            {isEmptyPool && <p className="text-sm text-muted-foreground">代理列表为空</p>}
+            <Button key="create-proxy" size="sm" ref={createTriggerRef} onClick={() => setCreateOpen(true)} disabled={!poolReady}>
               <Plus className="h-4 w-4 mr-2" />
               新增代理
             </Button>
           </div>
 
-          <div className="overflow-y-auto flex-1 pr-1 min-h-[8rem]">
+          <div className="min-h-0 flex-1 overflow-y-auto px-1 py-1">
             {isLoading ? (
               <div className="py-8 text-center text-muted-foreground">
                 <Loader2 className="inline h-4 w-4 animate-spin mr-2" />
@@ -88,38 +105,37 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
               <div className="py-8 text-center text-red-500">
                 加载失败：{extractErrorMessage(error)}
               </div>
-            ) : proxies.length === 0 ? (
-              <div className="py-8 text-center text-muted-foreground">代理列表为空</div>
-            ) : (
-              <ul className="divide-y">
+            ) : proxies.length === 0 ? null : (
+              <ul className="space-y-3">
                 {proxies.map((proxy) => (
-                  <li key={proxy.id} className="py-3 flex items-start justify-between gap-3">
-                    <div className="min-w-0 space-y-1">
+                  <li key={proxy.id} className="flex min-w-0 flex-col gap-3 rounded-lg border bg-card p-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0 flex-1 space-y-2 [overflow-wrap:anywhere]">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-medium truncate">{proxy.name}</span>
+                        <span className="min-w-0 font-medium">{proxy.name}</span>
                         <Badge variant="outline">
                           {PROTOCOL_LABELS[protocolOf(proxy.url)] ||
                             protocolOf(proxy.url) ||
                             '未知协议'}
                         </Badge>
-                        {proxy.hasPassword && <Badge variant="secondary">含密码</Badge>}
-                        <Badge variant={proxy.referenceCount > 0 ? 'default' : 'outline'}>
-                          被 {proxy.referenceCount} 个凭据引用
-                        </Badge>
                       </div>
-                      <div className="text-sm font-mono text-muted-foreground truncate">
+                      <div className="text-sm font-mono text-muted-foreground [overflow-wrap:anywhere]">
                         {proxy.url}
                       </div>
-                      <div className="text-xs text-muted-foreground">
-                        用户名：{proxy.username || '（无）'}
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        <span>用户名：{proxy.username || '（无）'}</span>
+                        {proxy.hasPassword && <Badge variant="secondary">含密码</Badge>}
+                        <Badge variant="outline">被 {proxy.referenceCount} 个凭据引用</Badge>
                       </div>
                     </div>
-                    <div className="flex gap-1 shrink-0">
+                    <div className="flex shrink-0 justify-end gap-1 border-t pt-2 sm:border-l sm:border-t-0 sm:pl-3 sm:pt-0">
                       <Button
                         size="sm"
                         variant="ghost"
                         aria-label={`编辑 ${proxy.name}`}
-                        onClick={() => setEditing(proxy)}
+                        onClick={(event) => {
+                          childTriggerRef.current = event.currentTarget
+                          setEditing(proxy)
+                        }}
                       >
                         <Pencil className="h-4 w-4" />
                       </Button>
@@ -128,7 +144,8 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
                         variant="ghost"
                         className="text-destructive hover:text-destructive"
                         aria-label={`删除 ${proxy.name}`}
-                        onClick={() => {
+                        onClick={(event) => {
+                          childTriggerRef.current = event.currentTarget
                           setDeleteConflict(null)
                           setDeleting(proxy)
                         }}
@@ -147,15 +164,20 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
       <ProxyCreateDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
-        isFirstProxy={proxies.length === 0}
+        isFirstProxy={isEmptyPool}
+        onCloseAutoFocus={(event) => {
+          if (!createTriggerRef.current?.isConnected) return
+          event.preventDefault()
+          createTriggerRef.current.focus()
+        }}
       />
 
-      <ProxyEditDialog proxy={editing} onClose={() => setEditing(null)} />
+      <ProxyEditDialog proxy={editing} onClose={() => setEditing(null)} onCloseAutoFocus={restoreChildFocus} />
 
       <Dialog open={deleting !== null} onOpenChange={(next) => !next && closeDeleteDialog()}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>删除代理</DialogTitle>
+        <DialogContent onCloseAutoFocus={restoreChildFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg p-4 sm:p-6">
+          <DialogHeader className="shrink-0 pr-6">
+            <DialogTitle className="leading-normal">删除代理</DialogTitle>
             <DialogDescription>
               确定删除代理「{deleting?.name}」吗？此操作无法撤销。
             </DialogDescription>

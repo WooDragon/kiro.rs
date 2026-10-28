@@ -1,5 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { useState } from 'react'
+import { screen, waitFor, within } from '@testing-library/react'
+import { ProxyBindingSelect } from '@/components/proxy-binding-select'
+import type { ProxyMode } from '@/types/proxy'
 import userEvent from '@testing-library/user-event'
 import { renderWithQueryClient } from '@/test/harness'
 import { installMockServer, proxyItem } from '@/test/mock-server'
@@ -41,6 +44,54 @@ async function boundBody() {
   return server.find('PUT', '/credentials/7/proxy')[0].body
 }
 
+function BindingInstance({ idPrefix }: { idPrefix: string }) {
+  const [mode, setMode] = useState<ProxyMode>('inherit')
+  const [inline, setInline] = useState({ url: '', username: '', password: '' })
+  return <ProxyBindingSelect idPrefix={idPrefix} mode={mode} onModeChange={setMode}
+    proxies={[]} poolId="" onPoolIdChange={() => {}} inline={inline} onInlineChange={setInline} />
+}
+
+it('原生 radio 有独立分组、精确名称和说明，键盘切换不提交也不清草稿', async () => {
+  const user = userEvent.setup()
+  renderWithQueryClient(<><BindingInstance idPrefix="first" /><BindingInstance idPrefix="second" /></>)
+  const groups = screen.getAllByRole('group', { name: '代理来源' })
+  const first = within(groups[0])
+  const second = within(groups[1])
+  expect(first.getByRole('radio', { name: '使用全局代理配置' })).toBeChecked()
+  expect(first.getByRole('radio', { name: '使用全局代理配置' })).toHaveAccessibleDescription('全局代理状态暂不可用')
+  expect(first.getAllByRole('radio').map((radio) => radio.getAttribute('name'))).toEqual(Array(4).fill('first-mode'))
+  expect(second.getAllByRole('radio').map((radio) => radio.getAttribute('name'))).toEqual(Array(4).fill('second-mode'))
+  await user.tab()
+  expect(first.getByRole('radio', { name: '使用全局代理配置' })).toHaveFocus()
+  await user.keyboard('{ArrowRight}')
+  expect(first.getByRole('radio', { name: '明确直连' })).toBeChecked()
+  await user.click(first.getByText('旧写法，仅该凭据使用'))
+  expect(first.getByRole('radio', { name: '高级：内联地址' })).toBeChecked()
+  await user.type(screen.getByLabelText('内联代理地址'), 'http://draft:8080')
+  await user.click(first.getByRole('radio', { name: '明确直连' }))
+  expect(second.getByRole('radio', { name: '使用全局代理配置' })).toBeChecked()
+  await user.keyboard('{ArrowRight}')
+  expect(first.getByRole('radio', { name: '使用指定代理' })).toBeChecked()
+  await user.keyboard('{ArrowRight}')
+  expect(first.getByRole('radio', { name: '高级：内联地址' })).toBeChecked()
+  expect(screen.getByLabelText('内联代理地址')).toHaveValue('http://draft:8080')
+  await user.tab()
+  expect(screen.getByLabelText('内联代理地址')).toHaveFocus()
+  await user.tab({ shift: true })
+  expect(first.getByRole('radio', { name: '高级：内联地址' })).toHaveFocus()
+  await user.keyboard(' ')
+  expect(first.getByRole('radio', { name: '高级：内联地址' })).toBeChecked()
+  expect(second.getByRole('radio', { name: '使用全局代理配置' })).toBeChecked()
+})
+
+it('禁用来源时所有 radio 与内联输入不可编辑', () => {
+  renderWithQueryClient(<ProxyBindingSelect idPrefix="pending" mode="inline" onModeChange={() => {}}
+    proxies={[]} poolId="" onPoolIdChange={() => {}} inline={{ url: '', username: '', password: '' }}
+    onInlineChange={() => {}} disabled />)
+  for (const radio of screen.getAllByRole('radio')) expect(radio).toBeDisabled()
+  expect(screen.getByLabelText('内联代理地址')).toBeDisabled()
+})
+
 function preloadProxies() {
   server = installMockServer((request) => {
     if (request.method === 'GET' && request.url === '/proxies') {
@@ -56,7 +107,7 @@ describe('凭据代理选择：四种模式发出的请求体', () => {
     const user = userEvent.setup()
     renderDialog(credential({ proxyMode: 'direct' }))
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'inherit')
+    await user.click(screen.getByRole('radio', { name: '使用全局代理配置' }))
     await user.click(screen.getByRole('button', { name: '保存' }))
 
     expect(await boundBody()).toEqual({ mode: 'inherit' })
@@ -67,7 +118,7 @@ describe('凭据代理选择：四种模式发出的请求体', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'direct')
+    await user.click(screen.getByRole('radio', { name: '明确直连' }))
     await user.click(screen.getByRole('button', { name: '保存' }))
 
     expect(await boundBody()).toEqual({ mode: 'direct' })
@@ -78,7 +129,7 @@ describe('凭据代理选择：四种模式发出的请求体', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
+    await user.click(screen.getByRole('radio', { name: '使用指定代理' }))
     await waitFor(() => expect(screen.getByLabelText('选择指定代理')).toBeInTheDocument())
     await user.selectOptions(screen.getByLabelText('选择指定代理'), 'p1')
     await user.click(screen.getByRole('button', { name: '保存' }))
@@ -91,7 +142,7 @@ describe('凭据代理选择：四种模式发出的请求体', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+    await user.click(screen.getByRole('radio', { name: '高级：内联地址' }))
     await user.type(screen.getByLabelText('内联代理地址'), 'socks5://10.0.0.9:1080')
     await user.type(screen.getByLabelText('内联代理用户名'), 'bob')
     await user.type(screen.getByLabelText('内联代理密码'), ' pw ')
@@ -144,7 +195,7 @@ describe('凭据代理选择：界面与失败处理', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
+    await user.click(screen.getByRole('radio', { name: '使用指定代理' }))
     await user.click(screen.getByRole('button', { name: '保存' }))
 
     expect(await screen.findByText('请从代理列表选择一条代理')).toBeInTheDocument()
@@ -169,12 +220,12 @@ describe('凭据代理选择：界面与失败处理', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'direct')
+    await user.click(screen.getByRole('radio', { name: '明确直连' }))
     await user.click(screen.getByRole('button', { name: '保存' }))
 
     expect(await screen.findByText(/代理池操作被拒绝/)).toBeInTheDocument()
     // 表单仍在，选择未被重置
-    expect(screen.getByLabelText('代理来源')).toHaveValue('direct')
+    expect(screen.getByRole('radio', { name: '明确直连' })).toBeChecked()
   })
 
   it('提交中重复点击只发一次请求', async () => {
@@ -193,7 +244,7 @@ describe('凭据代理选择：界面与失败处理', () => {
     const user = userEvent.setup()
     renderDialog(credential())
 
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'direct')
+    await user.click(screen.getByRole('radio', { name: '明确直连' }))
     const submit = screen.getByRole('button', { name: '保存' })
     await user.click(submit)
     await user.click(submit)
@@ -221,7 +272,7 @@ it('切换待提交模式不篡改已保存来源和实际地址', async () => {
   preloadProxies()
   const user = userEvent.setup()
   renderDialog(credential({ proxyMode: 'direct' }))
-  await user.selectOptions(screen.getByLabelText('代理来源'), 'inherit')
+  await user.click(screen.getByRole('radio', { name: '使用全局代理配置' }))
   expect(screen.getByText('当前来源：明确直连')).toBeInTheDocument()
   expect(screen.getByTestId('effective-proxy-url')).toHaveTextContent('实际地址：明确直连')
   expect(screen.getByText('全局代理状态暂不可用')).toBeInTheDocument()
@@ -248,13 +299,13 @@ it('编辑失败保留内联地址与认证原文', async () => {
     : { status: 400, data: { error: { message: '保存失败' } } })
   const user = userEvent.setup()
   renderDialog(credential())
-  await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+  await user.click(screen.getByRole('radio', { name: '高级：内联地址' }))
   await user.type(screen.getByLabelText('内联代理地址'), 'http://draft:8080')
   await user.type(screen.getByLabelText('内联代理用户名'), ' user ')
   await user.type(screen.getByLabelText('内联代理密码'), ' password ')
   await user.click(screen.getByRole('button', { name: '保存' }))
   expect(await screen.findByText(/保存失败/)).toBeInTheDocument()
-  expect(screen.getByLabelText('代理来源')).toHaveValue('inline')
+  expect(screen.getByRole('radio', { name: '高级：内联地址' })).toBeChecked()
   expect(screen.getByLabelText('内联代理地址')).toHaveValue('http://draft:8080')
   expect(screen.getByLabelText('内联代理用户名')).toHaveValue(' user ')
   expect(screen.getByLabelText('内联代理密码')).toHaveValue(' password ')

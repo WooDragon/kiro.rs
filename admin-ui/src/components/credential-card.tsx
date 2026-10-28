@@ -27,7 +27,7 @@ import {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
-  onEditProxy: (credential: CredentialStatusItem) => void
+  onEditProxy: (credential: CredentialStatusItem, trigger: HTMLButtonElement) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -172,14 +172,14 @@ export function CredentialCard({
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-1 items-start gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg leading-normal [overflow-wrap:anywhere]">
+                <span className="min-w-0 [overflow-wrap:anywhere]">{credential.email || `凭据 #${credential.id}`}</span>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -187,7 +187,7 @@ export function CredentialCard({
                   <Badge variant="destructive">已禁用</Badge>
                 )}
                 {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                  <Badge variant="outline" className="min-w-0 max-w-full [overflow-wrap:anywhere]">{credential.disabledReason}</Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
@@ -198,7 +198,7 @@ export function CredentialCard({
                   </Badge>
                 )}
                 {credential.endpoint && (
-                  <Badge variant="outline">{credential.endpoint}</Badge>
+                  <Badge variant="outline" className="min-w-0 max-w-full [overflow-wrap:anywhere]">{credential.endpoint}</Badge>
                 )}
               </CardTitle>
             </div>
@@ -308,11 +308,11 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            <div className="col-span-2" data-testid="credential-proxy-source">
+            <div className="col-span-2 min-w-0 space-y-1 rounded-md border bg-muted/50 p-3 [overflow-wrap:anywhere]" data-testid="credential-proxy-source">
               <span className="text-muted-foreground">代理：</span>
               <span className="font-medium">{proxySourceLabel(credential)}</span>
               {credential.proxyMode === 'pool' && credential.effectiveProxyUrl && (
-                <span className="ml-1 font-mono text-xs text-muted-foreground">
+                <span className="block font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">
                   {credential.effectiveProxyUrl}
                 </span>
               )}
@@ -392,7 +392,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
-              onClick={() => onEditProxy(credential)}
+              onClick={(event) => onEditProxy(credential, event.currentTarget)}
             >
               <Network className="h-4 w-4 mr-1" />
               修改代理

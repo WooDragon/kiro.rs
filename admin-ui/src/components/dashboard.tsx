@@ -29,6 +29,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [proxyPoolOpen, setProxyPoolOpen] = useState(false)
+  const dialogTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const restoreDialogFocus = (event: Event) => {
+    if (!dialogTriggerRef.current?.isConnected) return
+    event.preventDefault()
+    dialogTriggerRef.current.focus()
+  }
   const [editingProxyCredential, setEditingProxyCredential] = useState<number | null>(null)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -619,9 +625,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
+          <div className="flex min-w-0 flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+            <div className="flex shrink-0 flex-wrap items-center gap-3">
+              <h2 className="text-xl font-semibold leading-normal">凭据管理</h2>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -631,7 +637,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex min-w-0 flex-wrap gap-2 xl:justify-end">
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -701,11 +707,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
-              <Button onClick={() => setProxyPoolOpen(true)} size="sm" variant="outline">
+              <Button onClick={(event) => {
+                dialogTriggerRef.current = event.currentTarget
+                setProxyPoolOpen(true)
+              }} size="sm" variant="outline">
                 <Network className="h-4 w-4 mr-2" />
                 代理列表
               </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm">
+              <Button onClick={(event) => {
+                dialogTriggerRef.current = event.currentTarget
+                setAddDialogOpen(true)
+              }} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
@@ -725,7 +737,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
-                    onEditProxy={(item) => setEditingProxyCredential(item.id)}
+                    onEditProxy={(item, trigger) => {
+                      dialogTriggerRef.current = trigger
+                      setEditingProxyCredential(item.id)
+                    }}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -775,6 +790,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         globalProxyConfigured={globalProxyConfigured}
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+        onCloseAutoFocus={restoreDialogFocus}
       />
 
       {/* 批量导入对话框 */}
@@ -784,13 +800,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
       />
 
       {/* 代理列表管理 */}
-      <ProxyPoolDialog open={proxyPoolOpen} onOpenChange={setProxyPoolOpen} />
+      <ProxyPoolDialog open={proxyPoolOpen} onOpenChange={setProxyPoolOpen} onCloseAutoFocus={restoreDialogFocus} />
 
       {/* 单凭据代理来源 */}
       <CredentialProxyDialog
         globalProxyConfigured={globalProxyConfigured}
         credential={editingProxyCredentialItem}
         onClose={() => setEditingProxyCredential(null)}
+        onCloseAutoFocus={restoreDialogFocus}
       />
 
       {/* KAM 账号导入对话框 */}
