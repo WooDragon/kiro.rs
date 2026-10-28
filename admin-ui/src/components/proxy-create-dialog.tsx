@@ -26,6 +26,7 @@ export const ENVELOPE_NOTICE =
 interface ProxyCreateDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  onCloseAutoFocus?: (event: Event) => void
   /** 池当前是否为空：决定是否展示升级提示 */
   isFirstProxy: boolean
 }
@@ -42,6 +43,7 @@ export function ProxyCreateDialog({
   open,
   onOpenChange,
   isFirstProxy,
+  onCloseAutoFocus,
 }: ProxyCreateDialogProps) {
   const createProxy = useCreateProxy()
   const [form, setForm] = useState(emptyForm)
@@ -95,91 +97,95 @@ export function ProxyCreateDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>新增代理</DialogTitle>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus} className="w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] flex flex-col gap-4 rounded-lg p-4 sm:p-6 sm:max-w-lg">
+        <DialogHeader className="shrink-0 pr-6">
+          <DialogTitle className="leading-normal">新增代理</DialogTitle>
           <DialogDescription>
             地址只填主机与端口；认证信息走独立字段。
-            添加后不会自动应用，需要在凭据中选择该代理。
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {isFirstProxy && (
-            <p
-              role="note"
-              className="rounded-md border border-yellow-500/50 bg-yellow-500/10 p-3 text-xs leading-relaxed"
-            >
-              {ENVELOPE_NOTICE}
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-1 py-1">
+            <p className="rounded-md border bg-muted/50 p-3 text-sm leading-relaxed text-muted-foreground">
+              添加后不会自动应用，需要在凭据中选择该代理。
             </p>
-          )}
-          <div className="space-y-2">
-            <label htmlFor="proxy-name" className="text-sm font-medium">
-              名称
-            </label>
-            <Input
-              id="proxy-name"
-              placeholder="例如：家庭 SOCKS"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              disabled={createProxy.isPending}
-            />
-          </div>
-          <div className="grid grid-cols-[9rem_1fr] gap-2">
-            <div className="space-y-2">
-              <label htmlFor="proxy-protocol" className="text-sm font-medium">
-                协议
-              </label>
-              <select
-                id="proxy-protocol"
-                value={form.protocol}
-                onChange={(e) => setForm({ ...form, protocol: e.target.value })}
-                disabled={createProxy.isPending}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            {isFirstProxy && (
+              <p
+                role="note"
+                className="rounded-md border border-yellow-500/50 bg-yellow-500/10 p-3 text-xs leading-relaxed"
               >
-                {PROXY_PROTOCOLS.map((protocol) => (
-                  <option key={protocol} value={protocol}>
-                    {PROTOCOL_LABELS[protocol]}
-                  </option>
-                ))}
-              </select>
-            </div>
+                {ENVELOPE_NOTICE}
+              </p>
+            )}
             <div className="space-y-2">
-              <label htmlFor="proxy-host" className="text-sm font-medium">
-                主机:端口
+              <label htmlFor="proxy-name" className="text-sm font-medium">
+                名称
               </label>
               <Input
-                id="proxy-host"
-                placeholder="127.0.0.1:1080"
-                value={form.hostPort}
-                onChange={(e) => setForm({ ...form, hostPort: e.target.value })}
+                id="proxy-name"
+                placeholder="例如：家庭 SOCKS"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
                 disabled={createProxy.isPending}
               />
             </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[9rem_minmax(0,1fr)]">
+              <div className="space-y-2">
+                <label htmlFor="proxy-protocol" className="text-sm font-medium">
+                  协议
+                </label>
+                <select
+                  id="proxy-protocol"
+                  value={form.protocol}
+                  onChange={(e) => setForm({ ...form, protocol: e.target.value })}
+                  disabled={createProxy.isPending}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {PROXY_PROTOCOLS.map((protocol) => (
+                    <option key={protocol} value={protocol}>
+                      {PROTOCOL_LABELS[protocol]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="proxy-host" className="text-sm font-medium">
+                  主机:端口
+                </label>
+                <Input
+                  id="proxy-host"
+                  placeholder="127.0.0.1:1080"
+                  value={form.hostPort}
+                  onChange={(e) => setForm({ ...form, hostPort: e.target.value })}
+                  disabled={createProxy.isPending}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              默认 SOCKS5h：域名由代理端解析（本机不做 DNS）。
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Input
+                aria-label="代理用户名"
+                placeholder="用户名（可选）"
+                value={form.username}
+                onChange={(e) => setForm({ ...form, username: e.target.value })}
+                disabled={createProxy.isPending}
+              />
+              <Input
+                aria-label="代理密码"
+                type="password"
+                placeholder="密码（可选）"
+                value={form.password}
+                onChange={(e) => setForm({ ...form, password: e.target.value })}
+                disabled={createProxy.isPending}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              用户名与密码须同时填写或同时留空；密码按原样保存，不会去除空格。
+            </p>
           </div>
-          <p className="text-xs text-muted-foreground">
-            默认 SOCKS5h：域名由代理端解析（本机不做 DNS）。
-          </p>
-          <div className="grid grid-cols-2 gap-2">
-            <Input
-              aria-label="代理用户名"
-              placeholder="用户名（可选）"
-              value={form.username}
-              onChange={(e) => setForm({ ...form, username: e.target.value })}
-              disabled={createProxy.isPending}
-            />
-            <Input
-              aria-label="代理密码"
-              type="password"
-              placeholder="密码（可选）"
-              value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
-              disabled={createProxy.isPending}
-            />
-          </div>
-          <p className="text-xs text-muted-foreground">
-            用户名与密码须同时填写或同时留空；密码按原样保存，不会去除空格。
-          </p>
-          <DialogFooter>
+          <DialogFooter className="shrink-0 gap-2 border-t pt-4 sm:gap-0">
             <Button
               type="button"
               variant="outline"

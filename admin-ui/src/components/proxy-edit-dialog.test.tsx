@@ -31,6 +31,22 @@ async function patchedBody() {
   return server.find('PATCH', '/proxies/p1')[0].body as Record<string, unknown>
 }
 
+it('正文与操作区分离但保存仍属于表单，Escape 不保存草稿', async () => {
+  server = installMockServer(() => ({ data: { proxies: [] } }))
+  let closed = false
+  const user = userEvent.setup()
+  renderWithQueryClient(<ProxyEditDialog proxy={existing} onClose={() => { closed = true }} />)
+  const name = screen.getByRole('textbox', { name: '名称' })
+  const submit = screen.getByRole('button', { name: '保存' }) as HTMLButtonElement
+  expect(submit.form).toBe(name.closest('form'))
+  expect(name.parentElement?.parentElement).toContainElement(screen.getByRole('textbox', { name: '主机:端口' }))
+  expect(name.parentElement?.parentElement).not.toContainElement(submit)
+  await user.type(name, '草稿')
+  await user.keyboard('{Escape}')
+  expect(closed).toBe(true)
+  expect(server.requests).toHaveLength(0)
+})
+
 describe('编辑代理：密码三态', () => {
   it('默认“保持不变”：请求体里根本不出现 username/password 键', async () => {
     server = installMockServer(() => ({ data: { proxies: [] } }))

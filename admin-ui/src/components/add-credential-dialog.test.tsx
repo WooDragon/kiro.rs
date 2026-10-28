@@ -64,7 +64,7 @@ describe('新增凭据：代理绑定新写法', () => {
     renderDialog()
 
     await fillApiKey(user)
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
+    await user.click(screen.getByRole('radio', { name: '使用指定代理' }))
     await waitFor(() => expect(screen.getByLabelText('选择指定代理')).toBeInTheDocument())
     await user.selectOptions(screen.getByLabelText('选择指定代理'), 'p1')
     await user.click(screen.getByRole('button', { name: '添加' }))
@@ -80,7 +80,7 @@ describe('新增凭据：代理绑定新写法', () => {
     renderDialog()
 
     await fillApiKey(user)
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+    await user.click(screen.getByRole('radio', { name: '高级：内联地址' }))
     await user.type(screen.getByLabelText('内联代理地址'), 'socks5://10.0.0.9:1080')
     await user.type(screen.getByLabelText('内联代理用户名'), 'carol')
     await user.type(screen.getByLabelText('内联代理密码'), ' a b ')
@@ -101,7 +101,7 @@ describe('新增凭据：代理绑定新写法', () => {
     renderDialog()
 
     await fillApiKey(user)
-    await user.selectOptions(screen.getByLabelText('代理来源'), 'direct')
+    await user.click(screen.getByRole('radio', { name: '明确直连' }))
     await user.click(screen.getByRole('button', { name: '添加' }))
 
     expect((await postBody()).proxy).toEqual({ mode: 'direct' })
@@ -159,7 +159,7 @@ it('未选指定代理拒绝新增并保留认证输入', async () => {
   const user = userEvent.setup()
   renderDialog()
   await fillApiKey(user)
-  await user.selectOptions(screen.getByLabelText('代理来源'), 'pool')
+  await user.click(screen.getByRole('radio', { name: '使用指定代理' }))
   expect(screen.getByText('从代理列表选择一条代理，仅作用于本凭据')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: '添加' }))
   expect(await screen.findByText('请从代理列表选择一条代理')).toBeInTheDocument()
@@ -171,12 +171,12 @@ it('模式名称、顺序与空列表说明不暗示自动分配', async () => {
   server = installMockServer(() => ({ data: { proxies: [] } }))
   const user = userEvent.setup()
   renderDialog()
-  const select = screen.getByLabelText('代理来源') as HTMLSelectElement
-  expect(Array.from(select.options, (option) => [option.value, option.text])).toEqual([
+  const radios = screen.getAllByRole('radio') as HTMLInputElement[]
+  expect(radios.map((radio) => [radio.value, radio.labels?.[0].querySelector('[id$="-title"]')?.textContent])).toEqual([
     ['inherit', '使用全局代理配置'], ['direct', '明确直连'],
     ['pool', '使用指定代理'], ['inline', '高级：内联地址'],
   ])
-  await user.selectOptions(select, 'pool')
+  await user.click(screen.getByRole('radio', { name: '使用指定代理' }))
   expect(await screen.findByText('代理列表为空，请先在“代理列表”中新增条目')).toBeInTheDocument()
   expect(screen.getByText('从代理列表选择一条代理，仅作用于本凭据')).toBeInTheDocument()
 })
@@ -188,13 +188,13 @@ it('新增失败保留内联地址、认证原文及凭据输入', async () => {
   const user = userEvent.setup()
   renderDialog()
   await fillApiKey(user)
-  await user.selectOptions(screen.getByLabelText('代理来源'), 'inline')
+  await user.click(screen.getByRole('radio', { name: '高级：内联地址' }))
   await user.type(screen.getByLabelText('内联代理地址'), 'http://draft:8080')
   await user.type(screen.getByLabelText('内联代理用户名'), ' user ')
   await user.type(screen.getByLabelText('内联代理密码'), ' password ')
   await user.click(screen.getByRole('button', { name: '添加' }))
   expect(await screen.findByText(/保存失败/)).toBeInTheDocument()
-  expect(screen.getByLabelText('代理来源')).toHaveValue('inline')
+  expect(screen.getByRole('radio', { name: '高级：内联地址' })).toBeChecked()
   expect(screen.getByLabelText('内联代理地址')).toHaveValue('http://draft:8080')
   expect(screen.getByLabelText('内联代理用户名')).toHaveValue(' user ')
   expect(screen.getByLabelText('内联代理密码')).toHaveValue(' password ')

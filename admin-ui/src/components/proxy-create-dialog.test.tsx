@@ -22,6 +22,22 @@ describe('新增代理对话框', () => {
     server = installMockServer(() => ({ data: { proxies: [proxyItem()] } }))
   })
 
+  it('正文与操作区分离但提交仍属于表单，键盘可取消且不写入', async () => {
+    let closed = false
+    const user = userEvent.setup()
+    renderWithQueryClient(<ProxyCreateDialog open isFirstProxy onOpenChange={(open) => { closed = !open }} />)
+    const name = screen.getByRole('textbox', { name: '名称' })
+    const submit = screen.getByRole('button', { name: '添加' }) as HTMLButtonElement
+    expect(submit.form).toBe(name.closest('form'))
+    expect(name.parentElement?.parentElement).toContainElement(screen.getByRole('textbox', { name: '主机:端口' }))
+    expect(name.parentElement?.parentElement).not.toContainElement(submit)
+    expect(screen.getAllByRole('note')).toHaveLength(1)
+    await user.type(name, '取消草稿')
+    await user.keyboard('{Escape}')
+    expect(closed).toBe(true)
+    expect(server.requests).toHaveLength(0)
+  })
+
   it('默认协议是 SOCKS5h 并说明由代理端解析域名', async () => {
     renderDialog(true)
 

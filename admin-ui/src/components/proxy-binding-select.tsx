@@ -3,7 +3,7 @@ import { Badge } from '@/components/ui/badge'
 import type { ProxyItem, ProxyMode } from '@/types/proxy'
 import { PROTOCOL_LABELS, protocolOf } from '@/lib/proxies'
 
-/** 模式下拉的选项（顺序固定：继承 → 直连 → 池 → 高级内联） */
+/** 模式卡片的选项（顺序固定：继承 → 直连 → 池 → 高级内联） */
 const MODE_OPTIONS: { value: ProxyMode; label: string; hint: string }[] = [
   {
     value: 'inherit',
@@ -62,7 +62,6 @@ export function ProxyBindingSelect({
   disabled = false,
   idPrefix,
 }: ProxyBindingSelectProps) {
-  const selectedMode = MODE_OPTIONS.find((option) => option.value === mode)
   const globalProxyHint = globalProxyConfigured === true
     ? '已配置全局代理'
     : globalProxyConfigured === false
@@ -71,26 +70,38 @@ export function ProxyBindingSelect({
   const selectedProxy = proxies.find((proxy) => proxy.id === poolId)
 
   return (
-    <div className="space-y-2">
-      <label htmlFor={`${idPrefix}-mode`} className="text-sm font-medium">
-        代理来源
-      </label>
-      <select
-        id={`${idPrefix}-mode`}
-        value={mode}
-        onChange={(e) => onModeChange(e.target.value as ProxyMode)}
-        disabled={disabled}
-        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-      >
+    <fieldset className="min-w-0 space-y-3" disabled={disabled}>
+      <legend className="mb-2 text-sm font-medium">代理来源</legend>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {MODE_OPTIONS.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
+          <label
+            key={option.value}
+            className={`flex min-w-0 items-start gap-3 rounded-lg border p-3 transition-colors focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 ${
+              disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-muted/50'
+            } ${mode === option.value ? 'border-primary bg-primary/5' : 'border-input'}`}
+          >
+            <input
+              type="radio"
+              id={`${idPrefix}-${option.value}`}
+              name={`${idPrefix}-mode`}
+              value={option.value}
+              checked={mode === option.value}
+              onChange={() => onModeChange(option.value)}
+              aria-labelledby={`${idPrefix}-${option.value}-title`}
+              aria-describedby={`${idPrefix}-${option.value}-hint`}
+              className="mt-1 h-4 w-4 shrink-0 accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            />
+            <span className="min-w-0 space-y-1 [overflow-wrap:anywhere]">
+              <span id={`${idPrefix}-${option.value}-title`} className="block text-sm font-medium leading-5">
+                {option.label}
+              </span>
+              <span id={`${idPrefix}-${option.value}-hint`} className="block text-xs leading-relaxed text-muted-foreground">
+                {option.value === 'inherit' ? globalProxyHint : option.hint}
+              </span>
+            </span>
+          </label>
         ))}
-      </select>
-      {selectedMode && (
-        <p className="text-xs text-muted-foreground">{mode === 'inherit' ? globalProxyHint : selectedMode.hint}</p>
-      )}
+      </div>
 
       {mode === 'pool' && (
         <div className="space-y-1">
@@ -116,11 +127,11 @@ export function ProxyBindingSelect({
             </p>
           )}
           {selectedProxy && (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <Badge variant="outline">
                 {PROTOCOL_LABELS[protocolOf(selectedProxy.url)] || protocolOf(selectedProxy.url) || '未知协议'}
               </Badge>
-              <span className="font-mono">{selectedProxy.url}</span>
+              <span className="min-w-0 font-mono [overflow-wrap:anywhere]">{selectedProxy.url}</span>
               {selectedProxy.hasPassword && <Badge variant="secondary">含认证</Badge>}
             </div>
           )}
@@ -140,7 +151,7 @@ export function ProxyBindingSelect({
             onChange={(e) => onInlineChange({ ...inline, url: e.target.value })}
             disabled={disabled}
           />
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <Input
               id={`${idPrefix}-inline-username`}
               aria-label="内联代理用户名"
@@ -164,6 +175,6 @@ export function ProxyBindingSelect({
           </p>
         </div>
       )}
-    </div>
+    </fieldset>
   )
 }
