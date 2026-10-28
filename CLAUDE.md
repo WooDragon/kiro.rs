@@ -74,6 +74,7 @@ repo 内不保留 `docs/` 目录，所有设计文档、实现细节归私有侧
 - 模型映射由 `models.toml` 配置驱动（`ModelRegistry`），新增模型只改配置文件重启生效，无需改代码；文件不存在时 fallback 内嵌默认，文件存在但语法错误时 fail-fast 退出
 - Kiro 上游按 `KiroIDE-<version>-<machineId>` 的版本段执行准入。当前默认版本由 `default_kiro_version` 给出，`config.json` 的 `kiroVersion` 可覆盖，为上游收紧提供无需改代码的热修逃生舱。默认值更新必须由相同 token、相同 endpoint 的黑盒 A/B 背书；其他 aws-sdk 版本串不得联动猜改。已实测 OAuth IDE API 的 `getUsageLimits` 缺少 `profileArn` 时上游会拒绝请求；代理在 token 收口阶段懒调用 `ListAvailableProfiles` 补齐。profile discovery 采用 best-effort，不得污染凭据健康计数。API key 是否需要或接受 `profileArn` 尚未实测；代理保持既有行为，不将 OAuth 结论外推
 - 请求转换流程：Anthropic 格式 → build_history → validate_tool_pairing / remove_orphaned（配对校验）→ 发送
+- 提示词注入在转换前仅作用于客户端首条 user 的顶层文本；转换、token 估算/count_tokens 与缓存共用同一份注入后的 payload，纯 WebSearch/MCP 旁路及其计数同样排除。维护此行为时应先读取 [README「提示词注入」](README.md#提示词注入)。
 - prompt cache 是纯本地模拟（进程内 HashMap），从不向 Kiro 透传 cache_control；cache identity 必须基于完整 canonical payload，token ruler 只可归一化已知 content-block 中的媒体，二者不得共用同一视图（细节见私有 docs/issue92-multimodal-prompt-cache-ruler.md，#92）
 - 空 tool_result 统一替换为占位文本，不发空串
 - 空 tool description 在 `convert_tools` 出口兜底填 `Tool: {name}` 占位——Anthropic 原生 description 对自定义工具是 optional（空串合法），但上游 Kiro/Bedrock `toolSpecification.description` 硬约束 length>=1，空串 400 拒整个请求；不删字段（缺失=length 0 同样拒）、不删工具（历史 tool_use 落单撞 validate_tool_pairing）；占位非空白避免诱导退化（退化行为见 #26）（#46）

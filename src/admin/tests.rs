@@ -16,6 +16,436 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 use crate::model::registry::ModelRegistry;
 
+// Given an old config, updates must persist before becoming visible to readers.
+fn prompt_manager(config: Config) -> Arc<MultiTokenManager> {
+    Arc::new(
+        MultiTokenManager::new(
+            config,
+            Vec::new(),
+            None,
+            None,
+            false,
+            Arc::new(ModelRegistry::builtin()),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn bdd_prompt_injection_config_default_and_utf8_boundaries() {
+    use crate::model::config::{MAX_PROMPT_INJECTION_BYTES, normalize_prompt_injection};
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    assert_eq!(Config::load(&path).unwrap().prompt_injection, "");
+    for size in [MAX_PROMPT_INJECTION_BYTES - 1, MAX_PROMPT_INJECTION_BYTES] {
+        let value = format!("{}{}", "中".repeat(size / 3), "x".repeat(size % 3));
+        assert_eq!(normalize_prompt_injection(&value).unwrap(), value);
+        std::fs::write(
+            &path,
+            serde_json::json!({"promptInjection":value}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().prompt_injection, value);
+    }
+    let too_long = format!("{}x", "中".repeat(5461) + "x");
+    assert_eq!(too_long.len(), 16385);
+    assert!(normalize_prompt_injection(&too_long).is_err());
+    assert!(normalize_prompt_injection(&" ".repeat(16385)).is_err());
+    assert_eq!(normalize_prompt_injection(" \n\t\u{3000}").unwrap(), "");
+    let original = " \n实际提示词\n ";
+    assert_eq!(normalize_prompt_injection(original).unwrap(), original);
+    std::fs::write(
+        &path,
+        serde_json::json!({"promptInjection":" \n\t"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(Config::load(&path).unwrap().prompt_injection, "");
+    std::fs::write(
+        &path,
+        serde_json::json!({"promptInjection":too_long}).to_string(),
+    )
+    .unwrap();
+    let error = Config::load(&path).unwrap_err().to_string();
+    assert!(error.contains("promptInjection"));
+    assert!(!error.contains("中中"));
+}
+
+#[test]
+fn bdd_prompt_injection_persists_reloads_and_shares_handle() {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"port":9191,"loadBalancingMode":"priority","promptInjection":"initial"}"#,
+    )
+    .unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    let handle = manager.prompt_injection_handle();
+    assert_eq!(*handle.read(), "initial");
+    assert!(Arc::ptr_eq(&handle, &manager.prompt_injection_handle()));
+    // A writer must preserve the latest known fields, not the startup snapshot.
+    let mut latest = Config::load(&path).unwrap();
+    latest.port = 9292;
+    latest.save().unwrap();
+    let value = " \n新提示词\n ";
+    assert_eq!(manager.set_prompt_injection(value.into()).unwrap(), value);
+    assert_eq!(*handle.read(), value);
+    assert_eq!(Config::load(&path).unwrap().port, 9292);
+    let restarted = prompt_manager(Config::load(&path).unwrap());
+    assert_eq!(restarted.get_prompt_injection(), value);
+    manager.set_load_balancing_mode("balanced".into()).unwrap();
+    assert_eq!(Config::load(&path).unwrap().prompt_injection, value);
+    assert_eq!(manager.set_prompt_injection(" \n\t".into()).unwrap(), "");
+    assert_eq!(Config::load(&path).unwrap().prompt_injection, "");
+    assert_eq!(Config::load(&path).unwrap().load_balancing_mode, "balanced");
+}
+
+#[test]
+fn bdd_prompt_injection_failed_save_never_publishes() {
+    let manager = prompt_manager(Config::default());
+    let admin = AdminService::new(manager.clone(), Vec::new());
+    let request =
+        serde_json::from_value(serde_json::json!({"promptInjection":"not saved"})).unwrap();
+    assert_status(
+        admin.set_prompt_injection(request).unwrap_err(),
+        500,
+        "internal_error",
+    );
+    assert!(manager.set_prompt_injection("not saved".into()).is_err());
+    assert_eq!(manager.get_prompt_injection(), "");
+    manager.set_load_balancing_mode("balanced".into()).unwrap();
+    assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(&path, r#"{"promptInjection":"committed"}"#).unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    // Startup still permits missing files, but updates must reject the missing config
+    // and preserve active settings even when the parent directory is also gone.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir.0).unwrap();
+    assert!(Config::load(&path).is_ok());
+    assert!(manager.set_prompt_injection("uncommitted".into()).is_err());
+    assert_eq!(manager.get_prompt_injection(), "committed");
+    assert!(manager.set_load_balancing_mode("balanced".into()).is_err());
+    assert_eq!(manager.get_load_balancing_mode(), "priority");
+    assert!(!path.exists());
+}
+
+fn write_config_values(manager: &MultiTokenManager, worker: usize) {
+    for iteration in 0..40 {
+        if worker < 2 {
+            manager
+                .set_prompt_injection(format!("{worker}:{iteration}"))
+                .unwrap();
+            continue;
+        }
+        let mode = ["balanced", "priority"][(worker + iteration) % 2];
+        manager.set_load_balancing_mode(mode.into()).unwrap();
+    }
+}
+
+#[test]
+fn bdd_prompt_injection_concurrent_writers_keep_file_and_runtime_consistent() {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(&path, r#"{"port":9191}"#).unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let manager = manager.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            write_config_values(&manager, worker);
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved.port, 9191);
+    assert!(saved.prompt_injection.ends_with(":39"));
+    assert_eq!(saved.prompt_injection, manager.get_prompt_injection());
+    assert_eq!(saved.load_balancing_mode, manager.get_load_balancing_mode());
+}
+
+fn assert_missing_config_file_rejects_load_balancing(mode: &str) {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"port":9191,"loadBalancingMode":"priority","promptInjection":"committed"}"#,
+    )
+    .unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    assert!(dir.0.is_dir());
+
+    let result = manager.set_load_balancing_mode(mode.into());
+    assert_eq!(manager.get_load_balancing_mode(), "priority");
+    assert_eq!(manager.get_prompt_injection(), "committed");
+    assert!(!path.exists(), "must not recreate config for mode {mode}");
+    assert!(result.is_err(), "missing config must reject mode {mode}");
+}
+
+#[test]
+fn bdd_load_balancing_missing_config_file_never_publishes_or_recreates() {
+    assert_missing_config_file_rejects_load_balancing("balanced");
+}
+
+#[test]
+fn bdd_load_balancing_missing_config_file_unchanged_mode_never_recreates() {
+    assert_missing_config_file_rejects_load_balancing("priority");
+}
+
+#[test]
+fn bdd_missing_config_file_startup_defaults_but_updates_require_existing() {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    let startup = Config::load(&path).unwrap();
+    assert_eq!(startup.prompt_injection, "");
+    assert_eq!(startup.load_balancing_mode, "priority");
+    assert_eq!(startup.config_path(), Some(path.as_path()));
+    assert!(Config::load_existing(&path).is_err());
+    assert!(!path.exists());
+
+    std::fs::write(&path, r#"{"port":9191,"promptInjection":" \n\t"}"#).unwrap();
+    let existing = Config::load_existing(&path).unwrap();
+    assert_eq!(existing.port, 9191);
+    assert_eq!(existing.prompt_injection, "");
+    assert_eq!(existing.config_path(), Some(path.as_path()));
+    for invalid in [
+        "not json".to_string(),
+        serde_json::json!({"promptInjection":"x".repeat(16385)}).to_string(),
+    ] {
+        std::fs::write(&path, &invalid).unwrap();
+        assert!(Config::load_existing(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    }
+}
+
+#[test]
+fn bdd_prompt_injection_reload_failure_preserves_active_settings() {
+    let dir = TempDir::new();
+    let path = dir.0.join("config.json");
+    std::fs::write(&path, r#"{"promptInjection":"committed"}"#).unwrap();
+    let manager = prompt_manager(Config::load(&path).unwrap());
+    std::fs::write(&path, "not json").unwrap();
+    assert!(manager.set_prompt_injection("uncommitted".into()).is_err());
+    assert!(manager.set_load_balancing_mode("balanced".into()).is_err());
+    assert_eq!(manager.get_prompt_injection(), "committed");
+    assert_eq!(manager.get_load_balancing_mode(), "priority");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+}
+
+struct PromptAdminHttp {
+    client: reqwest::Client,
+    base: String,
+    manager: Arc<MultiTokenManager>,
+    server: tokio::task::JoinHandle<()>,
+    dir: TempDir,
+}
+
+impl Drop for PromptAdminHttp {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl PromptAdminHttp {
+    async fn start(persistent: bool) -> Self {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let config = if persistent {
+            Config::load(&path).unwrap()
+        } else {
+            Config::default()
+        };
+        let manager = prompt_manager(config);
+        let state = super::middleware::AdminState::new(
+            "admin-test",
+            AdminService::new(manager.clone(), Vec::new()),
+        );
+        let router =
+            axum::Router::new().nest("/api/admin", super::router::create_admin_router(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        Self {
+            client,
+            base,
+            manager,
+            server,
+            dir,
+        }
+    }
+
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        body: Option<serde_json::Value>,
+        auth: Option<(&str, &str)>,
+    ) -> reqwest::Response {
+        let mut request = self.client.request(
+            method,
+            format!("{}/api/admin/config/prompt-injection", self.base),
+        );
+        if let Some((name, value)) = auth {
+            request = request.header(name, value);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        request.send().await.unwrap()
+    }
+
+    async fn put(&self, body: serde_json::Value) -> reqwest::Response {
+        self.request(
+            reqwest::Method::PUT,
+            Some(body),
+            Some(("x-api-key", "admin-test")),
+        )
+        .await
+    }
+
+    async fn get(&self) -> serde_json::Value {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                None,
+                Some(("authorization", "Bearer admin-test")),
+            )
+            .await;
+        assert_eq!(response.status().as_u16(), 200);
+        response.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_real_admin_authentication() {
+    let http = PromptAdminHttp::start(true).await;
+    for method in [reqwest::Method::GET, reqwest::Method::PUT] {
+        for auth in [None, Some(("x-api-key", "wrong"))] {
+            let response = http
+                .request(
+                    method.clone(),
+                    Some(serde_json::json!({"promptInjection":"unauthorized"})),
+                    auth,
+                )
+                .await;
+            assert_eq!(response.status().as_u16(), 401);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+                "authentication_error"
+            );
+        }
+    }
+    assert_eq!(http.manager.get_prompt_injection(), "");
+    assert_eq!(http.get().await, serde_json::json!({"promptInjection":""}));
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_real_admin_roundtrip() {
+    let http = PromptAdminHttp::start(true).await;
+    for text in [
+        " \n实际文本\n ".to_string(),
+        "中".repeat(5461) + "x",
+        " \n\t".into(),
+        "".into(),
+    ] {
+        let expected = if text.trim().is_empty() { "" } else { &text };
+        let response = http.put(serde_json::json!({"promptInjection":text})).await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"promptInjection":expected})
+        );
+        assert_eq!(http.get().await["promptInjection"], expected);
+        assert_eq!(
+            Config::load(http.dir.0.join("config.json"))
+                .unwrap()
+                .prompt_injection,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_real_admin_validation() {
+    let http = PromptAdminHttp::start(true).await;
+    for value in ["界".repeat(5462), " ".repeat(16385)] {
+        let response = http.put(serde_json::json!({"promptInjection":value})).await;
+        assert_eq!(response.status().as_u16(), 400);
+        let error = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request");
+        assert!(!error.to_string().contains("界"));
+    }
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"promptInjection":false}),
+        serde_json::json!({"promptInjection":null}),
+        serde_json::json!({"promptInjection":16384}),
+        serde_json::json!({"promptInjection":[]}),
+    ] {
+        assert_eq!(http.put(body).await.status().as_u16(), 422);
+    }
+    assert_eq!(http.get().await["promptInjection"], "");
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_missing_config_file_rejects_put_and_keeps_get() {
+    let http = PromptAdminHttp::start(true).await;
+    http.manager.set_prompt_injection("keep".into()).unwrap();
+    let path = http.dir.0.join("config.json");
+    std::fs::remove_file(&path).unwrap();
+    assert!(http.dir.0.is_dir());
+
+    let response = http
+        .put(serde_json::json!({"promptInjection":"must not publish"}))
+        .await;
+    assert_eq!(response.status().as_u16(), 500);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+        "internal_error"
+    );
+    assert_eq!(http.get().await["promptInjection"], "keep");
+    assert_eq!(http.manager.get_prompt_injection(), "keep");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn bdd_prompt_injection_real_admin_storage_errors() {
+    let http = PromptAdminHttp::start(true).await;
+    http.manager.set_prompt_injection("keep".into()).unwrap();
+    std::fs::remove_file(http.dir.0.join("config.json")).unwrap();
+    std::fs::remove_dir(&http.dir.0).unwrap();
+    let response = http
+        .put(serde_json::json!({"promptInjection":"must not publish"}))
+        .await;
+    assert_eq!(response.status().as_u16(), 500);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+        "internal_error"
+    );
+    assert_eq!(http.get().await["promptInjection"], "keep");
+    let http = PromptAdminHttp::start(false).await;
+    assert_eq!(
+        http.put(serde_json::json!({"promptInjection":"no path"}))
+            .await
+            .status()
+            .as_u16(),
+        500
+    );
+    assert_eq!(http.get().await["promptInjection"], "");
+}
+
 struct TempDir(std::path::PathBuf);
 
 impl TempDir {

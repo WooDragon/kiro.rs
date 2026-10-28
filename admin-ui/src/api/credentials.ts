@@ -90,6 +90,20 @@ export async function bindCredentialProxy(
   return data
 }
 
+export interface PromptInjectionConfig {
+  promptInjection: string
+}
+
+export async function getPromptInjection(signal?: AbortSignal): Promise<PromptInjectionConfig> {
+  const { data } = await api.get<PromptInjectionConfig>('/config/prompt-injection', { signal })
+  return data
+}
+
+export async function setPromptInjection(promptInjection: string): Promise<PromptInjectionConfig> {
+  const { data } = await api.put<PromptInjectionConfig>('/config/prompt-injection', { promptInjection })
+  return data
+}
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')

@@ -212,6 +212,7 @@ async fn main() {
         config.anthropic_prompt_cache_mode,
         config.cc_streaming_mode,
         model_registry.clone(),
+        token_manager.prompt_injection_handle(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

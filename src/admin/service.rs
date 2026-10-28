@@ -18,7 +18,8 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BindProxyRequest,
     CreateProxyRequest, CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ProxyItem, ProxyListResponse, SetLoadBalancingModeRequest, UpdateProxyRequest,
+    PromptInjectionResponse, ProxyItem, ProxyListResponse, SetLoadBalancingModeRequest,
+    SetPromptInjectionRequest, UpdateProxyRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -324,6 +325,25 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    pub fn get_prompt_injection(&self) -> PromptInjectionResponse {
+        PromptInjectionResponse {
+            prompt_injection: self.token_manager.get_prompt_injection(),
+        }
+    }
+
+    pub fn set_prompt_injection(
+        &self,
+        req: SetPromptInjectionRequest,
+    ) -> Result<PromptInjectionResponse, AdminServiceError> {
+        let normalized = crate::model::config::normalize_prompt_injection(&req.prompt_injection)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        let prompt_injection = self
+            .token_manager
+            .set_prompt_injection(normalized)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(PromptInjectionResponse { prompt_injection })
     }
 
     /// 强制刷新指定凭据的 Token

@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getPromptInjection,
+  setPromptInjection,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 import { PROXIES_QUERY_KEY } from '@/hooks/use-proxies'
@@ -99,6 +101,29 @@ export function useDeleteCredential() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: PROXIES_QUERY_KEY })
+    },
+  })
+}
+
+export const PROMPT_INJECTION_QUERY_KEY = ['promptInjection'] as const
+
+export function usePromptInjection() {
+  return useQuery({
+    queryKey: PROMPT_INJECTION_QUERY_KEY,
+    queryFn: ({ signal }) => getPromptInjection(signal),
+    refetchOnMount: 'always',
+    retry: false,
+  })
+}
+
+export function useSetPromptInjection() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setPromptInjection,
+    onSuccess: async (data) => {
+      // PUT 在途也可能触发后台读取；成功发布前取消它们，避免旧响应覆盖保存值。
+      await queryClient.cancelQueries({ queryKey: PROMPT_INJECTION_QUERY_KEY, exact: true })
+      queryClient.setQueryData(PROMPT_INJECTION_QUERY_KEY, data)
     },
   })
 }

@@ -424,6 +424,9 @@ pub async fn post_messages(
         .await;
     }
 
+    let prompt = state.prompt_injection.read().clone();
+    super::prompt_injection::apply(&mut payload.messages, &prompt);
+
     // 转换请求
     let conversion_result = match convert_request(&payload, &state.model_registry) {
         Ok(result) => result,
@@ -1228,6 +1231,7 @@ fn override_thinking_from_model_name(
 /// 不等同于上游 Kiro 实际计费的 token 数——上游从不在本端点路径上暴露真实值，
 /// 该端点天然只能给出估算，不承诺与 `messages` 端点最终 usage 完全一致。
 pub async fn count_tokens(
+    State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -1241,6 +1245,11 @@ pub async fn count_tokens(
             count = stripped_headers,
             "已剥离 Claude Code x-anthropic-billing-header 系统块"
         );
+    }
+
+    if !websearch::is_web_search_only(payload.tools.as_deref()) {
+        let prompt = state.prompt_injection.read().clone();
+        super::prompt_injection::apply(&mut payload.messages, &prompt);
     }
 
     let total_tokens = token::count_all_tokens(
@@ -1322,6 +1331,9 @@ pub async fn post_messages_cc(
         )
         .await;
     }
+
+    let prompt = state.prompt_injection.read().clone();
+    super::prompt_injection::apply(&mut payload.messages, &prompt);
 
     // 转换请求
     let conversion_result = match convert_request(&payload, &state.model_registry) {

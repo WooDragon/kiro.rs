@@ -12,7 +12,7 @@ pub use proxy_pool::{ProxyBindingRequest, ProxyListItem, ProxyPoolError, ProxyUp
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -912,6 +912,9 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    prompt_injection: Arc<RwLock<String>>,
+    /// 两条 Config writer 共用；锁覆盖重读、保存及运行时发布。
+    config_update_lock: Mutex<()>,
     /// 最近一次统计持久化*尝试*时间（用于 debounce；#86 返工 SUGGESTION：
     /// 无论落盘成败都推进，语义是"上次尝试"而非"上次成功"，与脏状态解耦——
     /// 否则坏盘场景下每个请求都会因快判恒真而去抢 `stats_save_lock`）
@@ -1307,6 +1310,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let prompt_injection = Arc::new(RwLock::new(config.prompt_injection.clone()));
         let writable = is_multiple_format && credentials_path.is_some();
         let manager = Self {
             config,
@@ -1318,6 +1322,8 @@ impl MultiTokenManager {
             credentials_save_lock: Mutex::new(writable),
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            prompt_injection,
+            config_update_lock: Mutex::new(()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty_version: AtomicU64::new(0),
             stats_saved_version: AtomicU64::new(0),
@@ -3979,6 +3985,34 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
+    /// 与后续请求入口共享同一个 handle；读侧只持锁克隆快照。
+    pub fn prompt_injection_handle(&self) -> Arc<RwLock<String>> {
+        Arc::clone(&self.prompt_injection)
+    }
+
+    pub fn get_prompt_injection(&self) -> String {
+        self.prompt_injection.read().clone()
+    }
+
+    pub fn set_prompt_injection(&self, value: String) -> anyhow::Result<String> {
+        let normalized = crate::model::config::normalize_prompt_injection(&value)?;
+        let _guard = self.config_update_lock.lock();
+        let path = self
+            .config
+            .config_path()
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存 promptInjection"))?;
+        let mut config = Config::load_existing(path)?;
+        config.prompt_injection = normalized.clone();
+        config.save()?;
+        *self.prompt_injection.write() = normalized.clone();
+        tracing::info!(
+            enabled = !normalized.is_empty(),
+            bytes = normalized.len(),
+            "提示词注入配置已更新"
+        );
+        Ok(normalized)
+    }
+
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -3993,7 +4027,7 @@ impl MultiTokenManager {
             }
         };
 
-        let mut config = Config::load(&config_path)
+        let mut config = Config::load_existing(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.load_balancing_mode = mode.to_string();
         config
@@ -4010,17 +4044,9 @@ impl MultiTokenManager {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
-            return Ok(());
-        }
-
+        let _guard = self.config_update_lock.lock();
+        self.persist_load_balancing_mode(&mode)?;
         *self.load_balancing_mode.lock() = mode.clone();
-
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
-            return Err(err);
-        }
 
         tracing::info!(mode = mode.as_str(), "负载均衡模式已设置");
         Ok(())

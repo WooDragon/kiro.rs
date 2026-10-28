@@ -45,6 +45,7 @@ pub fn create_router_with_provider(
     prompt_cache_mode: PromptCacheMode,
     cc_streaming_mode: CcStreamingMode,
     model_registry: Arc<ModelRegistry>,
+    prompt_injection: Arc<parking_lot::RwLock<String>>,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
@@ -53,6 +54,7 @@ pub fn create_router_with_provider(
         cc_streaming_mode,
         model_registry,
     );
+    state.prompt_injection = prompt_injection;
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
