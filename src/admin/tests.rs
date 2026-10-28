@@ -72,6 +72,39 @@ fn api_key(extra: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
+fn bdd_suspension_admin_contract_uses_existing_reason_field() {
+    use crate::kiro::model::credentials::KiroCredentials;
+    let credential = KiroCredentials {
+        id: Some(1),
+        kiro_api_key: Some("ksk_synthetic_suspension".into()),
+        disabled: true,
+        disabled_reason: Some("TemporarilySuspended".into()),
+        ..Default::default()
+    };
+    let manager = Arc::new(
+        MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            Arc::new(ModelRegistry::builtin()),
+        )
+        .unwrap(),
+    );
+    let response = AdminService::new(manager, Vec::new()).get_all_credentials();
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["available"], 0);
+    assert_eq!(value["credentials"][0]["disabled"], true);
+    assert_eq!(
+        value["credentials"][0]["disabledReason"],
+        "TemporarilySuspended"
+    );
+    assert!(!value.to_string().contains("ksk_synthetic_suspension"));
+    assert!(value["credentials"][0].get("upstreamBlockReason").is_none());
+}
+
+#[test]
 fn bdd_global_proxy_configured_matrix() {
     let direct_credential = crate::kiro::model::credentials::KiroCredentials {
         id: Some(1),

@@ -662,7 +662,7 @@ impl CredentialEntry {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub(super) enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -675,6 +675,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 上游明确暂停；继续认证维护，仅人工操作解除本地禁用。
+    TemporarilySuspended,
 }
 
 /// 统计数据持久化条目
@@ -1276,7 +1278,11 @@ impl MultiTokenManager {
                     credential_id = entry.id,
                     "凭据配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用"
                 );
-                entry.set_reason(Some(DisabledReason::InvalidConfig));
+                if entry.disabled_reason != Some(DisabledReason::TemporarilySuspended) {
+                    entry.set_reason(Some(DisabledReason::InvalidConfig));
+                } else {
+                    entry.state_revision = entry.state_revision.wrapping_add(1);
+                }
             }
         }
 
@@ -2919,10 +2925,10 @@ impl MultiTokenManager {
         // 还是之后"的关键。
         //
         // ⚠️ 不变量（`save_stats` 的 doc comment 有完整推导，这里只放告警）：
-        // 本函数是当前唯一的标记点，且全部 6 个调用方
+        // 本函数是当前唯一的标记点，且全部 7 个调用方
         // （report_success/report_quota_exhausted/report_failure/
-        // report_refresh_failure/report_refresh_token_invalid/report_no_result，
-        // 最后一个由 #98 新增）都保证先释放 entries 锁、完成对 entries 的修改，
+        // report_refresh_failure/report_refresh_token_invalid/report_no_result/
+        // report_upstream_disabled）都保证先释放 entries 锁、完成对 entries 的修改，
         // 再调用本函数标记版本号。这个顺序
         // 是 `stats_saved_version` 清脏正确性的地基——新增任何调用点，都必须在
         // entries 修改**提交、锁释放之后**才调用本函数；一旦反过来（先标记后
@@ -3041,11 +3047,11 @@ impl MultiTokenManager {
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
+            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
@@ -3093,6 +3099,44 @@ impl MultiTokenManager {
         result
     }
 
+    /// 上游明确禁用先结清本次预留；人工决定优先，重复报告不改状态版本。
+    pub(super) fn report_upstream_disabled(&self, id: u64, reason: DisabledReason) -> bool {
+        let (changed, available) = {
+            let mut entries = self.entries.lock();
+            let mut changed = false;
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
+                if entry.disabled_reason != Some(DisabledReason::Manual)
+                    && entry.disabled_reason != Some(reason)
+                {
+                    entry.set_reason(Some(reason));
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    changed = true;
+                    tracing::warn!(
+                        credential_id = id,
+                        disabled_reason = reason.name(),
+                        "上游明确禁用凭据"
+                    );
+                }
+            }
+            if changed
+                && let Some(next) = entries
+                    .iter()
+                    .filter(|entry| !entry.disabled)
+                    .min_by_key(|entry| entry.credentials.priority)
+            {
+                *self.current_id.lock() = next.id;
+            }
+            (changed, entries.iter().any(|entry| !entry.disabled))
+        };
+        if changed {
+            self.clear_sticky_sessions_for_credential(id);
+            self.persist_credentials_observed();
+        }
+        self.save_stats_debounced();
+        available
+    }
+
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
@@ -3109,11 +3153,11 @@ impl MultiTokenManager {
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
+            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.in_flight_count = entry.in_flight_count.saturating_sub(1);
             entry.set_reason(Some(DisabledReason::QuotaExceeded));
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用

@@ -444,7 +444,11 @@ impl MultiTokenManager {
                         error = %error,
                         "凭据代理配置无效，已自动禁用"
                     );
-                    entry.set_reason(Some(DisabledReason::InvalidConfig));
+                    if entry.disabled_reason != Some(DisabledReason::TemporarilySuspended) {
+                        entry.set_reason(Some(DisabledReason::InvalidConfig));
+                    } else {
+                        entry.state_revision = entry.state_revision.wrapping_add(1);
+                    }
                     entry.route = fallback.clone();
                     // 运行时事实：这条回落才是"配置无效"的权威判据（F2）。
                     entry.route_build_failed = true;
