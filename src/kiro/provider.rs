@@ -14,8 +14,22 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 use crate::kiro::{LOG_PAYLOAD_LIMIT, truncate_for_log};
+
+fn classify_upstream_disabled_reason(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<DisabledReason> {
+    if !status.is_client_error() {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    match payload.get("reason").and_then(serde_json::Value::as_str) {
+        Some("TEMPORARILY_SUSPENDED") => Some(DisabledReason::TemporarilySuspended),
+        _ => None,
+    }
+}
 
 /// Provider 层类型化错误，供 handlers 层 downcast 后映射到正确 HTTP 状态码。
 #[derive(Debug)]
@@ -303,6 +317,21 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+
+            if let Some(reason) = classify_upstream_disabled_reason(status, &body) {
+                let has_available = self.token_manager.report_upstream_disabled(ctx.id, reason);
+                failed_credential_ids.insert(ctx.id);
+                let error = anyhow::anyhow!(
+                    "MCP 请求失败: {} {}",
+                    status,
+                    truncate_for_log(&body, LOG_PAYLOAD_LIMIT)
+                );
+                if !has_available {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                continue;
+            }
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -599,6 +628,26 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            if let Some(reason) = classify_upstream_disabled_reason(status, &body) {
+                let has_available = self.token_manager.report_upstream_disabled(ctx.id, reason);
+                failed_credential_ids.insert(ctx.id);
+                let error = match status.as_u16() {
+                    408 | 429 => ProviderError::UpstreamTransientExhausted {
+                        last_status: status.as_u16(),
+                        body,
+                    },
+                    _ => ProviderError::UpstreamClientError {
+                        status: status.as_u16(),
+                        body,
+                    },
+                };
+                if !has_available {
+                    return Err(error.into());
+                }
+                last_error = Some(error);
+                continue;
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -1257,6 +1306,230 @@ mod tests {
             (load - 8.8).abs() < 1e-2,
             "load 应约等于 2 次调用 × credit_weight(gpt-5.6-sol)=4.4 = 8.8（容差 1e-2 内，见上方 doc comment），实际: {load}"
         );
+    }
+
+    #[test]
+    fn suspension_classifier_requires_4xx_and_exact_top_level_reason() {
+        let exact = r#"{"reason":"TEMPORARILY_SUSPENDED"}"#;
+        for status in [
+            200, 302, 399, 400, 401, 402, 403, 404, 408, 429, 499, 500, 503,
+        ] {
+            assert_eq!(
+                classify_upstream_disabled_reason(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    exact
+                ),
+                (400..500)
+                    .contains(&status)
+                    .then_some(DisabledReason::TemporarilySuspended),
+                "{status}"
+            );
+        }
+        for body in [
+            "",
+            " ",
+            "{",
+            "null",
+            "[]",
+            "{}",
+            r#"{"reason":null}"#,
+            r#"{"reason":123}"#,
+            r#"{"reason":true}"#,
+            r#"{"reason":["TEMPORARILY_SUSPENDED"]}"#,
+            r#"{"error":{"reason":"TEMPORARILY_SUSPENDED"}}"#,
+            r#"{"reason":"temporarily_suspended"}"#,
+            r#"{"reason":" TEMPORARILY_SUSPENDED"}"#,
+            r#"{"reason":"TEMPORARILY_SUSPENDED suffix"}"#,
+            r#"{"message":"TEMPORARILY_SUSPENDED"}"#,
+        ] {
+            assert_eq!(
+                classify_upstream_disabled_reason(reqwest::StatusCode::FORBIDDEN, body),
+                None,
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_nonmatching_responses_keep_existing_health_policy() {
+        for (status, body, expected_reason) in [
+            (
+                "400 Bad Request",
+                r#"{"error":{"reason":"TEMPORARILY_SUSPENDED"}}"#,
+                None,
+            ),
+            ("401 Unauthorized", r#"{"message":"denied"}"#, None),
+            (
+                "403 Forbidden",
+                r#"{"reason":"temporarily_suspended"}"#,
+                None,
+            ),
+            (
+                "402 Payment Required",
+                r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+                Some("QuotaExceeded"),
+            ),
+            ("408 Request Timeout", r#"{"message":"timeout"}"#, None),
+            (
+                "429 Too Many Requests",
+                r#"{"message":"TEMPORARILY_SUSPENDED"}"#,
+                None,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"reason":"TEMPORARILY_SUSPENDED"}"#,
+                None,
+            ),
+        ] {
+            for mcp in [false, true] {
+                let stub = StubUpstream::start(status, body).await;
+                let provider = provider_with_stub(vec![api_key_credential(1, 0, None)], &stub);
+                let result = if mcp {
+                    provider.call_mcp_with_retry("{}", None).await.map(|_| ())
+                } else {
+                    provider
+                        .call_api_with_retry(&request_body("claude-sonnet-5"), false)
+                        .await
+                        .map(|_| ())
+                };
+                assert!(result.is_err());
+                let snapshot = provider.token_manager.snapshot();
+                assert_eq!(
+                    snapshot.entries[0].disabled_reason.as_deref(),
+                    expected_reason,
+                    "{status} mcp={mcp}"
+                );
+                let expected_failures = if expected_reason.is_some() {
+                    3
+                } else if status.starts_with("401") || status.starts_with("403") {
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    snapshot.entries[0].failure_count, expected_failures,
+                    "{status} mcp={mcp}"
+                );
+                assert_eq!(snapshot.available, usize::from(expected_reason.is_none()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_oauth_reason_precedes_bearer_force_refresh() {
+        let body = r#"{"reason":"TEMPORARILY_SUSPENDED","message":"The bearer token included in the request is invalid."}"#;
+        for mcp in [false, true] {
+            let stub = StubUpstream::start("403 Forbidden", body).await;
+            let refresh = StubUpstream::start("500 Internal Server Error", "{}").await;
+            assert!(
+                TestEndpoint {
+                    url: stub.url.clone()
+                }
+                .is_bearer_token_invalid(body)
+            );
+            let credential = KiroCredentials {
+                id: Some(1),
+                access_token: Some("synthetic-access".into()),
+                refresh_token: Some("r".repeat(120)),
+                expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                profile_arn: Some(
+                    "arn:aws:codewhisperer:us-east-1:111111111111:profile/test".into(),
+                ),
+                ..Default::default()
+            };
+            let provider = provider_with_stub(vec![credential], &stub);
+            provider
+                .token_manager
+                .install_refresh_url_for_test(refresh.url.clone());
+            let result = if mcp {
+                provider.call_mcp_with_retry("{}", None).await.map(|_| ())
+            } else {
+                provider
+                    .call_api_with_retry(&request_body("claude-sonnet-5"), false)
+                    .await
+                    .map(|_| ())
+            };
+            assert!(result.is_err());
+            assert_eq!(stub.hits(), 1);
+            assert_eq!(
+                refresh.hits(),
+                0,
+                "suspension must not force refresh, mcp={mcp}"
+            );
+            assert_eq!(
+                provider.token_manager.snapshot().entries[0]
+                    .disabled_reason
+                    .as_deref(),
+                Some("TemporarilySuspended")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suspension_model_and_mcp_fail_over_once_per_credential() {
+        for (status, credential_count) in [
+            ("400 Bad Request", 2),
+            ("401 Unauthorized", 2),
+            ("402 Payment Required", 2),
+            ("403 Forbidden", 2),
+            ("408 Request Timeout", 2),
+            ("429 Too Many Requests", 2),
+            ("404 Not Found", 2),
+            ("408 Request Timeout", 1),
+            ("429 Too Many Requests", 1),
+        ] {
+            for mcp in [false, true] {
+                let stub = StubUpstream::start(
+                    status,
+                    r#"{"reason":"TEMPORARILY_SUSPENDED","message":"bearer token invalid"}"#,
+                )
+                .await;
+                let provider = provider_with_stub(
+                    (1..=credential_count)
+                        .map(|id| api_key_credential(id, id as u32, None))
+                        .collect(),
+                    &stub,
+                );
+                let result = if mcp {
+                    provider.call_mcp_with_retry("{}", None).await.map(|_| ())
+                } else {
+                    provider
+                        .call_api_with_retry(&request_body("claude-sonnet-5"), false)
+                        .await
+                        .map(|_| ())
+                };
+                assert!(result.is_err());
+                assert_eq!(
+                    stub.hits(),
+                    credential_count as usize,
+                    "{status}, mcp={mcp}"
+                );
+                if !mcp {
+                    let error = result.unwrap_err();
+                    let status_code = status[..3].parse::<u16>().unwrap();
+                    let provider_error = error.downcast_ref::<ProviderError>();
+                    match status_code {
+                        408 | 429 => assert!(
+                            matches!(provider_error, Some(ProviderError::UpstreamTransientExhausted { last_status, .. }) if *last_status == status_code),
+                            "{status}: {provider_error:?}"
+                        ),
+                        _ => assert!(
+                            matches!(provider_error, Some(ProviderError::UpstreamClientError { status, .. }) if *status == status_code),
+                            "{status}: {provider_error:?}"
+                        ),
+                    }
+                }
+                let snapshot = provider.token_manager.snapshot();
+                assert_eq!(snapshot.available, 0);
+                for credential in snapshot.entries {
+                    assert_eq!(
+                        credential.disabled_reason.as_deref(),
+                        Some("TemporarilySuspended")
+                    );
+                    assert_eq!(credential.failure_count, 0);
+                }
+            }
+        }
     }
 
     /// P6：分支穷尽——5xx 拆分动了 `if` 链顺序敏感区，验证 400/404/402(月度

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { disabledReasonLabel } from '@/lib/credential-status'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Network } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -186,9 +187,6 @@ export function CredentialCard({
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline" className="min-w-0 max-w-full [overflow-wrap:anywhere]">{credential.disabledReason}</Badge>
-                )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
                     {credential.authMethod === 'api_key' ? 'API Key' :
@@ -213,6 +211,18 @@ export function CredentialCard({
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
+          {credential.disabled && (
+            <div data-testid="credential-disabled-reason" className="min-w-0 space-y-1 rounded-md border p-3 text-sm leading-relaxed break-words">
+              <p className="font-medium">禁用原因：{disabledReasonLabel(credential.disabledReason)}</p>
+              {credential.disabledReason === 'TemporarilySuspended' && (
+                <>
+                  <p className="font-mono text-xs break-all">TEMPORARILY_SUSPENDED</p>
+                  <p className="text-muted-foreground">触发原因和恢复时间未知，可联系官方支持。</p>
+                  <p className="text-muted-foreground">人工启用/重置仅解除本地禁用，不代表上游解锁。</p>
+                </>
+              )}
+            </div>
+          )}
           {/* 信息网格 */}
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>

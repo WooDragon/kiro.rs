@@ -55,6 +55,30 @@ it('长标题、代理名称与脱敏地址全文可读，不增加健康结论'
   expect(source).not.toHaveTextContent(/健康|探活/)
 })
 
+describe('禁用原因展示', () => {
+  it.each(['social', 'idc', 'api_key'])('Given %s 暂停，Then 说明事实和人工恢复边界', (authMethod) => {
+    renderCard(credential({ disabled: true, disabledReason: 'TemporarilySuspended', authMethod }))
+    const reason = screen.getByTestId('credential-disabled-reason')
+    expect(reason).toHaveTextContent('上游临时安全锁定')
+    expect(reason).toHaveTextContent('TEMPORARILY_SUSPENDED')
+    expect(reason).toHaveTextContent('触发原因和恢复时间未知，可联系官方支持')
+    expect(reason).toHaveTextContent('人工启用/重置仅解除本地禁用，不代表上游解锁')
+  })
+
+  it.each(['Manual', 'FutureReason', undefined, ''])('Given 禁用原因为 %s，Then 保留兼容展示', (disabledReason) => {
+    renderCard(credential({ disabled: true, disabledReason }))
+    const reason = screen.getByTestId('credential-disabled-reason')
+    expect(reason).toHaveTextContent(disabledReason === 'Manual' ? '人工禁用' : disabledReason || '禁用原因未提供')
+    expect(reason).not.toHaveTextContent('TEMPORARILY_SUSPENDED')
+  })
+
+  it('Given 启用且带陈旧暂停原因，Then 不展示禁用原因', () => {
+    renderCard(credential({ disabledReason: 'TemporarilySuspended' }))
+    expect(screen.queryByTestId('credential-disabled-reason')).not.toBeInTheDocument()
+    expect(screen.queryByText('TemporarilySuspended')).not.toBeInTheDocument()
+  })
+})
+
 describe('凭据卡片的代理来源展示', () => {
   it('无实际地址时只显示全局来源，不猜全局状态', () => {
     renderCard(credential({ hasProxy: true, proxyMode: 'inherit' }))
