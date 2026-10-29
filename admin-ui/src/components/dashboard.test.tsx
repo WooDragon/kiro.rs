@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { toast } from 'sonner'
 import { renderWithQueryClient } from '@/test/harness'
 import { installMockServer, proxyItem } from '@/test/mock-server'
 import { Dashboard } from '@/components/dashboard'
@@ -439,6 +440,70 @@ it('切换成功也等待真实query：priority→balanced→priority，同行�
     expect(screen.getByRole('button', { name: '凭据 #7 详情' })).toHaveAttribute('aria-expanded', 'true')
   }
   expect(server.find('PUT', '/config/load-balancing').map(request => request.body)).toEqual([{ mode: 'balanced' }, { mode: 'priority' }])
+})
+
+it('成功写后读回挂起不可重入，不提前宣称成功，且复用hook自动GET', async () => {
+  let written = false
+  let releaseRead!: (value: { data: unknown }) => void
+  installModeServer(request => {
+    if (request.method === 'PUT') { written = true; return { data: { success: true } } }
+    return written ? new Promise(resolve => { releaseRead = resolve }) : { data: { mode: 'priority' } }
+  })
+  const success = vi.spyOn(toast, 'success')
+  const user = userEvent.setup()
+  renderWithQueryClient(<Dashboard onLogout={() => {}} />)
+  const button = await screen.findByRole('button', { name: '优先级模式' })
+  act(() => { button.click(); button.click() })
+  await waitFor(() => expect(server.find('GET', '/config/load-balancing')).toHaveLength(2))
+  expect(button).toBeDisabled()
+  await user.click(button)
+  expect(server.find('PUT', '/config/load-balancing')).toHaveLength(1)
+  expect(success).not.toHaveBeenCalled()
+  await act(async () => { releaseRead({ data: { mode: 'priority' } }) })
+  await waitFor(() => expect(button).toBeEnabled())
+  expect(success).toHaveBeenCalledWith('已确认当前为优先级模式')
+  expect(server.find('GET', '/config/load-balancing')).toHaveLength(2)
+})
+
+it.each(['priority', 'balanced'])('成功写后GET失败隐藏失效指示，仅重试GET并按真实%s恢复', async recoveredMode => {
+  let written = false
+  let readState = 'failed'
+  let releaseRead!: (value: { data: unknown }) => void
+  installModeServer(request => {
+    if (request.method === 'PUT') { written = true; return { data: { success: true } } }
+    if (!written) return { data: { mode: 'priority' } }
+    return readState === 'failed' ? { status: 500 } : new Promise(resolve => { releaseRead = resolve })
+  })
+  const success = vi.spyOn(toast, 'success')
+  const user = userEvent.setup()
+  renderWithQueryClient(<Dashboard onLogout={() => {}} />)
+  await user.click(await screen.findByRole('button', { name: '优先级模式' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('模式读回失败')
+  expect(screen.getByRole('button', { name: '模式未知' })).toBeDisabled()
+  expect(screen.getByLabelText('凭据概览')).not.toHaveTextContent('当前')
+  const row = screen.getByTestId('credential-row-7')
+  expect(within(row).queryByText(/当前|优先级/)).not.toBeInTheDocument()
+  expect(row).not.toHaveClass('ring-2')
+  expect(success).not.toHaveBeenCalled()
+  // 失败的重试仍不能重新发PUT或恢复旧指示。
+  await user.click(screen.getByRole('button', { name: '重试读取模式' }))
+  await waitFor(() => expect(server.find('GET', '/config/load-balancing')).toHaveLength(3))
+  await waitFor(() => expect(screen.getByRole('button', { name: '重试读取模式' })).toBeEnabled())
+  expect(screen.getByRole('button', { name: '模式未知' })).toBeDisabled()
+  readState = 'pending'
+  const retry = screen.getByRole('button', { name: '重试读取模式' })
+  act(() => { retry.click(); retry.click() })
+  await waitFor(() => expect(server.find('GET', '/config/load-balancing')).toHaveLength(4))
+  expect(retry).toBeDisabled()
+  expect(screen.getByRole('button', { name: '模式未知' })).toBeDisabled()
+  await act(async () => { releaseRead({ data: { mode: recoveredMode } }) })
+  await waitFor(() => expect(screen.getByRole('button', { name: recoveredMode === 'priority' ? '优先级模式' : '均衡负载' })).toBeEnabled())
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('凭据概览').textContent?.includes('当前选定 #7')).toBe(recoveredMode === 'priority')
+  expect(within(row).queryByText('当前选定') !== null).toBe(recoveredMode === 'priority')
+  expect(server.find('PUT', '/config/load-balancing')).toHaveLength(1)
+  expect(server.find('PUT', '/config/load-balancing')[0].body).toEqual({ mode: 'balanced' })
+  expect(success).toHaveBeenCalledWith(`已确认当前为${recoveredMode === 'priority' ? '优先级模式' : '均衡负载模式'}`)
 })
 
 it('balanced详情保留优先级编辑/上下调原请求与开关，不改变服务端列表顺序', async () => {

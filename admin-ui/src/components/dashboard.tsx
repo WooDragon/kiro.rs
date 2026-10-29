@@ -79,9 +79,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     : undefined
   const { mutateAsync: deleteCredential } = useDeleteCredential()
   const { mutateAsync: resetFailure } = useResetFailure()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-  const loadBalancingMode = loadBalancingData?.mode === 'priority' || loadBalancingData?.mode === 'balanced'
+  const { data: loadBalancingData, isLoading: isLoadingMode, refetch: refetchMode } = useLoadBalancingMode()
+  const { mutateAsync: setLoadBalancingMode } = useSetLoadBalancingMode()
+  const modeLockRef = useRef(false)
+  const [isSettingMode, setIsSettingMode] = useState(false)
+  const [modeReadFailed, setModeReadFailed] = useState(false)
+  const loadBalancingMode = !modeReadFailed && (loadBalancingData?.mode === 'priority' || loadBalancingData?.mode === 'balanced')
     ? loadBalancingData.mode : undefined
 
   const filteredCredentials = filterCredentials(data?.credentials || [], search, status)
@@ -427,20 +430,43 @@ export function Dashboard({ onLogout }: DashboardProps) {
     cancelVerifyRef.current = true
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    if (!loadBalancingMode || isLoadingMode || isSettingMode) return
-    const newMode = loadBalancingMode === 'priority' ? 'balanced' : 'priority'
+  const readBackMode = async () => {
+    try {
+      // hook 已启动 invalidate GET；复用在途读取，不取消或重复请求。
+      const result = await refetchMode({ cancelRefetch: false })
+      if (result.isError) throw result.error
+      const mode = result.data?.mode
+      if (mode !== 'priority' && mode !== 'balanced') throw new Error('服务器返回未知模式')
+      setModeReadFailed(false)
+      toast.success(`已确认当前为${mode === 'priority' ? '优先级模式' : '均衡负载模式'}`)
+    } catch (error) {
+      setModeReadFailed(true)
+      toast.error(`模式读回失败: ${extractErrorMessage(error)}`)
+    }
+  }
 
-    setLoadBalancingMode(newMode, {
-      onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
-      },
-      onError: (error) => {
-        toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
-    })
+  // 锁覆盖写入及真实读回；写失败不作废原已知模式。
+  const handleToggleLoadBalancing = async () => {
+    if (!loadBalancingMode || isLoadingMode || modeLockRef.current) return
+    modeLockRef.current = true
+    setIsSettingMode(true)
+    try {
+      await setLoadBalancingMode(loadBalancingMode === 'priority' ? 'balanced' : 'priority')
+      await readBackMode()
+    } catch (error) {
+      toast.error(`切换失败: ${extractErrorMessage(error)}`)
+    } finally {
+      modeLockRef.current = false
+      setIsSettingMode(false)
+    }
+  }
+
+  const handleRetryModeRead = async () => {
+    if (modeLockRef.current) return
+    modeLockRef.current = true
+    setIsSettingMode(true)
+    try { await readBackMode() }
+    finally { modeLockRef.current = false; setIsSettingMode(false) }
   }
 
   if (isLoading) {
@@ -512,6 +538,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <span>可用凭据 <strong className="text-foreground">{data?.available || 0}</strong></span>
           {loadBalancingMode === 'priority' && <span>当前选定 <strong className="text-foreground">{data?.currentId ? `#${data.currentId}` : '无'}</strong></span>}
         </div>
+        {modeReadFailed && <div role="alert" className="mb-3 text-sm text-destructive">
+          模式读回失败，当前模式未确认；请重试读取后再切换。
+          <Button variant="outline" size="sm" onClick={handleRetryModeRead} disabled={isSettingMode}>重试读取模式</Button>
+        </div>}
         {error && <p role="alert" className="mb-3 text-sm text-destructive">后台刷新失败，保留上次列表；可重试刷新。</p>}
 
         {/* 凭据列表 */}
