@@ -10,8 +10,10 @@ Artifacts contain dummy passwords verbatim to verify persistence semantics.
 import argparse
 from contextlib import contextmanager
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,7 +21,7 @@ import time
 import traceback
 import unittest
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from playwright.sync_api import expect, sync_playwright
@@ -47,10 +49,23 @@ def credentials():
             for number in range(1, 5)]
 
 
+def compact_document():
+    items = [{"id": number, "authMethod": "api_key",
+              "kiroApiKey": f"ksk_dummy_never_submit_{number}",
+              "email": f"user{number:02d}@example.invalid", "priority": number,
+              "disabled": number % 4 == 0,
+              **({"disabledReason": "Manual"} if number % 4 == 0 else {})}
+             for number in range(1, 26)]
+    items[4]["proxyId"] = "office"
+    return {"version": 1, "proxies": [{"id": "office", "name": "OfficeProxy",
+            "url": "http://127.0.0.1:9"}], "credentials": items}
+
+
 def fixture_document(global_proxy):
     items = credentials()
     if not global_proxy:
         return items
+    items[2]["email"] = "long-identity-" * 18 + "@example.invalid"
     items[1]["proxyUrl"] = "direct"
     items[2]["proxyId"] = "long-proxy"
     items[3].update(proxyUrl=LONG_URL, proxyUsername="dummy-inline",
@@ -127,7 +142,7 @@ class Service:
 
 
 @contextmanager
-def private_fixture(label, global_proxy=False):
+def private_fixture(label, global_proxy=False, compact=False):
     artifacts = OPTIONS.artifacts / label
     artifacts.mkdir()
     with tempfile.TemporaryDirectory(prefix="kiro-proxy-admin-") as temporary:
@@ -137,16 +152,41 @@ def private_fixture(label, global_proxy=False):
         if global_proxy:
             config["proxyUrl"] = "http://127.0.0.1:9"
         save_json(directory / "config.json", config)
-        save_json(directory / "credentials.json", fixture_document(global_proxy))
+        document = compact_document() if compact else fixture_document(global_proxy)
+        save_json(directory / "credentials.json", document)
         service = Service(directory, artifacts)
         save_json(artifacts / "fixture.json", {"config": config,
-                  "credentials": fixture_document(global_proxy), "directory": temporary})
+                  "credentials": document, "directory": temporary})
         try:
             service.start()
             yield service
         finally:
             service.close()
     save_json(artifacts / "fixture-cleanup.json", {"removed": not directory.exists()})
+
+
+class AdminAssetParser(HTMLParser):
+    def __init__(self, document_url):
+        super().__init__()
+        self.document_url = document_url
+        self.origin = urlsplit(document_url)
+        self.resources = []
+        self.kinds = set()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "script" and attrs.get("src"):
+            kind, reference = "script", attrs["src"]
+        elif tag == "link" and "stylesheet" in attrs.get("rel", "").lower().split() and attrs.get("href"):
+            kind, reference = "css", attrs["href"]
+        else:
+            return
+        resource = urlsplit(urljoin(self.document_url, reference))
+        if (resource.scheme, resource.netloc) != (self.origin.scheme, self.origin.netloc):
+            return
+        if resource.path.startswith("/admin/assets/"):
+            self.resources.append(resource)
+            self.kinds.add(kind)
 
 
 class BrowserSession:
@@ -169,6 +209,8 @@ class BrowserSession:
         page.on("requestfailed", lambda request: self.record(
             "requestfailed", {"url": request.url, "failure": request.failure}, True))
         page.on("response", self.response)
+        page.on("request", lambda request: self.record("request", {
+            "url": request.url, "method": request.method, "postData": request.post_data}))
 
     def record(self, kind, detail, bad=False):
         event = {"kind": kind, "detail": detail, "unexpected": bad}
@@ -179,6 +221,7 @@ class BrowserSession:
 
     def console(self, message):
         if message.type != "error":
+            self.record("console." + message.type, message.text)
             return
         # Chromium reports expected HTTP failures separately from response events.
         # Correlate the exact resource URL AND numeric status, never blanket-ignore.
@@ -221,6 +264,26 @@ class BrowserSession:
             "browser_entry": "/admin", "note": "Existing Rust route uses no trailing slash"})
         response = self.page.goto(self.service.base + "/admin", wait_until="networkidle")
         assert response.status == 200, f"Admin document: {response.status}"
+        html = response.text()
+        expected_html = (Path(__file__).resolve().parents[1] / "dist/index.html").read_text()
+        assert html == expected_html, "Served Admin does not match the current built dist"
+        (self.service.artifacts / "served-admin.html").write_text(html)
+        parser = AdminAssetParser(response.url)
+        parser.feed(html)
+        parser.close()
+        assert parser.resources, "No same-origin Admin assets found in the current dist HTML"
+        assert parser.kinds == {"script", "css"}, "Current dist must contain both script and stylesheet assets"
+        resources = []
+        for resource in parser.resources:
+            path = resource.path
+            with urlopen(resource.geturl(), timeout=5) as asset:
+                content = asset.read()
+                assert asset.status == 200
+            local = Path(__file__).resolve().parents[1] / "dist" / path.removeprefix("/admin/")
+            assert content == local.read_bytes(), f"Stale served resource: {path}"
+            resources.append({"path": path, "bytes": len(content), "matchesDist": True,
+                              "sha256": hashlib.sha256(content).hexdigest()})
+        save_json(self.service.artifacts / "served-resources.json", resources)
         if bad_key:
             self.expected.add(("/api/admin/credentials", 401))
             self.expected.add(("/api/admin/proxies", 401))
@@ -245,8 +308,19 @@ class BrowserSession:
         expect(dialog.get_by_role("button", name="新增代理", exact=True)).to_be_enabled()
         return dialog
 
-    def edit_binding(self, index=0):
-        self.page.get_by_role("button", name="修改代理", exact=True).nth(index).click()
+    def row(self, credential_id):
+        return self.page.get_by_test_id(f"credential-row-{credential_id}")
+
+    def expand(self, credential_id):
+        row = self.row(credential_id)
+        trigger = row.get_by_role("button", name=f"凭据 #{credential_id} 详情", exact=True)
+        if trigger.get_attribute("aria-expanded") != "true":
+            trigger.click()
+        expect(trigger).to_have_attribute("aria-expanded", "true")
+        return row
+
+    def edit_binding(self, credential_id=1):
+        self.expand(credential_id).get_by_role("button", name="修改代理", exact=True).click()
         return self.dialog("修改代理")
 
     def mutation(self, method, path, action, status=200):
@@ -526,7 +600,6 @@ class ProxyAdminE2E(unittest.TestCase):
         session.mutation("DELETE", f"/api/admin/proxies/{proxy_id}", lambda:
                          dialog.get_by_role("button", name="确认删除").click(), status=409)
         expect(dialog.get_by_role("alert")).to_be_visible()
-        session.page.wait_for_timeout(600)
         expect(dialog.get_by_role("alert")).to_be_visible()
         session.shot("delete-conflict")
         service.snapshot("delete-conflict-unchanged")
@@ -594,22 +667,26 @@ class ProxyAdminE2E(unittest.TestCase):
         page.set_viewport_size({"width": width, "height": height})
         page.emulate_media(reduced_motion="reduce")
         if page.locator("html").evaluate("node => node.classList.contains('dark')") != (theme == "dark"):
-            # The existing theme button has no accessible name; identify its own icon,
-            # not the neighboring refresh control (which could invoke other actions).
-            page.locator('header button').filter(has=page.locator('svg.lucide-moon, svg.lucide-sun')).click()
+            page.get_by_role("button", name="切换主题", exact=True).click()
         assert page.locator("html").evaluate("node => node.classList.contains('dark')") == (theme == "dark")
         label = f"{width}x{height}-{theme}"
-        session.shot(label + "-dashboard")
-        save_json(session.service.artifacts / f"{label}-page-width.json", page.evaluate("""() => ({
-          viewport:innerWidth, document:document.documentElement.scrollWidth,
-          header:[...document.querySelectorAll('header')].map(node => ({
-            client:node.clientWidth, scroll:node.scrollWidth,
-            right:node.getBoundingClientRect().right})),
-          credentialCards:[...document.querySelectorAll('button')].filter(node =>
-            node.textContent.trim() === '修改代理').map(node => ({
-              client:node.closest('[class*="rounded"]').clientWidth,
-              scroll:node.closest('[class*="rounded"]').scrollWidth}))
-        })"""))
+        expect(page.locator('[data-testid^="credential-row-"]')).to_have_count(4)
+        page.screenshot(path=session.service.artifacts / f"{label}-dashboard.png", full_page=True)
+        widths = page.locator('[data-testid^="credential-row-"]').evaluate_all("""nodes =>
+          nodes.map(node => ({client:node.clientWidth, scroll:node.scrollWidth}))""")
+        save_json(session.service.artifacts / f"{label}-page-width.json", widths)
+        assert all(item["scroll"] <= item["client"] + 1 for item in widths), widths
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), label
+        row = session.expand(3)
+        source = row.get_by_test_id("credential-proxy-source")
+        expect(source).to_contain_text(LONG_NAME)
+        expect(row.locator('[id="credential-detail-3"] > p').filter(has_text="long-identity-")).to_contain_text("long-identity-" * 18 + "@example.invalid")
+        assert row.evaluate("n => n.scrollWidth <= n.clientWidth + 1"), label
+        assert source.evaluate("n => n.scrollWidth <= n.clientWidth + 1"), label
+        page.screenshot(path=session.service.artifacts / f"{label}-expanded.png", full_page=True)
+        row.locator('[id="credential-detail-3"]').evaluate("""n => scrollTo(0,
+          n.getBoundingClientRect().top + scrollY - document.querySelector('header').offsetHeight - 8)""")
+        session.shot(label + "-expanded-viewport")
         pool = session.pool()
         expect(pool.get_by_text(LONG_NAME, exact=True)).to_be_visible()
         session.layout(pool, label + "-pool")
@@ -668,7 +745,7 @@ class ProxyAdminE2E(unittest.TestCase):
         self.assertEqual(before, (session.service.directory / "credentials.json").read_bytes())
 
     def visual_binding(self, session, label):
-        dialog = session.edit_binding(2)
+        dialog = session.edit_binding(3)
         expect(dialog.get_by_text("已配置全局代理", exact=True)).to_be_visible()
         expect(dialog.get_by_role("radio", name="使用指定代理", exact=True)).to_be_checked()
         session.layout(dialog, label + "-binding-pool")
@@ -677,7 +754,311 @@ class ProxyAdminE2E(unittest.TestCase):
         session.layout(dialog, label + "-binding-inline")
         session.focus_trap(dialog)
         session.page.keyboard.press("Escape")
-        session.restored_focus(session.page.get_by_role("button", name="修改代理", exact=True).nth(2), label + "-binding-close")
+        session.restored_focus(session.row(3).get_by_role("button", name="修改代理", exact=True), label + "-binding-close")
+        expect(session.row(3).get_by_role("button", name="凭据 #3 详情", exact=True)).to_have_attribute("aria-expanded", "true")
+
+
+    def test_03_compact_list_real_http_and_visual(self):
+        """Given 25 local keys, manage compact rows without upstream operations."""
+        with private_fixture("C-compact-list", compact=True) as service:
+            with browser_session(self.browser, service) as session:
+                session.login()
+                page = session.page
+                self.assert_rows(page, range(1, 13))
+                expect(page.get_by_text("第 1 / 3 页，命中 25 项", exact=True)).to_be_visible()
+                self.assertEqual(page.locator('[aria-expanded="true"][aria-controls^="credential-"]').count(), 0)
+                expect(page.get_by_test_id("credential-disabled-reason")).to_have_count(0)
+                expect(session.row(4).get_by_test_id("credential-disabled-summary")).to_contain_text("人工禁用")
+                expect(session.row(5).get_by_test_id("credential-proxy-summary")).to_contain_text("OfficeProxy")
+                problems = self.mode_transitions(session, service)
+                self.cross_page_selection(session)
+                self.search_filters(session)
+                self.local_mutations(session, service)
+                self.cancel_global_clear(session, service)
+                forbidden = [event for event in session.events if event["kind"] == "request" and
+                             any(part in urlsplit(event["detail"]["url"]).path
+                                 for part in ("/balance", "/refresh", "/verify", "/probe", "/messages"))]
+                self.assertEqual(forbidden, [], "Unexpected upstream-oriented browser operation")
+                service.snapshot("final")
+                session.assert_clean()
+                self.assertEqual(problems, [], "Strict visual acceptance failed; see visual-metrics.json")
+
+    def assert_rows(self, page, ids):
+        rows = page.locator('[data-testid^="credential-row-"]')
+        expected = [f"credential-row-{number}" for number in ids]
+        expect(rows).to_have_count(len(expected))
+        self.assertEqual(rows.evaluate_all("nodes => nodes.map(n => n.dataset.testid)"), expected)
+
+    def assert_mode(self, session, service, mode):
+        page = session.page
+        label = "优先级模式" if mode == "priority" else "均衡负载"
+        expect(page.get_by_role("button", name=label, exact=True)).to_be_enabled()
+        status, response = service.request("/api/admin/config/load-balancing")
+        self.assertEqual((status, response), (200, {"mode": mode}))
+        status, listing = service.request("/api/admin/credentials")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["currentId"], 1)
+        self.assertTrue(next(item for item in listing["credentials"] if item["id"] == 1)["isCurrent"])
+        self.assert_rows(page, range(1, 13))
+        overview = page.locator('[aria-label="凭据概览"]')
+        indicators = page.get_by_text("当前选定", exact=True)
+        if mode == "priority":
+            expect(overview).to_contain_text("当前选定 #1")
+            expect(session.row(1).get_by_text("当前选定", exact=True)).to_be_visible()
+            expect(indicators).to_have_count(1)
+        else:
+            expect(overview).not_to_contain_text("当前选定")
+            expect(overview).not_to_contain_text("#1")
+            expect(indicators).to_have_count(0)
+        for number in range(1, 13):
+            row = session.row(number)
+            summary = row.locator(":scope > div").first
+            expect(summary.get_by_text("启用", exact=True)).to_have_count(0)
+            expect(summary.get_by_text("已禁用", exact=True)).to_have_count(0)
+            expect(row.get_by_role("switch", name=f"启用凭据 #{number}", exact=True)).to_be_checked(checked=number % 4 != 0)
+            if mode == "priority":
+                expect(summary.get_by_text(f"优先级 {number}", exact=True)).to_be_visible()
+            else:
+                expect(summary.get_by_text(re.compile("优先级"))).to_have_count(0)
+        expect(session.row(4).get_by_test_id("credential-disabled-summary")).to_contain_text("人工禁用")
+        shadows = [session.row(number).evaluate("n => getComputedStyle(n).boxShadow") for number in (1, 2)]
+        self.assertEqual(shadows[0] == shadows[1], mode == "balanced", shadows)
+        save_json(service.artifacts / f"{mode}-indicators.json", {"currentId": listing["currentId"], "shadows": shadows})
+
+    def switch_mode(self, session, service, mode):
+        before = "优先级模式" if mode == "balanced" else "均衡负载"
+        body = session.mutation("PUT", "/api/admin/config/load-balancing", lambda:
+                                session.page.get_by_role("button", name=before, exact=True).click())
+        self.assertEqual(body, {"mode": mode})
+        self.assert_mode(session, service, mode)
+        config = json.loads((service.directory / "config.json").read_text())
+        self.assertEqual(config["loadBalancingMode"], mode)
+        save_json(service.artifacts / f"{mode}-config.json", config)
+        service.snapshot(f"{mode}-credentials")
+        # A toast under the last click pauses its dismissal while hovered.
+        session.page.mouse.move(0, 0)
+        expect(session.page.locator('[data-sonner-toast]')).to_have_count(0)
+
+    def mode_transitions(self, session, service):
+        self.assert_mode(session, service, "priority")
+        problems = self.compact_visuals(session, "priority")
+        self.switch_mode(session, service, "balanced")
+        problems.extend(self.compact_visuals(session, "balanced"))
+        row = session.expand(1)
+        expect(row.get_by_text("负载相同时优先，数字越小越优先", exact=True)).to_be_visible()
+        expect(row.get_by_role("button", name="提高优先级", exact=True)).to_be_enabled()
+        expect(row.get_by_role("button", name="降低优先级", exact=True)).to_be_enabled()
+        for priority in (0, 1):
+            row.get_by_role("button", name="编辑优先级", exact=True).click()
+            editor = row.get_by_role("spinbutton", name="优先级", exact=True)
+            expect(editor).to_have_value(str(1 if priority == 0 else 0))
+            editor.fill(str(priority))
+            body = session.mutation("POST", "/api/admin/credentials/1/priority", lambda:
+                                    row.get_by_role("button", name="保存优先级", exact=True).click())
+            self.assertEqual(body, {"priority": priority})
+            expect(row.get_by_role("button", name="编辑优先级", exact=True)).to_have_text(f"{priority}（编辑）")
+            saved = service.snapshot(f"balanced-priority-{priority}")["credentials"]
+            entry = next(item for item in saved if item["id"] == 1)
+            # Credentials serializes the default zero priority by omitting it.
+            if priority == 0:
+                self.assertNotIn("priority", entry)
+            else:
+                self.assertEqual(entry["priority"], priority)
+            status, listing = service.request("/api/admin/credentials")
+            self.assertEqual(status, 200)
+            self.assertEqual([item["id"] for item in listing["credentials"]], list(range(1, 26)))
+            self.assertEqual(listing["credentials"][0]["priority"], priority)
+        session.page.mouse.move(0, 0)
+        expect(session.page.locator('[data-sonner-toast]')).to_have_count(0)
+        session.page.screenshot(path=service.artifacts / "balanced-expanded-detail.png", full_page=True)
+        row.get_by_role("button", name="凭据 #1 详情", exact=True).click()
+        self.assert_mode(session, service, "balanced")
+        self.switch_mode(session, service, "priority")
+        row = session.expand(1)
+        expect(row.get_by_role("button", name="编辑优先级", exact=True)).to_have_text("1（编辑）")
+        expect(row.get_by_text("负载相同时优先，数字越小越优先", exact=True)).to_have_count(0)
+        session.page.screenshot(path=service.artifacts / "priority-restored-detail.png", full_page=True)
+        row.get_by_role("button", name="凭据 #1 详情", exact=True).click()
+        return problems
+
+    def compact_visuals(self, session, mode):
+        page, metrics, problems = session.page, [], []
+        for width, height in ((1440, 900), (390, 844), (320, 568)):
+            for theme in ("light", "dark"):
+                page.set_viewport_size({"width": width, "height": height})
+                page.emulate_media(reduced_motion="reduce")
+                if page.locator("html").evaluate("n => n.classList.contains('dark')") != (theme == "dark"):
+                    page.get_by_role("button", name="切换主题", exact=True).click()
+                page.evaluate("scrollTo(0, 0)")
+                self.assert_rows(page, range(1, 13))
+                label = f"{mode}-{width}x{height}-{theme}"
+                page.screenshot(path=session.service.artifacts / f"{label}-full.png",
+                                full_page=True, animations="disabled")
+                measure = self.measure_compact(page)
+                measure.update(viewport=f"{width}x{height}", theme=theme, mode=mode)
+                failures = self.visual_failures(measure, width)
+                measure["failures"] = failures
+                metrics.append(measure)
+                problems.extend(f"{label}: {failure}" for failure in failures)
+                save_json(session.service.artifacts / f"{mode}-visual-metrics.json", metrics)
+        page.set_viewport_size({"width": 1440, "height": 900})
+        return problems
+
+    def measure_compact(self, page):
+        return page.evaluate("""() => {
+          const box = n => {const b=n.getBoundingClientRect(); return {
+            x:b.x,y:b.y,right:b.right,bottom:b.bottom,width:b.width,height:b.height}};
+          const content = n => {const b=box(n),s=getComputedStyle(n); return {
+            left:b.x+parseFloat(s.paddingLeft),right:b.right-parseFloat(s.paddingRight)}};
+          const main=document.querySelector('main'), header=document.querySelector('header > div');
+          const rows=[...document.querySelectorAll('[data-testid^="credential-row-"]')];
+          const controls=[...document.querySelectorAll('header button,main button,main input,main select')]
+            .filter(n => n.getBoundingClientRect().height).map(n => {
+              const target=n.closest('label') || n;
+              return {name:n.getAttribute('aria-label')||n.textContent, ...box(target)};});
+          const headerBox=box(document.querySelector('header'));
+          return {header:content(header),main:content(main),
+            navRight:box(document.querySelector('header > div > div:last-child')).right,
+            documentWidth:document.documentElement.scrollWidth,viewport:innerWidth,
+            rows:rows.map(box),listHeight:box(rows.at(-1)).bottom-box(rows[0]).y,
+            completeRows:rows.filter(n => {const b=box(n); return b.y>=headerBox.bottom && b.bottom<=innerHeight}).length,
+            bodyFonts:rows.map(n => parseFloat(getComputedStyle(n.firstElementChild).fontSize)),controls};
+        }""")
+
+    def visual_failures(self, measure, width):
+        failures = []
+        for edge in ("left", "right"):
+            if abs(measure["header"][edge] - measure["main"][edge]) > 1:
+                failures.append(f"{edge} content misaligned: {measure['header']} vs {measure['main']}")
+        if width == 1440 and abs(measure["navRight"] - measure["main"]["right"]) > 1:
+            failures.append("Desktop navigation right edge is not aligned")
+        if measure["documentWidth"] > width:
+            failures.append(f"Document overflow: {measure['documentWidth']} > {width}")
+        if width == 1440 and measure["listHeight"] > 720:
+            failures.append(f"12 ordinary rows height {measure['listHeight']} > 720")
+        if width == 1440 and measure["completeRows"] < 8:
+            failures.append(f"First viewport has {measure['completeRows']} complete rows < 8")
+        if any(abs(size - 14) > 1 for size in measure["bodyFonts"]):
+            failures.append(f"Body text is not approximately 14px: {measure['bodyFonts']}")
+        minimum = 32 if width == 1440 else 44
+        failures.extend(f"Click target {control['name']!r}: height {control['height']} < {minimum}"
+                        for control in measure["controls"] if control["height"] < minimum)
+        return failures
+
+    def cross_page_selection(self, session):
+        page = session.page
+        page.get_by_role("checkbox", name="选择当前页", exact=True).click()
+        expect(page.get_by_role("status").filter(has_text="已选 12 项")).to_be_visible()
+        page.get_by_role("button", name="下一页", exact=True).click()
+        self.assert_rows(page, range(13, 25))
+        page.get_by_role("checkbox", name="选择凭据 #13", exact=True).click()
+        expect(page.get_by_role("checkbox", name="选择当前页", exact=True)).to_have_attribute("data-state", "indeterminate")
+        expect(page.get_by_role("status").filter(has_text="已选 13 项")).to_be_visible()
+        page.screenshot(path=session.service.artifacts / "cross-page-selection.png", full_page=True)
+        page.get_by_role("button", name="上一页", exact=True).click()
+        page.get_by_role("checkbox", name="选择当前页", exact=True).click()
+        expect(page.get_by_role("status").filter(has_text="已选 1 项")).to_be_visible()
+        self.assertEqual(page.get_by_role("checkbox", checked=True).count(), 0)
+        page.get_by_role("button", name="下一页", exact=True).click()
+        expect(page.get_by_role("checkbox", name="选择凭据 #13", exact=True)).to_be_checked()
+        page.get_by_role("checkbox", name="选择当前页", exact=True).click()
+        expect(page.get_by_role("status").filter(has_text="已选 12 项")).to_be_visible()
+        page.get_by_role("button", name="清空选择", exact=True).click()
+        expect(page.get_by_role("status").filter(has_text="已选 0 项")).to_be_visible()
+
+    def search_filters(self, session):
+        page = session.page
+        search = page.get_by_role("searchbox", name="搜索凭据", exact=True)
+        for query, ids in (("  USER01@EXAMPLE.INVALID  ", [1]), ("25", [25]),
+                           ("  oFfIcEpRoXy ", [5]), ("absent-match", []), ("   ", range(1, 13))):
+            search.fill(query)
+            self.assert_rows(page, ids)
+            expect(page.get_by_role("status").filter(has_text="已选 0 项")).to_be_visible()
+            if not ids:
+                expect(page.get_by_text("没有匹配的凭据", exact=True)).to_be_visible()
+                expect(page.get_by_role("checkbox", name="选择当前页", exact=True)).to_be_disabled()
+                expect(page.get_by_text("第 1 / 1 页，命中 0 项", exact=True)).to_be_visible()
+        search.fill("")
+        for status, ids, total in (("disabled", [4, 8, 12, 16, 20, 24], 6),
+                                   ("enabled", [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15], 19)):
+            page.get_by_role("combobox", name="凭据状态", exact=True).select_option(status)
+            self.assert_rows(page, ids)
+            expect(page.get_by_text(f"第 1 / {(total + 11) // 12} 页，命中 {total} 项", exact=True)).to_be_visible()
+        page.get_by_role("button", name="下一页", exact=True).click()
+        page.get_by_role("checkbox", name="选择凭据 #25", exact=True).click()
+        search.fill("user")
+        expect(page.get_by_role("status").filter(has_text="已选 0 项")).to_be_visible()
+        expect(page.get_by_text("第 1 / 2 页，命中 19 项", exact=True)).to_be_visible()
+        page.get_by_role("checkbox", name="选择当前页", exact=True).click()
+        page.get_by_role("combobox", name="凭据状态", exact=True).select_option("all")
+        expect(page.get_by_role("status").filter(has_text="已选 0 项")).to_be_visible()
+        search.fill("")
+        self.assert_rows(page, range(1, 13))
+
+    def local_mutations(self, session, service):
+        page = session.page
+        row = session.expand(1)
+        expect(session.row(2).get_by_role("button", name="凭据 #2 详情", exact=True)).to_have_attribute("aria-expanded", "false")
+        page.evaluate("scrollTo(0, 0)")
+        page.screenshot(path=service.artifacts / "ordinary-expanded-detail.png", full_page=True)
+        trigger = row.get_by_role("button", name="凭据 #1 详情", exact=True)
+        trigger.click()
+        expect(trigger).to_have_attribute("aria-expanded", "false")
+        toggle = row.get_by_role("switch", name="启用凭据 #1", exact=True)
+        for disabled in (True, False):
+            body = session.mutation("POST", "/api/admin/credentials/1/disabled", toggle.click)
+            self.assertEqual(body, {"disabled": disabled})
+            expect(toggle).to_be_checked(checked=not disabled)
+            document = service.snapshot(f"local-disabled-{disabled}")
+            self.assertEqual(next(item for item in document["credentials"] if item["id"] == 1)["disabled"], disabled)
+            expect(trigger).to_have_attribute("aria-expanded", "false")
+        for number in (1, 4, 8):
+            page.get_by_role("checkbox", name=f"选择凭据 #{number}", exact=True).click()
+        before = (service.directory / "credentials.json").read_bytes()
+        requests_before = len(self.write_requests(session))
+        confirmations = []
+        def cancel(dialog):
+            confirmations.append(dialog.message)
+            dialog.dismiss()
+        page.once("dialog", cancel)
+        page.get_by_role("button", name="批量删除", exact=True).click()
+        self.assertEqual(confirmations, ["已选 3 项，实际删除 2 个已禁用凭据，跳过 1 个未禁用凭据。此操作无法撤销。"])
+        self.assertEqual(len(self.write_requests(session)), requests_before)
+        self.assertEqual(before, (service.directory / "credentials.json").read_bytes())
+        page.once("dialog", lambda dialog: dialog.accept())
+        with page.expect_response(lambda r: r.request.method == "DELETE" and urlsplit(r.url).path == "/api/admin/credentials/8"):
+            page.get_by_role("button", name="批量删除", exact=True).click()
+        expect(page.get_by_role("status").filter(has_text="已选 0 项")).to_be_visible()
+        deleted = self.write_requests(session)[requests_before:]
+        self.assertEqual([(entry["method"], urlsplit(entry["url"]).path) for entry in deleted],
+                         [("DELETE", "/api/admin/credentials/4"), ("DELETE", "/api/admin/credentials/8")])
+        remaining = service.snapshot("batch-delete")["credentials"]
+        self.assertEqual([item["id"] for item in remaining], [number for number in range(1, 26) if number not in (4, 8)])
+
+    def write_requests(self, session):
+        return [event["detail"] for event in session.events if event["kind"] == "request" and
+                urlsplit(event["detail"]["url"]).path.startswith("/api/admin/") and event["detail"]["method"] != "GET"]
+
+    def cancel_global_clear(self, session, service):
+        page = session.page
+        page.get_by_role("searchbox", name="搜索凭据", exact=True).fill("user01")
+        self.assert_rows(page, [1])
+        before = (service.directory / "credentials.json").read_bytes()
+        requests_before = len(self.write_requests(session))
+        messages = []
+        def cancel(dialog):
+            messages.append(dialog.message)
+            dialog.dismiss()
+        page.once("dialog", cancel)
+        page.get_by_role("button", name="清除全库已禁用凭据（4）", exact=True).click()
+        self.assertEqual(messages, ["确定清除全库 4 个已禁用凭据？不受搜索、分页或选择限制。此操作无法撤销。"])
+        page.get_by_role("button", name="提示词注入", exact=True).click()
+        dialog = session.dialog("提示词注入")
+        dialog.get_by_role("button", name="取消", exact=True).click()
+        expect(dialog).not_to_be_visible()
+        session.restored_focus(page.get_by_role("button", name="提示词注入", exact=True), "prompt-cancel")
+        self.assertEqual(len(self.write_requests(session)), requests_before)
+        self.assertEqual(before, (service.directory / "credentials.json").read_bytes())
 
 
 def main():
@@ -698,8 +1079,8 @@ def main():
         "python": sys.version, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "scope": "real Rust Admin HTTP + browser + private disk; no upstream connectivity assertion"})
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ProxyAdminE2E)
-    if suite.countTestCases() != 2:
-        raise RuntimeError("Expected exactly two serial fixture scenarios")
+    if suite.countTestCases() != 3:
+        raise RuntimeError("Expected exactly three serial fixture scenarios")
     with (OPTIONS.artifacts / "unittest.log").open("w") as log:
         result = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
     failed_ids = {getattr(test, 'test_case', test).id()
@@ -711,7 +1092,7 @@ def main():
     save_json(OPTIONS.artifacts / "summary.json", summary)
     print((OPTIONS.artifacts / "unittest.log").read_text())
     print(json.dumps(summary), flush=True)
-    return 0 if result.wasSuccessful() and result.testsRun == 2 and not result.skipped else 1
+    return 0 if result.wasSuccessful() and result.testsRun == 3 and not result.skipped else 1
 
 
 if __name__ == "__main__":
