@@ -128,19 +128,36 @@ def isolated_page(browser, origin, api, width):
     context.route("**/*", api.route)
     context.add_init_script(f"localStorage.setItem('adminApiKey', {json.dumps(FAKE_KEY)})")
     page = context.new_page()
-    errors = []
+    errors, failed_requests, console_errors = [], [], []
     page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on("requestfailed", lambda request: failed_requests.append(request.url))
+    page.on("console", lambda message: console_errors.append({
+        "text": message.text, "url": message.location.get("url", "")})
+        if message.type == "error" else None)
     try:
         page.goto(origin + "/admin/", wait_until="networkidle")
         yield page
+        expected_urls = {origin + "/api/admin/credentials/1/" + action for action in ("disabled", "reset")}
+        unexpected_console = [event for event in console_errors if not (
+            api.reject and event["url"] in expected_urls and "status of 400" in event["text"])]
         assert not api.breaches, api.breaches
         assert not errors, errors
+        assert not failed_requests, failed_requests
+        assert not unexpected_console, unexpected_console
     finally:
+        print(f"Browser events: console.error={len(console_errors)} pageerror={len(errors)} requestfailed={len(failed_requests)}")
         context.close()
 
 
 def assert_reason(page):
-    reason = page.get_by_test_id("credential-disabled-reason")
+    row = page.get_by_test_id("credential-row-1")
+    trigger = row.get_by_role("button", name="凭据 #1 详情", exact=True)
+    if trigger.get_attribute("aria-expanded") != "true":
+        expect(row.get_by_test_id("credential-disabled-summary")).to_contain_text("上游临时安全锁定")
+        expect(row.get_by_test_id("credential-disabled-reason")).to_have_count(0)
+        trigger.click()
+    expect(trigger).to_have_attribute("aria-expanded", "true")
+    reason = row.get_by_test_id("credential-disabled-reason")
     expect(reason).to_be_visible()
     for text in ["上游临时安全锁定", "TEMPORARILY_SUSPENDED",
                  "触发原因和恢复时间未知，可联系官方支持",

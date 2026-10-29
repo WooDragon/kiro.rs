@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { disabledReasonLabel } from '@/lib/credential-status'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Network } from 'lucide-react'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
@@ -33,6 +33,8 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  selectionDisabled?: boolean
+  loadBalancingMode?: string
 }
 
 /**
@@ -84,7 +86,13 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  selectionDisabled = false,
+  loadBalancingMode,
 }: CredentialCardProps) {
+  const isPriorityMode = loadBalancingMode === 'priority'
+  const isSelected = isPriorityMode && credential.isCurrent
+  const [expanded, setExpanded] = useState(false)
+  const detailId = `credential-detail-${credential.id}`
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -171,46 +179,51 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
-        <CardHeader className="pb-2">
-          <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-            <div className="flex min-w-0 flex-1 items-start gap-2">
-              <Checkbox
-                checked={selected}
-                onCheckedChange={onToggleSelect}
-              />
-              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg leading-normal [overflow-wrap:anywhere]">
-                <span className="min-w-0 [overflow-wrap:anywhere]">{credential.email || `凭据 #${credential.id}`}</span>
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
-                {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {credential.authMethod && (
-                  <Badge variant="secondary">
-                    {credential.authMethod === 'api_key' ? 'API Key' :
-                     credential.authMethod === 'idc' ? 'IdC' :
-                     credential.authMethod === 'social' ? 'Social' :
-                     credential.authMethod}
-                  </Badge>
-                )}
-                {credential.endpoint && (
-                  <Badge variant="outline" className="min-w-0 max-w-full [overflow-wrap:anywhere]">{credential.endpoint}</Badge>
-                )}
-              </CardTitle>
+      <Card data-testid={`credential-row-${credential.id}`} className={`min-w-0 ${isSelected ? 'ring-2 ring-primary' : ''}`}>
+        <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-1 px-3 py-1 text-sm sm:flex sm:flex-wrap">
+          <label className="flex min-h-11 min-w-11 shrink-0 items-center justify-center sm:min-h-8 sm:min-w-8">
+            <Checkbox aria-label={`选择凭据 #${credential.id}`} checked={selected}
+              disabled={selectionDisabled} onCheckedChange={onToggleSelect} />
+          </label>
+          <div className="min-w-0 flex-1 basis-40">
+            <div className="flex min-w-0 items-center gap-2">
+              <h3 className="min-w-0 truncate font-medium leading-normal" title={credential.email}>
+                {credential.email || `凭据 #${credential.id}`}
+              </h3>
+              <span className="shrink-0 text-muted-foreground">#{credential.id}</span>
+              {isSelected && <Badge variant="success" className="shrink-0 whitespace-nowrap">当前选定</Badge>}
             </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">启用</span>
-              <Switch
-                checked={!credential.disabled}
-                onCheckedChange={handleToggleDisabled}
-                disabled={setDisabled.isPending}
-              />
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-muted-foreground">
+              {credential.disabled && <span data-testid="credential-disabled-summary" className="max-w-full text-foreground [overflow-wrap:anywhere]">
+                禁用原因：{disabledReasonLabel(credential.disabledReason)}
+              </span>}
+              <span className="shrink-0">缓存余额：{loadingBalance ? '加载中…' : balance ? balance.remaining.toFixed(2) : '未知'}</span>
+              <span data-testid="credential-proxy-summary" className="truncate" title={credential.proxyName}>
+                {credential.proxyMode === 'inherit' ? '使用全局代理配置' :
+                 credential.proxyMode === 'direct' ? '明确直连' :
+                 credential.proxyMode === 'pool' ? `使用指定代理 · ${credential.proxyName || credential.proxyId || '未知条目'}` :
+                 credential.proxyMode === 'inline' ? '高级内联' : credential.proxyMode || '未知'}
+              </span>
             </div>
           </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
+          <div className="col-span-2 flex min-w-0 items-center gap-2 sm:shrink-0 sm:gap-3">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 sm:flex-none">
+              <span className="[overflow-wrap:anywhere]">{credential.authMethod === 'api_key' ? 'API Key' : credential.authMethod === 'idc' ? 'IdC' : credential.authMethod === 'social' ? 'Social' : credential.authMethod || '未知认证'}</span>
+              {isPriorityMode && <span className="whitespace-nowrap">优先级 {credential.priority}</span>}
+            </div>
+            <label className="flex min-h-11 shrink-0 items-center gap-2 sm:min-h-8">
+              <Switch aria-label={`启用凭据 #${credential.id}`} checked={!credential.disabled}
+                onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} />
+            </label>
+            <Button size="sm" variant="outline" className="min-h-11 shrink-0 sm:min-h-8"
+              aria-label={`凭据 #${credential.id} 详情`} aria-expanded={expanded} aria-controls={detailId}
+              onClick={() => { setExpanded(!expanded); setEditingPriority(false) }}>
+              {expanded ? '收起' : '详情'}
+            </Button>
+          </div>
+        </div>
+        {expanded && <CardContent id={detailId} className="space-y-4 border-t pt-3 text-sm [&_button]:min-h-11 sm:[&_button]:min-h-8">
+          <p className="[overflow-wrap:anywhere]">{credential.email || `凭据 #${credential.id}`} · #{credential.id} · {credential.endpoint}</p>
           {credential.disabled && (
             <div data-testid="credential-disabled-reason" className="min-w-0 space-y-1 rounded-md border p-3 text-sm leading-relaxed break-words">
               <p className="font-medium">禁用原因：{disabledReasonLabel(credential.disabledReason)}</p>
@@ -231,15 +244,17 @@ export function CredentialCard({
                 <div className="inline-flex items-center gap-1 ml-1">
                   <Input
                     type="number"
+                    aria-label="优先级"
                     value={priorityValue}
                     onChange={(e) => setPriorityValue(e.target.value)}
-                    className="w-16 h-7 text-sm"
+                    className="min-h-11 w-20 text-sm sm:min-h-8"
                     min="0"
                   />
                   <Button
                     size="sm"
                     variant="ghost"
                     className="h-7 w-7 p-0"
+                    aria-label="保存优先级"
                     onClick={handlePriorityChange}
                     disabled={setPriority.isPending}
                   >
@@ -249,6 +264,7 @@ export function CredentialCard({
                     size="sm"
                     variant="ghost"
                     className="h-7 w-7 p-0"
+                    aria-label="取消优先级编辑"
                     onClick={() => {
                       setEditingPriority(false)
                       setPriorityValue(String(credential.priority))
@@ -258,14 +274,12 @@ export function CredentialCard({
                   </Button>
                 </div>
               ) : (
-                <span
-                  className="font-medium cursor-pointer hover:underline ml-1"
-                  onClick={() => setEditingPriority(true)}
-                >
-                  {credential.priority}
-                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
-                </span>
+                <Button size="sm" variant="ghost" aria-label="编辑优先级"
+                  onClick={() => { setPriorityValue(String(credential.priority)); setEditingPriority(true) }}>
+                  {credential.priority}（编辑）
+                </Button>
               )}
+              {loadBalancingMode === 'balanced' && <p className="text-muted-foreground">负载相同时优先，数字越小越优先</p>}
             </div>
             <div>
               <span className="text-muted-foreground">失败次数：</span>
@@ -334,12 +348,14 @@ export function CredentialCard({
             )}
           </div>
 
+          <p className="text-muted-foreground">重置失败会重新启用凭据；人工启用/重置不代表上游解锁。</p>
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
             <Button
               size="sm"
               variant="outline"
               onClick={handleReset}
+              title="重置失败计数并重新启用；不代表上游解锁"
               disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
             >
               <RefreshCw className="h-4 w-4 mr-1" />
@@ -418,7 +434,7 @@ export function CredentialCard({
               删除
             </Button>
           </div>
-        </CardContent>
+        </CardContent>}
       </Card>
 
       {/* 删除确认对话框 */}
