@@ -10,6 +10,7 @@ Artifacts contain dummy passwords verbatim to verify persistence semantics.
 import argparse
 from contextlib import contextmanager
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
@@ -20,7 +21,7 @@ import time
 import traceback
 import unittest
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from playwright.sync_api import expect, sync_playwright
@@ -164,6 +165,30 @@ def private_fixture(label, global_proxy=False, compact=False):
     save_json(artifacts / "fixture-cleanup.json", {"removed": not directory.exists()})
 
 
+class AdminAssetParser(HTMLParser):
+    def __init__(self, document_url):
+        super().__init__()
+        self.document_url = document_url
+        self.origin = urlsplit(document_url)
+        self.resources = []
+        self.kinds = set()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "script" and attrs.get("src"):
+            kind, reference = "script", attrs["src"]
+        elif tag == "link" and "stylesheet" in attrs.get("rel", "").lower().split() and attrs.get("href"):
+            kind, reference = "css", attrs["href"]
+        else:
+            return
+        resource = urlsplit(urljoin(self.document_url, reference))
+        if (resource.scheme, resource.netloc) != (self.origin.scheme, self.origin.netloc):
+            return
+        if resource.path.startswith("/admin/assets/"):
+            self.resources.append(resource)
+            self.kinds.add(kind)
+
+
 class BrowserSession:
     def __init__(self, browser, service):
         self.service = service
@@ -243,15 +268,19 @@ class BrowserSession:
         expected_html = (Path(__file__).resolve().parents[1] / "dist/index.html").read_text()
         assert html == expected_html, "Served Admin does not match the current built dist"
         (self.service.artifacts / "served-admin.html").write_text(html)
+        parser = AdminAssetParser(response.url)
+        parser.feed(html)
+        parser.close()
+        assert parser.resources, "No same-origin Admin assets found in the current dist HTML"
+        assert parser.kinds == {"script", "css"}, "Current dist must contain both script and stylesheet assets"
         resources = []
-        for name in ("index-hQAFE82u.js", "index-CgqMuxC8.css"):
-            path = "/admin/assets/" + name
-            assert path in html, f"Expected current dist resource missing: {path}"
-            with urlopen(self.service.base + path, timeout=5) as asset:
+        for resource in parser.resources:
+            path = resource.path
+            with urlopen(resource.geturl(), timeout=5) as asset:
                 content = asset.read()
                 assert asset.status == 200
-            local = Path(__file__).resolve().parents[1] / "dist/assets" / name
-            assert content == local.read_bytes(), f"Stale served resource: {name}"
+            local = Path(__file__).resolve().parents[1] / "dist" / path.removeprefix("/admin/")
+            assert content == local.read_bytes(), f"Stale served resource: {path}"
             resources.append({"path": path, "bytes": len(content), "matchesDist": True,
                               "sha256": hashlib.sha256(content).hexdigest()})
         save_json(self.service.artifacts / "served-resources.json", resources)
